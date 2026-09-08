@@ -166,8 +166,8 @@ def main():
             "watch_dirs": [r"D:\实验数据\谱仪1"],
             "server_url": "http://192.168.1.100:8765",
             "machine_name": socket.gethostname(),
-            "scan_interval_sec": 3,
-            "group_window_sec": 8,
+            "scan_interval_sec": 1,
+            "group_window_sec": 5,
         })
         print("已生成默认配置 config_b.json，请修改后重新运行。")
         sys.exit(1)

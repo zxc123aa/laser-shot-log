@@ -59,6 +59,10 @@ ALLOW_IPS = [str(x) for x in _CFG_A.get("allow_ips", [])]
 
 _db_lock = threading.Lock()
 
+# 数据版本号：任意 POST（增删改行/表/回收站/告警等）成功后 +1，
+# SSE 端点 /api/events 据此在数据变化时立刻通知页面刷新
+DATA_VER = 0
+
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -818,6 +822,20 @@ window.addEventListener("focus", function(){
   loadSheets();
 });
 
+/* ---------- 实时通道：SSE 收到数据变化通知立即刷新（4s 轮询仅兜底） ---------- */
+var ES = null;
+function connectSSE(){
+  if (!window.EventSource) return;
+  try { ES = new EventSource("/api/events"); } catch(e){ return; }
+  ES.onmessage = function(){
+    if (S.editing || document.hidden) return;
+    if (document.getElementById("trashMask").style.display === "flex") return;
+    if (document.querySelector("td.ed input, td.ed select")) return;
+    loadSheets(); loadAlerts();
+  };
+}
+connectSSE();
+
 /* ---------- 启动 ---------- */
 var COLS = __COLS__;
 COLS.forEach(function(c){ if (c.options) COL_OPTS[c.key] = c.options; });
@@ -883,6 +901,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_rows(q)
             elif url.path == "/api/alerts":
                 self.api_alerts()
+            elif url.path == "/api/events":
+                self.sse_events()
             elif url.path == "/api/trash":
                 self.api_trash()
             elif url.path == "/export.csv":
@@ -914,12 +934,37 @@ class Handler(BaseHTTPRequestHandler):
         }
         fn = routes.get(url.path)
         if fn:
+            global DATA_VER
             try:
                 fn()
+                DATA_VER += 1   # 数据有变，SSE 通知页面
             except Exception as e:
                 self._err(e)
         else:
             self._err("not found", 404)
+
+    def sse_events(self):
+        """SSE：数据版本变化时推一条 ping，页面收到立即刷新（毫秒级出新一发）"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        last = DATA_VER
+        last_beat = time.time()
+        try:
+            while True:
+                if DATA_VER != last:
+                    last = DATA_VER
+                    self.wfile.write(b"data: changed\n\n")
+                    self.wfile.flush()
+                    last_beat = time.time()
+                elif time.time() - last_beat >= 15:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    last_beat = time.time()
+                time.sleep(0.4)
+        except Exception:
+            pass   # 客户端断开
 
     # ---------- 表格管理 ----------
     def api_sheets(self):
