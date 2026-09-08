@@ -799,14 +799,14 @@ function loadAlerts(){
   }).catch(function(){});
 }
 
-/* ---------- 自动刷新：8 秒轮询（编辑中/回收站打开/页面隐藏时暂停） ---------- */
+/* ---------- 自动刷新：4 秒轮询（编辑中/回收站打开/页面隐藏时暂停） ---------- */
 setInterval(function(){
   if (S.editing || document.hidden) return;
   if (document.getElementById("trashMask").style.display === "flex") return;
   if (document.querySelector("td.ed input, td.ed select")) return;
   loadSheets(); loadAlerts();
-}, 8000);
-/* 切回标签页/恢复窗口时立即刷新，不等下一个 8 秒节拍 */
+}, 4000);
+/* 切回标签页/恢复窗口时立即刷新，不等下一个 4 秒节拍 */
 document.addEventListener("visibilitychange", function(){
   if (document.hidden || S.editing) return;
   if (document.getElementById("trashMask").style.display === "flex") return;
