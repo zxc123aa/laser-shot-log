@@ -54,23 +54,6 @@ def log(msg):
     print("[%s] %s" % (datetime.now().strftime("%H:%M:%S"), msg), flush=True)
 
 
-def scan_once(watch_dirs):
-    """扫描所有监视目录，返回 [(路径, mtime), ...]（仅新出现的文件路径，不含已登记的）"""
-    found = []
-    for d in watch_dirs:
-        if not os.path.isdir(d):
-            continue
-        for root, _dirs, files in os.walk(d):
-            for fn in files:
-                p = os.path.join(root, fn)
-                try:
-                    mt = os.path.getmtime(p)
-                except OSError:
-                    continue  # 文件可能正被写入/刚被移走
-                found.append((p, mt))
-    return found
-
-
 def group_into_shots(entries, window):
     """按 mtime 排序，相邻间隔 <= window 的文件归为一次打靶。
     返回 ([完整组...], [最后一组（可能还在增长，暂缓上报）])
@@ -118,9 +101,46 @@ def send_alert(server_url, machine_name, level, message, timeout=5):
         pass  # 告警通道失败不阻塞扫描
 
 
+# 目录扫描缓存（与 thomson_helper 同款）：{目录: (目录mtime, [(文件路径, mtime), ...], [子目录路径, ...])}
+# 逐层校验目录 mtime，没变的层直接用缓存，热扫描从 ~0.4s 降到 ~0.01s
+_DIR_CACHE = {}
+
+
 def scan_once(watch_dirs):
     """扫描所有监视目录（保留旧签名兼容），返回 [(路径, mtime), ...]"""
     return scan_once_status(watch_dirs)[0]
+
+
+def _scan_dir(d, out):
+    try:
+        mt = os.path.getmtime(d)
+    except OSError:
+        _DIR_CACHE.pop(d, None)
+        return
+    c = _DIR_CACHE.get(d)
+    if c is not None and c[0] == mt:
+        out.extend(c[1])          # 本层无增删改：文件列表直接用缓存
+        for sub in c[2]:
+            _scan_dir(sub, out)   # 但每层子目录仍要各自校验
+        return
+    files, subs = [], []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        p = os.path.join(d, n)
+        if os.path.isdir(p):
+            subs.append(p)
+        else:
+            try:
+                files.append((p, os.path.getmtime(p)))
+            except OSError:
+                continue  # 文件可能正被写入/刚被移走
+    _DIR_CACHE[d] = (mt, files, subs)
+    out.extend(files)
+    for sub in subs:
+        _scan_dir(sub, out)
 
 
 def scan_once_status(watch_dirs):
@@ -131,14 +151,7 @@ def scan_once_status(watch_dirs):
         if not os.path.isdir(d):
             missing.append(d)
             continue
-        for root, _dirs, files in os.walk(d):
-            for fn in files:
-                p = os.path.join(root, fn)
-                try:
-                    mt = os.path.getmtime(p)
-                except OSError:
-                    continue  # 文件可能正被写入/刚被移走
-                found.append((p, mt))
+        _scan_dir(d, found)
     return found, missing
 
 
