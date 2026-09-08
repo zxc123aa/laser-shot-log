@@ -27,7 +27,9 @@ from datetime import datetime
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config_b.json")
+LOCAL_CONFIG_PATH = os.path.join(BASE, "config_b.local.json")  # 本机实际配置（不入库，优先于 config_b.json）
 STATE_PATH = os.path.join(BASE, "state_b.json")
+REG_DIRS_PATH = os.path.join(BASE, "state_dirs.json")  # 已"静默登记"过的监视目录清单
 PENDING_PATH = os.path.join(BASE, "pending_b.json")  # 已见但未归组的文件缓冲
 QUEUE_PATH = os.path.join(BASE, "unsent_b.json")
 
@@ -150,7 +152,8 @@ def make_payload(machine_name, group):
 
 
 def main():
-    cfg = load_json(CONFIG_PATH, None)
+    # 本机实际配置 config_b.local.json 存在时优先（模板 config_b.json 保持入库）
+    cfg = load_json(LOCAL_CONFIG_PATH, None) or load_json(CONFIG_PATH, None)
     if cfg is None:
         save_json(CONFIG_PATH, {
             "watch_dirs": [r"D:\实验数据\谱仪1"],
@@ -178,6 +181,35 @@ def main():
     log("上报地址: %s  (本机名: %s)" % (server_url, machine_name))
 
     first_run = not os.path.exists(STATE_PATH)
+
+    # 新增监视目录静默登记（关键修复）：
+    # state 已存在时（非首次运行），config 里新出现的监视目录下的历史文件
+    # 会被当成"新文件"全部上报——历史数据就被灌进日志了。
+    # 因此：任何"首次纳入监视"的目录，先静默登记其启动时已有的全部文件。
+    registered_dirs = set(load_json(REG_DIRS_PATH, []))
+    silent_cnt = 0
+    for d in watch_dirs:
+        ad = os.path.abspath(d)
+        if ad in registered_dirs or not os.path.isdir(ad):
+            continue
+        cnt = 0
+        for root, _dirs, files in os.walk(ad):
+            for fn in files:
+                p = os.path.join(root, fn)
+                if p in seen:
+                    continue
+                try:
+                    seen[p] = os.path.getmtime(p)
+                except OSError:
+                    continue  # 文件正被写入，下一轮按新文件处理
+                cnt += 1
+        registered_dirs.add(ad)
+        silent_cnt += cnt
+        log("目录首次纳入监视，静默登记已有文件 %d 个: %s" % (cnt, d))
+    if silent_cnt:
+        save_json(STATE_PATH, seen)
+        log("共静默登记 %d 个历史文件（不上报）" % silent_cnt)
+    save_json(REG_DIRS_PATH, sorted(registered_dirs))
 
     missing_seen = {}   # {目录: 上次告警时间}，同类告警 60 秒节流
     alert_gap = 60.0

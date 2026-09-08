@@ -7,12 +7,18 @@ backup/
 
 # 运行时状态文件（B机/helper 自动生成）
 state_b.json
+state_dirs.json
 pending_b.json
 unsent_b.json
 state_helper.json
 pending_helper.json
 unsent_helper.json
 config_helper.json
+
+# 本机实际配置（含真实内网地址，不入库；入库模板为 config_b.json）
+config_b.local.json
+deploy_status.json
+simulator_state.json
 
 # Python
 __pycache__/

@@ -6,5 +6,6 @@
   "server_url": "http://192.168.1.100:8765",
   "machine_name": "B-DAQ",
   "scan_interval_sec": 3,
-  "group_window_sec": 8
+  "group_window_sec": 8,
+  "_说明": "本机实际部署请复制为 config_b.local.json（不会被 git 跟踪），watch_dirs 改成谱仪落盘真实目录，server_url 改成 A 机地址 http://<A机IP>:8765。config_b.local.json 存在时优先于本文件。"
 }

@@ -33,7 +33,7 @@ from urllib.parse import urlparse, parse_qs
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 HOST = "0.0.0.0"
-PORT = 8765
+PORT = int(os.environ.get("PORT") or 8765)  # 8765 被占用时可用 PORT=8766 启动
 DB_PATH = os.path.join(BASE, "shots.db")
 COLS_PATH = os.path.join(BASE, "shotlist_cols.json")
 LIVE_SHEET = "实时打靶"          # B 机上报默认写入的表
