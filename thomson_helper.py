@@ -48,6 +48,12 @@ STATE_PATH = os.path.join(BASE, "state_helper.json")
 # RLock：save_state() 在调用方已持锁时也会被调用，必须可重入
 _state_lock = threading.RLock()
 STATE = {"seen": {}, "pend": [], "shots": [], "queue": [], "no_seq": {}}
+STATE_VER = 0          # 页面 SSE 推送用的状态版本号：shots/queue 一变就 +1
+
+
+def bump_ver():
+    global STATE_VER
+    STATE_VER += 1
 SERVER_URL = ""
 MACHINE = ""
 WATCH_DIRS = []
@@ -176,6 +182,7 @@ def retry_queue():
     if len(still) != len(STATE["queue"]):
         with _state_lock:
             STATE["queue"] = still
+            bump_ver()
             save_state()
 
 
@@ -226,6 +233,7 @@ def monitor_loop(watch_dirs, interval, window):
                             shot["no"] = seq.get(day, 0) + 1
                         seq[day] = max(seq.get(day, 0), shot["no"])
                         STATE["shots"].insert(0, shot)
+                        bump_ver()
                         save_state()
                     log("检测到发次: %s (%d 个文件)" %
                         (shot["shot_time"], shot["file_count"]))
@@ -240,6 +248,7 @@ def monitor_loop(watch_dirs, interval, window):
                                     "shot_time": shot["shot_time"],
                                     "files": [{"name": n, "mtime": 0}
                                               for n in shot["files"]]})
+                                bump_ver()
                                 save_state()
                             log("发次上报失败(%r)，已入补发队列" % e)
             time.sleep(interval)
@@ -385,21 +394,33 @@ function render(){
   var np = SHOTS.filter(function(s){ return s.status !== "sent"; }).length;
   document.getElementById("npending").textContent = np;
 }
-function refresh(){
-  fetch("/api/local", {cache:"no-store"}).then(function(r){ return r.json(); }).then(function(j){
-    document.getElementById("dot").className = "dot ok";
-    var s = JSON.stringify(j.shots);
-    if (s !== LASTJSON){
-      var focused = document.activeElement;
-      var typing = focused && focused.classList &&
-                   (focused.classList.contains("e") || focused.classList.contains("n"));
-      if (!typing){          // 正在输入时不重绘，避免打断
-        SHOTS = j.shots; LASTJSON = s; render();
-      }
+function apply(j){
+  document.getElementById("dot").className = "dot ok";
+  var s = JSON.stringify(j.shots);
+  if (s !== LASTJSON){
+    var focused = document.activeElement;
+    var typing = focused && focused.classList &&
+                 (focused.classList.contains("e") || focused.classList.contains("n"));
+    if (!typing){          // 正在输入时不重绘，避免打断
+      SHOTS = j.shots; LASTJSON = s; render();
     }
-  }).catch(function(){
+  }
+}
+function refresh(){
+  fetch("/api/local", {cache:"no-store"}).then(function(r){ return r.json(); }).then(apply)
+  .catch(function(){
     document.getElementById("dot").className = "dot bad";
   });
+}
+/* 实时通道：服务器有新发次/状态变化立刻推送 */
+var ES = null;
+function connectSSE(){
+  if (!window.EventSource) return;
+  try { ES = new EventSource("/api/events"); } catch(e){ return; }
+  ES.onmessage = function(ev){
+    try { apply(JSON.parse(ev.data)); } catch(e){}
+  };
+  ES.onerror = function(){ document.getElementById("dot").className = "dot bad"; };
 }
 function send(i, create){
   var inp = document.querySelector("input.e[data-i='" + i + "']");
@@ -432,7 +453,7 @@ document.getElementById("srv").textContent = CFG_SERVER;
 document.getElementById("win").textContent = CFG_WINDOW;
 document.getElementById("dirs").textContent = CFG_DIRS;
 document.getElementById("efield").textContent = CFG_FIELD;
-refresh(); setInterval(refresh, 4000);
+refresh(); connectSSE(); setInterval(refresh, 15000);   // SSE 实时推送，15s 轮询仅作兜底
 /* 切回标签页/窗口聚焦时立即刷新，不等下一个 4 秒节拍 */
 document.addEventListener("visibilitychange", function(){ if (!document.hidden) refresh(); });
 window.addEventListener("focus", refresh);
@@ -465,17 +486,48 @@ class Handler(BaseHTTPRequestHandler):
                 .replace("CFG_WINDOW", str(int(MATCH_WINDOW))))
         self._send(200, html, "text/html; charset=utf-8")
 
+    def _snapshot(self):
+        with _state_lock:
+            shots = [dict(s) for s in STATE["shots"]]
+        return json.dumps(
+            {"ok": True, "shots": shots[:200], "server": SERVER_URL,
+             "queue": len(STATE["queue"])}, ensure_ascii=False)
+
     def do_GET(self):
         if urlparse(self.path).path == "/":
             self._page()
         elif urlparse(self.path).path == "/api/local":
-            with _state_lock:
-                shots = [dict(s) for s in STATE["shots"]]
-            self._send(200, json.dumps(
-                {"ok": True, "shots": shots[:200], "server": SERVER_URL,
-                 "queue": len(STATE["queue"])}, ensure_ascii=False))
+            self._send(200, self._snapshot())
+        elif urlparse(self.path).path == "/api/events":
+            self.sse_events()
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
+
+    def sse_events(self):
+        """SSE 实时推送：状态版本号一变就推全量快照，页面毫秒级出新发次"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        last = -1
+        last_beat = time.time()
+        try:
+            while True:
+                with _state_lock:
+                    ver = STATE_VER
+                if ver != last:
+                    last = ver
+                    self.wfile.write(
+                        ("data: " + self._snapshot() + "\n\n").encode("utf-8"))
+                    self.wfile.flush()
+                    last_beat = time.time()
+                elif time.time() - last_beat >= 15:
+                    self.wfile.write(b": ping\n\n")   # 心跳，防代理断连
+                    self.wfile.flush()
+                    last_beat = time.time()
+                time.sleep(0.3)
+        except Exception:
+            pass   # 客户端断开，结束本次连接线程
 
     def do_POST(self):
         if urlparse(self.path).path == "/api/bind":
@@ -507,6 +559,7 @@ class Handler(BaseHTTPRequestHandler):
             no_in = 0
         if no_in:
             shot["no"] = no_in          # 手动改过 No. 以页面为准
+        bump_ver()
         payload = {"shot_time": st, "energy": energy, "field": ENERGY_FIELD,
                    "machine": MACHINE, "window_sec": MATCH_WINDOW,
                    "shot_no": no_in or (shot.get("no") or 0),
