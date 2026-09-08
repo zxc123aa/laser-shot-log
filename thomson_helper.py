@@ -47,7 +47,8 @@ STATE_PATH = os.path.join(BASE, "state_helper.json")
 
 # RLock：save_state() 在调用方已持锁时也会被调用，必须可重入
 _state_lock = threading.RLock()
-STATE = {"seen": {}, "pend": [], "shots": [], "queue": [], "no_seq": {}}
+STATE = {"seen": {}, "pend": [], "shots": [], "queue": [], "no_seq": {},
+         "forming_shot": None}
 STATE_VER = 0          # 页面 SSE 推送用的状态版本号：shots/queue 一变就 +1
 
 
@@ -98,6 +99,13 @@ def http_post_json(url, payload, timeout=6):
 
 # ---------------- 监视线程 ----------------
 
+# 目录扫描缓存：{目录: (目录mtime, [(文件路径, mtime), ...], [子目录路径, ...])}
+# 逐层校验目录 mtime：没变的层直接用缓存文件列表，只重扫有变化的层。
+# 新建/删除文件会更新其所在目录的 mtime，所以任何深度的新文件都能发现，
+# 而不必每次 stat 全部历史文件（TPS 有 9000+ 文件，裸扫一轮 ~0.4s）
+_DIR_CACHE = {}
+
+
 def scan_all(dirs):
     """扫描全部监视目录，返回 ([(路径, mtime), ...], [失效目录, ...])"""
     found, missing = [], []
@@ -105,15 +113,40 @@ def scan_all(dirs):
         if not os.path.isdir(d):
             missing.append(d)
             continue
-        for root, _dirs, files in os.walk(d):
-            for fn in files:
-                p = os.path.join(root, fn)
-                try:
-                    mt = os.path.getmtime(p)
-                except OSError:
-                    continue  # 文件可能正被写入
-                found.append((p, mt))
+        _scan_dir(d, found)
     return found, missing
+
+
+def _scan_dir(d, out):
+    try:
+        mt = os.path.getmtime(d)
+    except OSError:
+        _DIR_CACHE.pop(d, None)
+        return
+    c = _DIR_CACHE.get(d)
+    if c is not None and c[0] == mt:
+        out.extend(c[1])          # 本层无增删改：文件列表直接用缓存
+        for sub in c[2]:
+            _scan_dir(sub, out)   # 但每层子目录仍要各自校验
+        return
+    files, subs = [], []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        p = os.path.join(d, n)
+        if os.path.isdir(p):
+            subs.append(p)
+        else:
+            try:
+                files.append((p, os.path.getmtime(p)))
+            except OSError:
+                pass              # 文件可能正被写入
+    _DIR_CACHE[d] = (mt, files, subs)
+    out.extend(files)
+    for sub in subs:
+        _scan_dir(sub, out)
 
 
 def group_into_shots(entries, window):
@@ -203,7 +236,10 @@ def monitor_loop(watch_dirs, interval, window):
     while True:
         try:
             retry_queue()
+            _t0 = time.time()
             entries, missing = scan_all(watch_dirs)
+            if time.time() - _t0 > 0.5:
+                log("警告: 扫描耗时 %.2fs（正常应 <0.1s）" % (time.time() - _t0))
             now = time.time()
             for d in missing:
                 if now - missing_seen.get(d, 0) >= 60:
@@ -216,8 +252,14 @@ def monitor_loop(watch_dirs, interval, window):
             new_entries = [(p, mt) for p, mt in entries
                            if p not in STATE["seen"]]
             all_new = [tuple(x) for x in STATE["pend"]] + new_entries
+            # 即时行：有未到齐的文件（含刚落盘还没过安静期的）立刻上表显示
+            forming = None
             if all_new:
                 done, hold = group_into_shots(all_new, window)
+                if hold:
+                    forming = make_shot(hold)
+                    forming["status"] = "forming"
+                    forming["info"] = "检测中…（文件可能还没到齐）"
                 with _state_lock:
                     for p, mt in all_new:
                         STATE["seen"].setdefault(p, mt)
@@ -233,6 +275,7 @@ def monitor_loop(watch_dirs, interval, window):
                             shot["no"] = seq.get(day, 0) + 1
                         seq[day] = max(seq.get(day, 0), shot["no"])
                         STATE["shots"].insert(0, shot)
+                        STATE["forming_shot"] = None
                         bump_ver()
                         save_state()
                     log("检测到发次: %s (%d 个文件)" %
@@ -251,6 +294,18 @@ def monitor_loop(watch_dirs, interval, window):
                                 bump_ver()
                                 save_state()
                             log("发次上报失败(%r)，已入补发队列" % e)
+            # forming 行有变化（新出现/文件数增加/转正）就推送
+            with _state_lock:
+                prev = STATE.get("forming_shot")
+                changed = (json.dumps(forming, sort_keys=True, default=str) !=
+                           json.dumps(prev, sort_keys=True, default=str))
+                if changed:
+                    STATE["forming_shot"] = forming
+            if changed:
+                bump_ver()
+                if forming:
+                    log("检测到新文件: %s（即时显示，安静 %gs 后转正）"
+                        % (forming["files"][0], window))
             time.sleep(interval)
         except Exception as e:
             log("监视循环异常(继续运行): %r" % e)
@@ -307,6 +362,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
   .st{display:inline-block;padding:2px 10px;border-radius:10px;font-size:12px}
   .st.pending{background:#f6e8c8;color:#8a6d3b}
   .st.sent{background:#d4edda;color:#256029}
+  .st.forming{background:#e2e3fe;color:#3d3d8f}
   .st.no_match{background:#f8d7da;color:#721c24}
   .st.error{background:#f8d7da;color:#721c24}
   .empty{padding:50px;text-align:center;color:#999}
@@ -358,7 +414,7 @@ function toast(s){
 }
 function stLabel(s){
   return {pending:"待输入", sent:"已绑定", no_match:"无匹配发次",
-          error:"发送失败"}[s] || s;
+          error:"发送失败", forming:"检测中…"}[s] || s;
 }
 function render(){
   var tb = document.getElementById("tb");
@@ -381,7 +437,9 @@ function render(){
       h += "<td><span class='st " + cls + "'>" + stLabel(cls) + "</span>" +
            (s.info ? "<div style='color:#999;font-size:11px;margin-top:2px'>" + s.info + "</div>" : "") + "</td>";
       h += "<td>";
-      if (s.status === "no_match"){
+      if (s.status === "forming"){
+        h += "<span style='color:#999;font-size:12px'>等待文件到齐…</span>";
+      } else if (s.status === "no_match"){
         h += "<button class='tbtn orange' onclick='send(" + i + ",true)'>补录</button> ";
       } else {
         h += "<button class='tbtn' onclick='send(" + i + ",false)'>" +
@@ -489,8 +547,10 @@ class Handler(BaseHTTPRequestHandler):
     def _snapshot(self):
         with _state_lock:
             shots = [dict(s) for s in STATE["shots"]]
+            fm = STATE.get("forming_shot")
+        out = ([dict(fm)] if fm else []) + shots   # "检测中"行置顶
         return json.dumps(
-            {"ok": True, "shots": shots[:200], "server": SERVER_URL,
+            {"ok": True, "shots": out[:200], "server": SERVER_URL,
              "queue": len(STATE["queue"])}, ensure_ascii=False)
 
     def do_GET(self):
@@ -639,6 +699,7 @@ def main():
     if st:
         with _state_lock:
             STATE.update(st)
+            STATE["forming_shot"] = None   # 上次运行残留的"检测中"行不恢复
             n_pending = sum(1 for s in STATE["shots"] if s["status"] != "sent")
         log("已恢复状态: %d 条发次记录（其中 %d 条待绑定能量）"
             % (len(STATE["shots"]), n_pending))
