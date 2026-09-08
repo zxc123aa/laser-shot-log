@@ -30,6 +30,7 @@
 
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -46,7 +47,7 @@ STATE_PATH = os.path.join(BASE, "state_helper.json")
 
 # RLock：save_state() 在调用方已持锁时也会被调用，必须可重入
 _state_lock = threading.RLock()
-STATE = {"seen": {}, "pend": [], "shots": [], "queue": []}
+STATE = {"seen": {}, "pend": [], "shots": [], "queue": [], "no_seq": {}}
 SERVER_URL = ""
 MACHINE = ""
 WATCH_DIRS = []
@@ -127,11 +128,26 @@ def group_into_shots(entries, window):
     return groups, cur
 
 
+# 发次号解析：文件名里的编号（shot-3.png / SHOR_12.tif / shot7.dat…）
+NO_PAT = re.compile(r"(?:shot|shor)[-_ ]?(\d+)", re.IGNORECASE)
+
+
+def parse_shot_no(names):
+    """从一组文件名解析发次号；多个取最小值；解析不出返回 None（由调用方补号）"""
+    nums = []
+    for n in names:
+        m = NO_PAT.search(n)
+        if m:
+            nums.append(int(m.group(1)))
+    return min(nums) if nums else None
+
+
 def make_shot(group):
     names = [os.path.basename(p) for p, _mt in sorted(group, key=lambda x: x[1])]
     st = datetime.fromtimestamp(min(mt for _p, mt in group)).strftime(
         "%Y-%m-%d %H:%M:%S")
     return {"shot_time": st, "files": names, "file_count": len(group),
+            "no": parse_shot_no(names),
             "energy": "", "status": "pending", "info": "", "row_id": None}
 
 
@@ -201,7 +217,13 @@ def monitor_loop(watch_dirs, interval, window):
                 save_state()
                 for g in done:
                     shot = make_shot(g)
+                    # 发次号：文件名能解析就用解析值；否则按当天顺序自动补号
+                    day = shot["shot_time"][:10]
                     with _state_lock:
+                        seq = STATE.setdefault("no_seq", {})
+                        if shot.get("no") is None:
+                            shot["no"] = seq.get(day, 0) + 1
+                        seq[day] = max(seq.get(day, 0), shot["no"])
                         STATE["shots"].insert(0, shot)
                         save_state()
                     log("检测到发次: %s (%d 个文件)" %
@@ -264,6 +286,9 @@ HELP_PAGE = r"""<!DOCTYPE html>
   input.e{width:110px;padding:6px 8px;border:1px solid #d5d9de;border-radius:5px;
           font-size:13px;font-family:inherit}
   input.e:focus{outline:none;border-color:#9fc3e8;background:#fff8dc}
+  input.n{width:54px;padding:6px 6px;border:1px solid #d5d9de;border-radius:5px;
+          font-size:13px;text-align:center;font-family:Consolas,monospace}
+  input.n:focus{outline:none;border-color:#9fc3e8;background:#fff8dc}
   .tbtn{background:#2c3e50;color:#fff;border:none;border-radius:5px;padding:6px 14px;
         font-size:13px;cursor:pointer;font-family:inherit}
   .tbtn:hover{background:#3d5875}
@@ -306,13 +331,13 @@ HELP_PAGE = r"""<!DOCTYPE html>
 <div class="wrap">
   <table>
     <thead><tr>
-      <th>发次时间</th><th>图片数</th><th>图片文件</th>
+      <th>No.</th><th>发次时间</th><th>图片数</th><th>图片文件</th>
       <th>闪烁光纤能量</th><th>状态</th><th>操作</th>
     </tr></thead>
     <tbody id="tb"></tbody>
   </table>
 </div>
-<div id="foot">图片生成时间 = 发次时间 ｜ 解谱后填入能量点"发送"，按时间窗口自动绑定 A 机日志对应发次 ｜ 能量可"重发"覆盖</div>
+<div id="foot">No. 自动取自文件名（shot-3 → 3），可手动修正 ｜ 能量按时间窗绑定，未命中时按 No. 兜底 ｜ 能量可"重发"覆盖</div>
 <div id="toast"></div>
 <script>
 var SHOTS = [], LASTJSON = "", T = null;
@@ -328,11 +353,13 @@ function stLabel(s){
 function render(){
   var tb = document.getElementById("tb");
   if (!SHOTS.length){
-    tb.innerHTML = "<tr><td colspan=6 class='empty'>暂未检测到发次——等待谱仪图片落盘…</td></tr>";
+    tb.innerHTML = "<tr><td colspan=7 class='empty'>暂未检测到发次——等待谱仪图片落盘…</td></tr>";
   } else {
     var h = "";
     SHOTS.forEach(function(s, i){
       h += "<tr data-i='" + i + "'>";
+      h += "<td><input class='n' data-i='" + i + "' value='" +
+           (s.no != null ? s.no : "") + "'></td>";
       h += "<td class='t'>" + s.shot_time + "</td>";
       h += "<td>" + s.file_count + "</td>";
       h += "<td class='files' title='" + s.files.join("  ") + "'>" +
@@ -363,7 +390,8 @@ function refresh(){
     var s = JSON.stringify(j.shots);
     if (s !== LASTJSON){
       var focused = document.activeElement;
-      var typing = focused && focused.classList && focused.classList.contains("e");
+      var typing = focused && focused.classList &&
+                   (focused.classList.contains("e") || focused.classList.contains("n"));
       if (!typing){          // 正在输入时不重绘，避免打断
         SHOTS = j.shots; LASTJSON = s; render();
       }
@@ -376,12 +404,16 @@ function send(i, create){
   var inp = document.querySelector("input.e[data-i='" + i + "']");
   var v = (inp ? inp.value : SHOTS[i].energy).trim();
   if (!v){ toast("先填能量再发送"); return; }
+  var ninp = document.querySelector("input.n[data-i='" + i + "']");
+  var no = parseInt((ninp ? ninp.value : SHOTS[i].no), 10) || 0;
   fetch("/api/bind", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({shot_time: SHOTS[i].shot_time, energy: v, create: create})})
+    body: JSON.stringify({shot_time: SHOTS[i].shot_time, energy: v,
+                          shot_no: no, create: create})})
     .then(function(r){ return r.json(); })
     .then(function(j){
       if (j.ok && (j.matched !== undefined)){
-        toast("已绑定到发次 " + j.matched_time + "（差 " + (+j.diff_sec).toFixed(1) + "s）");
+        toast(j.by_no ? ("时间窗未命中，已按 No." + no + " 绑定到 " + j.matched_time)
+                      : ("已绑定到发次 " + j.matched_time + "（差 " + (+j.diff_sec).toFixed(1) + "s）"));
       } else if (j.ok && j.created){
         toast("已补录独立记录 #" + j.created);
       } else if (j.error === "no_match"){
@@ -468,8 +500,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(
                 {"ok": False, "error": "能量值不能为空"}))
         shot["energy"] = energy
+        try:
+            no_in = int(p.get("shot_no") or 0)
+        except (TypeError, ValueError):
+            no_in = 0
+        if no_in:
+            shot["no"] = no_in          # 手动改过 No. 以页面为准
         payload = {"shot_time": st, "energy": energy, "field": ENERGY_FIELD,
                    "machine": MACHINE, "window_sec": MATCH_WINDOW,
+                   "shot_no": no_in or (shot.get("no") or 0),
                    "create": create}
         try:
             j = http_post_json(SERVER_URL.rstrip("/") + "/api/energy", payload)
@@ -487,8 +526,8 @@ class Handler(BaseHTTPRequestHandler):
         if j.get("ok") and j.get("matched") is not None:
             shot["status"] = "sent"
             shot["row_id"] = j.get("matched")
-            shot["info"] = "→ %s (差%.1fs)" % (
-                j.get("matched_time", ""), j.get("diff_sec", 0))
+            tag = "按No." if j.get("by_no") else "差%.1fs" % j.get("diff_sec", 0)
+            shot["info"] = "→ %s (%s)" % (j.get("matched_time", ""), tag)
         elif j.get("ok") and j.get("created") is not None:
             shot["status"] = "sent"
             shot["row_id"] = j.get("created")

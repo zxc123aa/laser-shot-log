@@ -1238,6 +1238,10 @@ class Handler(BaseHTTPRequestHandler):
         if field not in COL_KEYS:
             return self._err("非法字段: %s" % field)
         try:
+            shot_no = int(p.get("shot_no") or 0)
+        except (TypeError, ValueError):
+            shot_no = 0
+        try:
             window = abs(float(p.get("window_sec", 15)))
         except (TypeError, ValueError):
             window = 15.0
@@ -1257,12 +1261,34 @@ class Handler(BaseHTTPRequestHandler):
                 best = min(cands, key=_diff)
                 flds = json.loads(best["fields"] or "{}")
                 flds[field] = energy
+                if shot_no:
+                    flds["shot_no"] = shot_no
                 conn.execute(
                     "UPDATE shots SET fields=?, rev=COALESCE(rev,1)+1 WHERE id=?",
                     (json.dumps(flds, ensure_ascii=False), best["id"]))
                 return self._ok(matched=best["id"], matched_time=best["shot_time"],
                                 diff_sec=_diff(best), sheet_id=best["sheet_id"],
                                 field=field, energy=energy)
+            if shot_no:
+                # 发次号兜底：时间窗没匹配到，但带了 No. → 绑定当天第 No. 条记录
+                day = st[:10]
+                rows = conn.execute(
+                    "SELECT * FROM shots WHERE shot_time LIKE ? ORDER BY shot_time",
+                    (day + "%",)).fetchall()
+                if 0 < shot_no <= len(rows):
+                    best = rows[shot_no - 1]
+                    flds = json.loads(best["fields"] or "{}")
+                    flds[field] = energy
+                    flds["shot_no"] = shot_no
+                    conn.execute(
+                        "UPDATE shots SET fields=?, rev=COALESCE(rev,1)+1 WHERE id=?",
+                        (json.dumps(flds, ensure_ascii=False), best["id"]))
+                    d = datetime.strptime(
+                        best["shot_time"], "%Y-%m-%d %H:%M:%S") - t0
+                    return self._ok(matched=best["id"], matched_time=best["shot_time"],
+                                    diff_sec=abs(d.total_seconds()),
+                                    sheet_id=best["sheet_id"], field=field,
+                                    energy=energy, by_no=True)
             if p.get("create"):
                 sh = get_sheet(conn, LIVE_SHEET)
                 cur = conn.execute("""
