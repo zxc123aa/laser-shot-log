@@ -1262,7 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
                 flds = json.loads(best["fields"] or "{}")
                 flds[field] = energy
                 if shot_no:
-                    flds["shot_no"] = shot_no
+                    flds["no"] = shot_no
                 conn.execute(
                     "UPDATE shots SET fields=?, rev=COALESCE(rev,1)+1 WHERE id=?",
                     (json.dumps(flds, ensure_ascii=False), best["id"]))
@@ -1279,7 +1279,7 @@ class Handler(BaseHTTPRequestHandler):
                     best = rows[shot_no - 1]
                     flds = json.loads(best["fields"] or "{}")
                     flds[field] = energy
-                    flds["shot_no"] = shot_no
+                    flds["no"] = shot_no
                     conn.execute(
                         "UPDATE shots SET fields=?, rev=COALESCE(rev,1)+1 WHERE id=?",
                         (json.dumps(flds, ensure_ascii=False), best["id"]))

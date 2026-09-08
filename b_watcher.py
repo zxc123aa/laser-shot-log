@@ -19,6 +19,7 @@ B机端 - 实验数据文件监视器
 
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -141,13 +142,19 @@ def scan_once_status(watch_dirs):
     return found, missing
 
 
+# 发次号解析：文件名里的编号（shot-3.png / shor_12.tif…），与 thomson_helper 同款
+NO_PAT = re.compile(r"(?:shot|shor)[-_ ]?(\d+)", re.IGNORECASE)
+
+
 def make_payload(machine_name, group):
     files = [{"name": os.path.basename(p),
               "folder": os.path.dirname(p),
               "mtime": mt} for p, mt in group]
     shot_time = datetime.fromtimestamp(min(mt for _p, mt in group)).strftime("%Y-%m-%d %H:%M:%S")
+    nums = [int(m.group(1)) for f in files if (m := NO_PAT.search(f["name"]))]
+    fields = {"no": min(nums)} if nums else {}
     return {"machine": machine_name, "shot_time": shot_time,
-            "files": files,
+            "files": files, "fields": fields,
             "reported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 

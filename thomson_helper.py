@@ -154,8 +154,9 @@ def make_shot(group):
 def report_shot(shot):
     """把发次上报给 A 机（与 b_watcher 同一入口，A 端按 machine+时间+首文件去重）"""
     files = [{"name": n, "mtime": 0} for n in shot["files"]]
+    fields = {"no": shot["no"]} if shot.get("no") is not None else {}
     payload = {"machine": MACHINE, "shot_time": shot["shot_time"],
-               "files": files, "reported_at":
+               "files": files, "fields": fields, "reported_at":
                datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     j = http_post_json(SERVER_URL.rstrip("/") + "/api/shot", payload)
     return bool(j.get("ok"))
