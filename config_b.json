@@ -1,0 +1,10 @@
+{
+  "watch_dirs": [
+    "D:\\实验数据\\谱仪1",
+    "D:\\实验数据\\谱仪2"
+  ],
+  "server_url": "http://192.168.1.100:8765",
+  "machine_name": "B-DAQ",
+  "scan_interval_sec": 3,
+  "group_window_sec": 8
+}

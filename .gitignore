@@ -1,0 +1,24 @@
+# 实验数据与运行时状态（禁止入库）
+shots.db
+backup/
+*.xls
+*.xlsx
+!docs/*.xlsx
+
+# 运行时状态文件（B机/helper 自动生成）
+state_b.json
+pending_b.json
+unsent_b.json
+state_helper.json
+pending_helper.json
+unsent_helper.json
+config_helper.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 本地测试/工具产物
+.playwright-cli/
+home.yaml
+*.log
