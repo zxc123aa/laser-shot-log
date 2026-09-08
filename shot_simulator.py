@@ -99,11 +99,22 @@ class SimulatorApp:
         ttk.Entry(top, textvariable=self.dir_var, width=46).grid(row=0, column=1, padx=4, pady=4)
         ttk.Label(top, text="(自动按 年\\日期 建子目录)").grid(row=0, column=2, sticky="w")
 
-        ttk.Label(top, text="每发文件数:").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        ttk.Label(top, text="实验日期:").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        self.date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
+        ttk.Entry(top, textvariable=self.date_var, width=14).grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Label(top, text="(默认今天，可改成任意日期如 20260901，写入 基础目录\\年\\日期)").grid(row=1, column=2, sticky="w")
+
+        ttk.Label(top, text="目标目录:").grid(row=2, column=0, sticky="e", padx=6, pady=4)
+        self.target_label = ttk.Label(top, foreground="#06c", text=self._target_dir())
+        self.target_label.grid(row=2, column=1, columnspan=2, sticky="w", padx=4)
+        self.dir_var.trace_add("write", lambda *_: self._refresh_target())
+        self.date_var.trace_add("write", lambda *_: self._refresh_target())
+
+        ttk.Label(top, text="每发文件数:").grid(row=3, column=0, sticky="e", padx=6, pady=4)
         self.nfiles_var = tk.IntVar(value=1)
         spin = ttk.Spinbox(top, from_=1, to=5, width=6, textvariable=self.nfiles_var)
-        spin.grid(row=1, column=1, sticky="w", padx=4)
-        ttk.Label(top, text="(1 发写多张图仍归为一发)").grid(row=1, column=2, sticky="w")
+        spin.grid(row=3, column=1, sticky="w", padx=4)
+        ttk.Label(top, text="(1 发写多张图仍归为一发)").grid(row=3, column=2, sticky="w")
 
         mid = ttk.LabelFrame(self.root, text="发次控制")
         mid.pack(fill="x", **pad)
@@ -140,9 +151,18 @@ class SimulatorApp:
         self.logbox.see("end")
 
     # ----- 动作 -----
+    def _target_dir(self):
+        """计算目标目录（不创建）"""
+        raw = "".join(ch for ch in self.date_var.get() if ch.isdigit())[:8]
+        if len(raw) != 8:
+            raw = datetime.now().strftime("%Y%m%d")  # 日期无效时回退到今天
+        return os.path.join(self.dir_var.get().strip(), raw[:4], raw)
+
+    def _refresh_target(self):
+        self.target_label.config(text=self._target_dir())
+
     def _today_dir(self):
-        now = datetime.now()
-        d = os.path.join(self.dir_var.get().strip(), now.strftime("%Y"), now.strftime("%Y%m%d"))
+        d = self._target_dir()
         os.makedirs(d, exist_ok=True)
         return d
 
@@ -153,11 +173,14 @@ class SimulatorApp:
         except Exception:
             n = 1
         d = self._today_dir()
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         written = []
         try:
             for i in range(1, n + 1):
-                fn = os.path.join(d, "TPS_shot-%03d_%s_%d.png" % (shot, ts, i))
+                base = "shot-%d" % shot if n == 1 else "shot-%d_%d" % (shot, i)
+                fn = os.path.join(d, base + ".png")
+                if os.path.exists(fn):  # 同名已存在（发次号归零重测）时加时间后缀
+                    fn = os.path.join(d, "%s_%s.png"
+                                      % (base, datetime.now().strftime("%H%M%S")))
                 with open(fn, "wb") as f:
                     f.write(make_shot_png(shot))
                 written.append(fn)

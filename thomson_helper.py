@@ -358,7 +358,7 @@ function render(){
   document.getElementById("npending").textContent = np;
 }
 function refresh(){
-  fetch("/api/local").then(function(r){ return r.json(); }).then(function(j){
+  fetch("/api/local", {cache:"no-store"}).then(function(r){ return r.json(); }).then(function(j){
     document.getElementById("dot").className = "dot ok";
     var s = JSON.stringify(j.shots);
     if (s !== LASTJSON){
@@ -400,6 +400,9 @@ document.getElementById("win").textContent = CFG_WINDOW;
 document.getElementById("dirs").textContent = CFG_DIRS;
 document.getElementById("efield").textContent = CFG_FIELD;
 refresh(); setInterval(refresh, 4000);
+/* 切回标签页/窗口聚焦时立即刷新，不等下一个 4 秒节拍 */
+document.addEventListener("visibilitychange", function(){ if (!document.hidden) refresh(); });
+window.addEventListener("focus", refresh);
 </script>
 </body>
 </html>"""

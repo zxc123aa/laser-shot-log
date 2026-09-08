@@ -410,8 +410,8 @@ function toast(m){
   document.body.appendChild(t); setTimeout(function(){t.remove();}, 1800);
 }
 function api(path, body, cb, fail){
-  fetch(path, body ? {method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify(body)} : {})
+  fetch(path, body ? {method:"POST", cache:"no-store", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify(body)} : {cache:"no-store"})
     .then(function(r){ return r.json().then(function(j){
         if(!j.ok && !j.conflict) throw j.error||"请求失败"; return j; }); })
     .then(cb).catch(function(e){ toast("出错: " + e); if (fail) fail(e); });
@@ -788,7 +788,7 @@ function purgeTrash(){
 
 /* ---------- 告警横幅（B 机目录失效等） ---------- */
 function loadAlerts(){
-  fetch("/api/alerts").then(function(r){ return r.json(); }).then(function(j){
+  fetch("/api/alerts", {cache:"no-store"}).then(function(r){ return r.json(); }).then(function(j){
     var b = document.getElementById("banner");
     if (!j.alerts || !j.alerts.length){ b.style.display = "none"; return; }
     var a = j.alerts[0];
@@ -806,6 +806,17 @@ setInterval(function(){
   if (document.querySelector("td.ed input, td.ed select")) return;
   loadSheets(); loadAlerts();
 }, 8000);
+/* 切回标签页/恢复窗口时立即刷新，不等下一个 8 秒节拍 */
+document.addEventListener("visibilitychange", function(){
+  if (document.hidden || S.editing) return;
+  if (document.getElementById("trashMask").style.display === "flex") return;
+  loadSheets(); loadAlerts();
+});
+window.addEventListener("focus", function(){
+  if (S.editing) return;
+  if (document.getElementById("trashMask").style.display === "flex") return;
+  loadSheets();
+});
 
 /* ---------- 启动 ---------- */
 var COLS = __COLS__;
