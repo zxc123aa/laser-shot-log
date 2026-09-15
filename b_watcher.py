@@ -171,6 +171,42 @@ def make_payload(machine_name, group):
             "reported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 
+def config_mtime():
+    """两个配置文件中最新的 mtime（热重载检测用）"""
+    mt = 0
+    for p in (LOCAL_CONFIG_PATH, CONFIG_PATH):
+        try:
+            mt = max(mt, os.path.getmtime(p))
+        except OSError:
+            pass
+    return mt
+
+
+def register_silent_dirs(watch_dirs, seen, registered_dirs):
+    """"首次纳入监视"的目录：静默登记其中已有的全部文件（不上报）。
+    适用于启动时和运行中热更新增目录。返回本次登记的文件数。"""
+    cnt = 0
+    for d in watch_dirs:
+        ad = os.path.abspath(d)
+        if ad in registered_dirs or not os.path.isdir(ad):
+            continue
+        c = 0
+        for root, _dirs, files in os.walk(ad):
+            for fn in files:
+                p = os.path.join(root, fn)
+                if p in seen:
+                    continue
+                try:
+                    seen[p] = os.path.getmtime(p)
+                except OSError:
+                    continue  # 文件正被写入，下一轮按新文件处理
+                c += 1
+        registered_dirs.add(ad)
+        cnt += c
+        log("目录首次纳入监视，静默登记已有文件 %d 个: %s" % (c, d))
+    return cnt
+
+
 def main():
     # 本机实际配置 config_b.local.json 存在时优先（模板 config_b.json 保持入库）
     cfg = load_json(LOCAL_CONFIG_PATH, None) or load_json(CONFIG_PATH, None)
@@ -205,31 +241,15 @@ def main():
     # 新增监视目录静默登记（关键修复）：
     # state 已存在时（非首次运行），config 里新出现的监视目录下的历史文件
     # 会被当成"新文件"全部上报——历史数据就被灌进日志了。
-    # 因此：任何"首次纳入监视"的目录，先静默登记其启动时已有的全部文件。
+    # 因此：任何"首次纳入监视"的目录（启动时或运行中热更新增），
+    # 先静默登记其已有的全部文件。
     registered_dirs = set(load_json(REG_DIRS_PATH, []))
-    silent_cnt = 0
-    for d in watch_dirs:
-        ad = os.path.abspath(d)
-        if ad in registered_dirs or not os.path.isdir(ad):
-            continue
-        cnt = 0
-        for root, _dirs, files in os.walk(ad):
-            for fn in files:
-                p = os.path.join(root, fn)
-                if p in seen:
-                    continue
-                try:
-                    seen[p] = os.path.getmtime(p)
-                except OSError:
-                    continue  # 文件正被写入，下一轮按新文件处理
-                cnt += 1
-        registered_dirs.add(ad)
-        silent_cnt += cnt
-        log("目录首次纳入监视，静默登记已有文件 %d 个: %s" % (cnt, d))
+    silent_cnt = register_silent_dirs(watch_dirs, seen, registered_dirs)
     if silent_cnt:
         save_json(STATE_PATH, seen)
         log("共静默登记 %d 个历史文件（不上报）" % silent_cnt)
     save_json(REG_DIRS_PATH, sorted(registered_dirs))
+    cfg_mtime = config_mtime()
 
     missing_seen = {}   # {目录: 上次告警时间}，同类告警 60 秒节流
     alert_gap = 60.0
@@ -264,6 +284,23 @@ def main():
                     log("目录已恢复: %s" % d)
                     send_alert(server_url, machine_name, "info",
                                "监视目录已恢复: %s" % d)
+
+            # 1.8) 配置热重载：8767 页面"监视目录管理"改了配置，1 秒内自动跟上
+            mt = config_mtime()
+            if mt != cfg_mtime:
+                cfg_mtime = mt
+                nc = load_json(LOCAL_CONFIG_PATH, None) or load_json(CONFIG_PATH, None)
+                if nc and nc.get("watch_dirs") and nc["watch_dirs"] != watch_dirs:
+                    nd = [os.path.normpath(d) for d in nc["watch_dirs"] if d]
+                    added = [d for d in nd if d not in watch_dirs]
+                    gone = [d for d in watch_dirs if d not in nd]
+                    watch_dirs = nd
+                    c = register_silent_dirs(watch_dirs, seen, registered_dirs)
+                    if c:
+                        save_json(STATE_PATH, seen)
+                    save_json(REG_DIRS_PATH, sorted(registered_dirs))
+                    log("配置热重载：新增 %s，移除 %s（静默登记 %d 个文件）"
+                        % (added or "无", gone or "无", c))
 
             # 2) 扫描
             entries = scan_once(watch_dirs)

@@ -44,6 +44,7 @@ from urllib.parse import urlparse
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config_helper.json")
 STATE_PATH = os.path.join(BASE, "state_helper.json")
+B_LOCAL_CONFIG_PATH = os.path.join(BASE, "config_b.local.json")  # b_watcher 本机配置（监视目录变更需同步给它）
 
 # RLock：save_state() 在调用方已持锁时也会被调用，必须可重入
 _state_lock = threading.RLock()
@@ -219,25 +220,91 @@ def retry_queue():
             save_state()
 
 
-def monitor_loop(watch_dirs, interval, window):
+def _norm_dir(d):
+    """目录路径规范化：去引号/空白，补全尾斜杠（'D:' -> 'D:\\'）"""
+    d = str(d).strip().strip('"')
+    if len(d) == 2 and d[1] == ":":
+        d += "\\"
+    return os.path.normpath(d)
+
+
+def set_watch_dirs(new_dirs):
+    """8767 页面"监视目录管理"入口：增删目录即时生效。
+    新目录静默登记已有文件（历史数据不会被当成新发次上报）；
+    同步写回 config_helper.json，并同步 config_b.local.json
+    （b_watcher 检测到配置变更会自动热重载）。"""
+    dirs, uniq = [], set()
+    for d in new_dirs:
+        nd = _norm_dir(d)
+        if nd and nd not in uniq:
+            dirs.append(nd)
+            uniq.add(nd)
+    if not dirs:
+        return {"ok": False, "error": "至少需要保留一个监视目录"}
+    with _state_lock:
+        old = list(WATCH_DIRS)
+        added = [d for d in dirs if d not in WATCH_DIRS]
+        removed = [d for d in WATCH_DIRS if d not in dirs]
+        silent = 0
+        for d in added:                   # 新目录：先静默登记，避免历史文件误报
+            if os.path.isdir(d):
+                for root, _ds, fs in os.walk(d):
+                    for fn in fs:
+                        p = os.path.join(root, fn)
+                        try:
+                            STATE["seen"].setdefault(p, os.path.getmtime(p))
+                        except OSError:
+                            continue
+                        silent += 1
+        for d in removed:                 # 删除目录：顺手清理扫描缓存
+            pre = d.rstrip("\\/") + os.sep
+            for k in [k for k in _DIR_CACHE if k == d or k.startswith(pre)]:
+                _DIR_CACHE.pop(k, None)
+        WATCH_DIRS[:] = dirs              # 原地替换，监视循环无需重启
+        if silent:
+            save_state()
+        CFG["watch_dirs"] = dirs
+        save_json(CONFIG_PATH, CFG)
+        bl = load_json(B_LOCAL_CONFIG_PATH, None)
+        if bl and "watch_dirs" in bl:     # 让 b_watcher（上报 A 机）保持同目录
+            # b_watcher 可能还监视着 8767 页面之外的目录（如 DAQ 目录）：
+            # 只同步页面管理的目录，b_watcher 独有的目录原样保留不被误删
+            old_set = {os.path.normpath(x) for x in old}
+            keep = [os.path.normpath(x) for x in bl["watch_dirs"]
+                    if x and os.path.normpath(x) not in old_set
+                    and os.path.normpath(x) not in uniq]
+            bl["watch_dirs"] = dirs + keep
+            save_json(B_LOCAL_CONFIG_PATH, bl)
+    bump_ver()
+    if added:
+        log("新增监视目录: %s（静默登记 %d 个已有文件）" % (added, silent))
+    if removed:
+        log("移除监视目录: %s" % removed)
+    return {"ok": True, "added": added, "removed": removed,
+            "dirs": [{"path": d, "exists": os.path.isdir(d)} for d in dirs]}
+
+
+def monitor_loop(interval, window):
+    """监视循环：每轮取 WATCH_DIRS 快照，页面改目录后下一轮立即生效"""
     seen_first = not os.path.exists(STATE_PATH)
     if seen_first:
         with _state_lock:
             if not STATE["seen"]:
-                entries, _missing = scan_all(watch_dirs)
+                entries, _missing = scan_all(WATCH_DIRS)
                 for p, mt in entries:
                     STATE["seen"][p] = mt
                 save_state()
         log("首次运行：登记已有图片 %d 个（不上报）" % len(STATE["seen"]))
-    log("监视目录: %s" % watch_dirs)
+    log("监视目录: %s" % WATCH_DIRS)
     log("日志系统: %s   本机页面: http://127.0.0.1:%d"
         % (SERVER_URL, CFG.get("helper_port", 8767)))
     missing_seen = {}      # {目录: 上次告警时间}，60 秒节流
     while True:
         try:
             retry_queue()
+            dirs = list(WATCH_DIRS)       # 快照：页面改目录后下一轮即生效
             _t0 = time.time()
-            entries, missing = scan_all(watch_dirs)
+            entries, missing = scan_all(dirs)
             if time.time() - _t0 > 0.5:
                 log("警告: 扫描耗时 %.2fs（正常应 <0.1s）" % (time.time() - _t0))
             now = time.time()
@@ -389,7 +456,8 @@ HELP_PAGE = r"""<!DOCTYPE html>
   </span>
 </div>
 <div id="bar">
-  <span>监视目录：<b id="dirs">-</b></span>
+  <span>监视目录：<b id="dirs" style="cursor:pointer;border-bottom:1px dotted #888"
+        onclick="openDirs()" title="点击管理监视目录">-</b></span>
   <span>待填能量 <b id="npending">0</b> 发</span>
   <span>绑定窗口 ±<b id="win">-</b>s</span>
   <span>能量写入列：<b id="efield">-</b></span>
@@ -405,6 +473,30 @@ HELP_PAGE = r"""<!DOCTYPE html>
 </div>
 <div id="foot">No. 自动取自文件名（shot-3 → 3），可手动修正 ｜ 能量按时间窗绑定，未命中时按 No. 兜底 ｜ 能量可"重发"覆盖</div>
 <div id="toast"></div>
+<div id="dirMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
+     z-index:50;align-items:center;justify-content:center"
+     onclick="if(event.target===this)closeDirs()">
+  <div style="background:#fff;border-radius:12px;width:600px;max-width:92vw;
+       padding:20px 24px;max-height:80vh;overflow:auto">
+    <div style="display:flex;align-items:center;margin-bottom:6px">
+      <b style="font-size:15px">监视目录管理</b>
+      <span style="margin-left:auto;cursor:pointer;color:#999;font-size:20px;
+            line-height:1" onclick="closeDirs()">✕</span>
+    </div>
+    <div style="font-size:12px;color:#888;margin-bottom:12px">
+      新增目录会静默登记其中已有文件（历史数据不会误报为新发次）；删除即时生效，
+      并自动同步给打靶监测（b_watcher），两侧目录始终一致。
+    </div>
+    <div id="dirList"></div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <input id="newDir" style="flex:1;padding:7px 10px;border:1px solid #d5d9de;
+             border-radius:6px;font-size:13px;font-family:Consolas,monospace"
+             placeholder="输入目录，如 D:\data117\TPS 或 D:\实验数据\XXX"
+             onkeydown="if(event.key==='Enter')addDir()">
+      <button class="tbtn" onclick="addDir()">添加</button>
+    </div>
+  </div>
+</div>
 <script>
 var SHOTS = [], LASTJSON = "", T = null;
 function toast(s){
@@ -463,6 +555,55 @@ function apply(j){
       SHOTS = j.shots; LASTJSON = s; render();
     }
   }
+}
+/* ---------- 监视目录管理面板 ---------- */
+var DIRS = [];
+function openDirs(){
+  document.getElementById("dirMask").style.display = "flex";
+  fetch("/api/watchdirs", {cache:"no-store"}).then(function(r){ return r.json(); })
+  .then(function(j){ DIRS = j.dirs || []; renderDirs(); });
+}
+function closeDirs(){ document.getElementById("dirMask").style.display = "none"; }
+function renderDirs(){
+  var h = "";
+  DIRS.forEach(function(d, i){
+    h += "<div style='display:flex;align-items:center;gap:8px;padding:7px 10px;" +
+         "border:1px solid #e6e8eb;border-radius:6px;margin-bottom:6px;font-size:13px;" +
+         "font-family:Consolas,monospace'>";
+    h += "<span style='flex:1;word-break:break-all'>" + d.path + "</span>";
+    if (!d.exists)
+      h += "<span style='color:#8a6100;background:#fff3cd;border-radius:4px;" +
+           "padding:2px 8px;font-size:11px;font-family:inherit'>目录不存在</span>";
+    h += "<button class='tbtn' style='background:#c0392b;padding:4px 12px' " +
+         "onclick='delDir(" + i + ")'>删除</button></div>";
+  });
+  document.getElementById("dirList").innerHTML =
+    h || "<div style='color:#999;font-size:13px'>（无监视目录）</div>";
+}
+function addDir(){
+  var inp = document.getElementById("newDir");
+  var v = inp.value.trim();
+  if (!v){ toast("请输入目录路径"); return; }
+  saveDirs(DIRS.map(function(d){ return d.path; }).concat([v]));
+  inp.value = "";
+}
+function delDir(i){
+  var rest = DIRS.map(function(d){ return d.path; });
+  rest.splice(i, 1);
+  saveDirs(rest);
+}
+function saveDirs(list){
+  fetch("/api/watchdirs", {method:"POST", cache:"no-store",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({dirs: list})})
+  .then(function(r){ return r.json(); }).then(function(j){
+    if (!j.ok){ toast(j.error || "保存失败"); return; }
+    DIRS = j.dirs || []; renderDirs();
+    document.getElementById("dirs").textContent =
+      DIRS.map(function(d){ return d.path; }).join("；") || "-";
+    if ((j.added||[]).length) toast("已添加并静默登记：" + j.added.join("、"));
+    if ((j.removed||[]).length) toast("已移除：" + j.removed.join("、"));
+  }).catch(function(){ toast("保存失败（网络错误）"); });
 }
 function refresh(){
   fetch("/api/local", {cache:"no-store"}).then(function(r){ return r.json(); }).then(apply)
@@ -560,6 +701,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, self._snapshot())
         elif urlparse(self.path).path == "/api/events":
             self.sse_events()
+        elif urlparse(self.path).path == "/api/watchdirs":
+            self._send(200, json.dumps(
+                {"ok": True, "dirs": [{"path": d, "exists": os.path.isdir(d)}
+                                       for d in WATCH_DIRS]}, ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -592,6 +737,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if urlparse(self.path).path == "/api/bind":
             self.api_bind()
+        elif urlparse(self.path).path == "/api/watchdirs":
+            p = self._json_body()
+            self._send(200, json.dumps(
+                set_watch_dirs(p.get("dirs") or []), ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -708,7 +857,7 @@ def main():
         log("线程异常退出: %r" % args.exc_value)
     threading.excepthook = _thread_exc
     t = threading.Thread(target=monitor_loop,
-                         args=(dirs, interval, window), daemon=True)
+                         args=(interval, window), daemon=True)
     t.start()
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
