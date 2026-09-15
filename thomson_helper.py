@@ -237,6 +237,12 @@ def report_shot(shot):
     payload = {"machine": MACHINE, "shot_time": shot["shot_time"],
                "files": files, "fields": fields, "reported_at":
                datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    # 上报目标表：""=默认"实时打靶"；"@date"=按打靶日期自动分表；其他=固定表名
+    sn = str((CFG or {}).get("sheet_name", "") or "").strip()
+    if sn == "@date":
+        sn = str(shot["shot_time"])[:10]
+    if sn:
+        payload["sheet_name"] = sn
     j = http_post_json(SERVER_URL.rstrip("/") + "/api/shot", payload)
     return bool(j.get("ok"))
 

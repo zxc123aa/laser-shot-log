@@ -161,7 +161,9 @@ def scan_once_status(watch_dirs):
 NO_PAT = re.compile(r"(?:shot|shor)[-_ ]?(\d+)", re.IGNORECASE)
 
 
-def make_payload(machine_name, group):
+def make_payload(machine_name, group, sheet_name=""):
+    """sheet_name: ""=A 机默认表(实时打靶); "@date"=按打靶日期自动分表;
+    其他=固定写入该表名的表（不存在 A 机自动创建）"""
     files = [{"name": os.path.basename(p),
               "folder": os.path.dirname(p),
               "mtime": mt} for p, mt in group]
@@ -178,9 +180,15 @@ def make_payload(machine_name, group):
             fields["target_defocus"] = str(d["defocus"])
     except Exception:
         pass  # 靶系统离线时不上靶位字段，不影响打靶上报
-    return {"machine": machine_name, "shot_time": shot_time,
-            "files": files, "fields": fields,
-            "reported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    sn = str(sheet_name or "").strip()
+    if sn == "@date":
+        sn = shot_time[:10]  # 打靶日期 -> 当天日期命名的表
+    payload = {"machine": machine_name, "shot_time": shot_time,
+               "files": files, "fields": fields,
+               "reported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    if sn:
+        payload["sheet_name"] = sn
+    return payload
 
 
 def config_mtime():
@@ -238,6 +246,8 @@ def main():
     machine_name = cfg.get("machine_name", socket.gethostname())
     interval = float(cfg.get("scan_interval_sec", 3))
     window = float(cfg.get("group_window_sec", 8))
+    # 上报目标表：""=默认"实时打靶"；"@date"=按打靶日期自动分表；其他=固定表名
+    sheet_name = str(cfg.get("sheet_name", "") or "").strip()
 
     seen = load_json(STATE_PATH, {})      # {路径: mtime}
     pend = load_json(PENDING_PATH, [])    # 已见但尚未归组上报的 [[路径, mtime], ...]
@@ -302,6 +312,13 @@ def main():
             if mt != cfg_mtime:
                 cfg_mtime = mt
                 nc = load_json(LOCAL_CONFIG_PATH, None) or load_json(CONFIG_PATH, None)
+                if nc:
+                    # 上报目标表热更新
+                    ns = str(nc.get("sheet_name", "") or "").strip()
+                    if ns != sheet_name:
+                        sheet_name = ns
+                        log("配置热重载：上报目标表 -> %s"
+                            % (ns or "实时打靶(默认)"))
                 if nc and nc.get("watch_dirs") and nc["watch_dirs"] != watch_dirs:
                     nd = [os.path.normpath(d) for d in nc["watch_dirs"] if d]
                     added = [d for d in nd if d not in watch_dirs]
@@ -342,7 +359,7 @@ def main():
                     save_json(STATE_PATH, seen)
                     save_json(PENDING_PATH, pend)
                     for g in done_groups:
-                        pl = make_payload(machine_name, g)
+                        pl = make_payload(machine_name, g, sheet_name)
                         try:
                             send_shot(server_url, pl)
                             log("已上报 1 次打靶: %s  (%d 个文件, 首=%s)"
