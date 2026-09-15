@@ -627,6 +627,14 @@ function apply(j){
       SHOTS = j.shots; LASTJSON = s; render();
     }
   }
+  if (j.dirs){            // 目录变更 → 信息条实时更新（其他标签页也同步）
+    var d = j.dirs.join("；") || "-";
+    var el = document.getElementById("dirs");
+    if (el.textContent !== d){
+      el.textContent = d;
+      if (document.getElementById("dirMask").style.display === "flex") openDirs();
+    }
+  }
 }
 /* ---------- 监视目录管理面板 ---------- */
 var DIRS = [];
@@ -787,10 +795,11 @@ class Handler(BaseHTTPRequestHandler):
         with _state_lock:
             shots = [dict(s) for s in STATE["shots"]]
             fm = STATE.get("forming_shot")
+            dirs = list(WATCH_DIRS)     # 随快照下发：目录变更所有页面实时同步
         out = ([dict(fm)] if fm else []) + shots   # "检测中"行置顶
         return json.dumps(
             {"ok": True, "shots": out[:200], "server": SERVER_URL,
-             "queue": len(STATE["queue"])}, ensure_ascii=False)
+             "queue": len(STATE["queue"]), "dirs": dirs}, ensure_ascii=False)
 
     def do_GET(self):
         if urlparse(self.path).path == "/":
