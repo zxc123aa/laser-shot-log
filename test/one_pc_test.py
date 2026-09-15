@@ -54,8 +54,10 @@ def main():
     with open(os.path.join(s1, "历史数据_昨天.dat"), "w") as f:
         f.write("old")
 
-    shutil.copy(os.path.join(BASE, "a_server.py"), RUN)
-    shutil.copy(os.path.join(BASE, "b_watcher.py"), RUN)
+    # 核心脚本在项目根目录（test\ 的上一级）
+    ROOT = os.path.dirname(BASE)
+    shutil.copy(os.path.join(ROOT, "a_server.py"), RUN)
+    shutil.copy(os.path.join(ROOT, "b_watcher.py"), RUN)
     with open(os.path.join(RUN, "config_b.json"), "w", encoding="utf-8") as f:
         json.dump({
             "watch_dirs": [s1, s2],

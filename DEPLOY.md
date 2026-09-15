@@ -7,7 +7,10 @@
 | **B 机（数据机）** | `start_real.bat` | b_watcher 打靶监视 + sheet_backup 表格备份 + 能量填报页(8767)，三个最小化窗口 |
 | B 机（只跑备份） | `start_backup.bat` | 仅表格备份 |
 | **A 机（主控服务器）** | `start_a_server.bat` | a_server.py，页面 http://<A机IP>:8765 |
-| 演示模式 | `start_all.bat` | watcher + 能量页 + 模拟器（测试用，别在实验时开） |
+
+> 测试 / 演示工具全部在 `test\` 子目录（`start_all.bat` 演示模式、`start_simulator.bat`
+> 发次模拟器、`start_test_gen.bat` 假发次生成器、`one_pc_test.bat` 单机演示），
+> 实验时别开。
 
 - 所有 bat 都用 `py` 启动器，新电脑只要有 Python 3.8+（含 tkinter 更佳）即可
 - B 机首次部署：复制 `config_b.local.json`（模板见 `config_b.json`），改 `watch_dirs`（谱仪落盘目录）和 `server_url`（A 机地址）
