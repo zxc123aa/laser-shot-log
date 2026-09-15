@@ -228,6 +228,76 @@ def _norm_dir(d):
     return os.path.normpath(d)
 
 
+# ---------------- 原生"选择文件夹"对话框（网页浏览按钮调用） ----------------
+# 浏览器安全限制拿不到真实路径，但 helper 就跑在本机：用子进程弹
+# 系统 tkinter 文件夹对话框，选完把真实路径传回页面。
+_PICK_STATE = {"state": "idle", "path": "", "error": ""}  # idle|pending|done|canceled
+_PICK_LOCK = threading.Lock()
+_PICK_PY = None       # 缓存带 tkinter 的解释器（managed 3.13 没有，系统 3.10 有）
+
+
+def _find_tk_python():
+    """找一个能 import tkinter 的 Python 解释器"""
+    global _PICK_PY
+    if _PICK_PY:
+        return _PICK_PY
+    import subprocess
+    for exe in (r"D:\Program Files\Python310\python.exe", sys.executable):
+        try:
+            r = subprocess.run([exe, "-c", "import tkinter; print('ok')"],
+                               capture_output=True, timeout=30)
+            if r.returncode == 0:
+                _PICK_PY = exe
+                return exe
+        except Exception:
+            continue
+    return None
+
+
+def _pick_dir_worker():
+    """弹本机文件夹选择对话框（子进程，避免阻塞/依赖 tkinter）"""
+    import subprocess
+    try:
+        exe = _find_tk_python()
+        if not exe:
+            with _PICK_LOCK:
+                _PICK_STATE.update(state="canceled", path="",
+                                   error="本机没有可用的 tkinter 环境，请手动输入路径")
+            return
+        code = ("import tkinter as tk; from tkinter import filedialog;"
+                "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True);"
+                "r.focus_force();"
+                "p = filedialog.askdirectory(title='选择要监视的文件夹', mustexist=True);"
+                "r.destroy(); print(p)")
+        r = subprocess.run([exe, "-c", code], capture_output=True, text=True,
+                           timeout=600,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        p = (r.stdout or "").strip()
+        with _PICK_LOCK:
+            if p:
+                _PICK_STATE.update(state="done", path=os.path.normpath(p), error="")
+            else:
+                _PICK_STATE.update(state="canceled", path="", error="已取消")
+    except Exception as e:
+        with _PICK_LOCK:
+            _PICK_STATE.update(state="canceled", path="", error=repr(e))
+
+
+def pick_dir_start():
+    """开始一次选择（同一时刻只允许一个对话框）"""
+    with _PICK_LOCK:
+        if _PICK_STATE["state"] == "pending":
+            return {"ok": False, "error": "已有选择窗口打开，请先完成或取消"}
+        _PICK_STATE.update(state="pending", path="", error="")
+    threading.Thread(target=_pick_dir_worker, daemon=True).start()
+    return {"ok": True, "state": "pending"}
+
+
+def pick_dir_status():
+    with _PICK_LOCK:
+        return {"ok": True, **_PICK_STATE}
+
+
 def set_watch_dirs(new_dirs):
     """8767 页面"监视目录管理"入口：增删目录即时生效。
     新目录静默登记已有文件（历史数据不会被当成新发次上报）；
@@ -484,6 +554,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
             line-height:1" onclick="closeDirs()">✕</span>
     </div>
     <div style="font-size:12px;color:#888;margin-bottom:12px">
+      点"浏览…"会弹出本机文件夹选择窗口（真实路径自动填入）；也可直接手动输入。
       新增目录会静默登记其中已有文件（历史数据不会误报为新发次）；删除即时生效，
       并自动同步给打靶监测（b_watcher），两侧目录始终一致。
     </div>
@@ -493,6 +564,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
              border-radius:6px;font-size:13px;font-family:Consolas,monospace"
              placeholder="输入目录，如 D:\data117\TPS 或 D:\实验数据\XXX"
              onkeydown="if(event.key==='Enter')addDir()">
+      <button class="tbtn" id="btnBrowse" onclick="browseDir()">浏览…</button>
       <button class="tbtn" onclick="addDir()">添加</button>
     </div>
   </div>
@@ -605,6 +677,31 @@ function saveDirs(list){
     if ((j.removed||[]).length) toast("已移除：" + j.removed.join("、"));
   }).catch(function(){ toast("保存失败（网络错误）"); });
 }
+/* 浏览按钮：后端弹系统文件夹对话框，轮询取回真实路径后自动添加 */
+function browseDir(){
+  var btn = document.getElementById("btnBrowse");
+  fetch("/api/pickdir", {method:"POST", cache:"no-store"})
+  .then(function(r){ return r.json(); }).then(function(j){
+    if (!j.ok){ toast(j.error || "无法打开选择窗口"); return; }
+    toast("请在弹出的窗口中选择要监视的文件夹…");
+    btn.disabled = true;
+    var n = 0;
+    var timer = setInterval(function(){
+      fetch("/api/pickdir", {cache:"no-store"})
+      .then(function(r){ return r.json(); }).then(function(j){
+        if (j.state === "done"){
+          clearInterval(timer); btn.disabled = false;
+          document.getElementById("newDir").value = j.path;
+          addDir();
+        } else if (j.state === "canceled"){
+          clearInterval(timer); btn.disabled = false;
+          if (j.error && j.error !== "已取消") toast(j.error);
+        }
+      }).catch(function(){});
+      if (++n > 1200){ clearInterval(timer); btn.disabled = false; }
+    }, 500);
+  }).catch(function(){ toast("无法打开选择窗口"); });
+}
 function refresh(){
   fetch("/api/local", {cache:"no-store"}).then(function(r){ return r.json(); }).then(apply)
   .catch(function(){
@@ -705,6 +802,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(
                 {"ok": True, "dirs": [{"path": d, "exists": os.path.isdir(d)}
                                        for d in WATCH_DIRS]}, ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/pickdir":
+            self._send(200, json.dumps(pick_dir_status(), ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -741,6 +840,8 @@ class Handler(BaseHTTPRequestHandler):
             p = self._json_body()
             self._send(200, json.dumps(
                 set_watch_dirs(p.get("dirs") or []), ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/pickdir":
+            self._send(200, json.dumps(pick_dir_start(), ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
