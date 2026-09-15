@@ -26,6 +26,8 @@ import time
 import urllib.request
 from datetime import datetime
 
+import target_client
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config_b.json")
 LOCAL_CONFIG_PATH = os.path.join(BASE, "config_b.local.json")  # 本机实际配置（不入库，优先于 config_b.json）
@@ -166,6 +168,16 @@ def make_payload(machine_name, group):
     shot_time = datetime.fromtimestamp(min(mt for _p, mt in group)).strftime("%Y-%m-%d %H:%M:%S")
     nums = [int(m.group(1)) for f in files if (m := NO_PAT.search(f["name"]))]
     fields = {"no": min(nums)} if nums else {}
+    # 当前靶位/离焦（重频靶系统）。优先用 thomson_helper 轮询线程写的缓存
+    # （最多 30s 旧，零延迟）；缓存过期才现场查（限时，不阻塞主流程太久）。
+    try:
+        d = target_client.get(max_age=30, timeout=6)
+        if d.get("pos"):
+            fields["target_pos"] = d["pos"]
+        if d.get("defocus") != "":
+            fields["target_defocus"] = str(d["defocus"])
+    except Exception:
+        pass  # 靶系统离线时不上靶位字段，不影响打靶上报
     return {"machine": machine_name, "shot_time": shot_time,
             "files": files, "fields": fields,
             "reported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}

@@ -1250,7 +1250,7 @@ class Handler(BaseHTTPRequestHandler):
                                       (cur.lastrowid,)).fetchone()
             # 显式去重：同一来源、同一时间、同一首个文件 = 重复上报
             dup = conn.execute(
-                "SELECT 1 FROM shots WHERE machine IS ? AND shot_time=? "
+                "SELECT id, fields FROM shots WHERE machine IS ? AND shot_time=? "
                 "AND first_file IS ? AND sheet_id=?",
                 (machine, shot_time, first_name, sh["id"])).fetchone()
             if not dup:
@@ -1264,6 +1264,22 @@ class Handler(BaseHTTPRequestHandler):
                      json.dumps(p.get("fields", {}), ensure_ascii=False),
                      p.get("reported_at", ""),
                      datetime.now().strftime("%Y-%m-%d %H:%M:%S"), sh["id"]))
+            else:
+                # 重复上报：字段合并——已存在的行里"空/缺失"的字段用新值补上
+                # （helper 与 b_watcher 都会上报同一次打靶，谁先到谁建行；
+                #   后到的可能带着先到者没有的数据，如靶位/离焦，不能直接丢弃）
+                try:
+                    flds = json.loads(dup["fields"] or "{}")
+                except Exception:
+                    flds = {}
+                merged = {k: v for k, v in (p.get("fields") or {}).items()
+                          if v not in ("", None) and not flds.get(k)}
+                if merged:
+                    flds.update(merged)
+                    conn.execute(
+                        "UPDATE shots SET fields=?, rev=COALESCE(rev,1)+1 "
+                        "WHERE id=?",
+                        (json.dumps(flds, ensure_ascii=False), dup["id"]))
         self._ok(duplicate=bool(dup))
 
     def api_energy(self):

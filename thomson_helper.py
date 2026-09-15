@@ -41,6 +41,8 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import target_client
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config_helper.json")
 STATE_PATH = os.path.join(BASE, "state_helper.json")
@@ -51,6 +53,30 @@ _state_lock = threading.RLock()
 STATE = {"seen": {}, "pend": [], "shots": [], "queue": [], "no_seq": {},
          "forming_shot": None}
 STATE_VER = 0          # 页面 SSE 推送用的状态版本号：shots/queue 一变就 +1
+
+# 重频靶系统实时状态（后台线程每 5s 刷新；靶位/离焦随 SSE 推到页面）
+TARGET = dict(target_client.EMPTY)
+
+
+def target_poll_loop(interval=5.0):
+    """后台轮询重频靶系统：当前靶位 / 离焦值等，结果写 state_target.json
+    （b_watcher 上报时直接读缓存，零延迟）。靶系统离线不影响打靶主流程。"""
+    global TARGET
+    while True:
+        try:
+            d = target_client.poll()
+        except Exception as e:
+            d = dict(target_client.EMPTY)
+            d["error"] = repr(e)
+            d["ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        changed = (d.get("pos") != TARGET.get("pos") or
+                   d.get("defocus") != TARGET.get("defocus") or
+                   d.get("ok") != TARGET.get("ok"))
+        with _state_lock:
+            TARGET = d
+        if changed:
+            bump_ver()   # 靶位/离焦变化也推给页面
+        time.sleep(interval)
 
 
 def bump_ver():
@@ -188,13 +214,26 @@ def make_shot(group):
         "%Y-%m-%d %H:%M:%S")
     return {"shot_time": st, "files": names, "file_count": len(group),
             "no": parse_shot_no(names),
+            "target": "", "defocus": "",
             "energy": "", "status": "pending", "info": "", "row_id": None}
+
+
+def attach_target(shot):
+    """把当前靶位/离焦值（后台轮询缓存，最多 5s 旧）挂到发次上"""
+    with _state_lock:
+        shot["target"] = TARGET.get("pos", "") or ""
+        shot["defocus"] = TARGET.get("defocus", "") or ""
+    return shot
 
 
 def report_shot(shot):
     """把发次上报给 A 机（与 b_watcher 同一入口，A 端按 machine+时间+首文件去重）"""
     files = [{"name": n, "mtime": 0} for n in shot["files"]]
     fields = {"no": shot["no"]} if shot.get("no") is not None else {}
+    if shot.get("target"):
+        fields["target_pos"] = shot["target"]       # A 机表已有"靶位"列
+    if shot.get("defocus") != "":
+        fields["target_defocus"] = str(shot["defocus"])  # A 机表"靶离焦"列
     payload = {"machine": MACHINE, "shot_time": shot["shot_time"],
                "files": files, "fields": fields, "reported_at":
                datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -394,7 +433,7 @@ def monitor_loop(interval, window):
             if all_new:
                 done, hold = group_into_shots(all_new, window)
                 if hold:
-                    forming = make_shot(hold)
+                    forming = attach_target(make_shot(hold))
                     forming["status"] = "forming"
                     forming["info"] = "检测中…（文件可能还没到齐）"
                 with _state_lock:
@@ -403,7 +442,7 @@ def monitor_loop(interval, window):
                     STATE["pend"] = [list(x) for x in hold]
                 save_state()
                 for g in done:
-                    shot = make_shot(g)
+                    shot = attach_target(make_shot(g))
                     # 发次号：文件名能解析就用解析值；否则按当天顺序自动补号
                     day = shot["shot_time"][:10]
                     with _state_lock:
@@ -531,11 +570,13 @@ HELP_PAGE = r"""<!DOCTYPE html>
   <span>待填能量 <b id="npending">0</b> 发</span>
   <span>绑定窗口 ±<b id="win">-</b>s</span>
   <span>能量写入列：<b id="efield">-</b></span>
+  <span>当前靶位：<b id="tgt">…</b><span id="tgtF" style="color:#888;font-size:12px"></span></span>
 </div>
 <div class="wrap">
   <table>
     <thead><tr>
       <th>No.</th><th>发次时间</th><th>图片数</th><th>图片文件</th>
+      <th>靶位/离焦</th>
       <th>闪烁光纤能量</th><th>状态</th><th>操作</th>
     </tr></thead>
     <tbody id="tb"></tbody>
@@ -583,7 +624,7 @@ function stLabel(s){
 function render(){
   var tb = document.getElementById("tb");
   if (!SHOTS.length){
-    tb.innerHTML = "<tr><td colspan=7 class='empty'>暂未检测到发次——等待谱仪图片落盘…</td></tr>";
+    tb.innerHTML = "<tr><td colspan=8 class='empty'>暂未检测到发次——等待谱仪图片落盘…</td></tr>";
   } else {
     var h = "";
     SHOTS.forEach(function(s, i){
@@ -594,6 +635,9 @@ function render(){
       h += "<td>" + s.file_count + "</td>";
       h += "<td class='files' title='" + s.files.join("  ") + "'>" +
            (s.files[0] || "-") + (s.file_count > 1 ? " 等" + s.file_count + "个" : "") + "</td>";
+      var tgt = s.target || "-";
+      if (s.defocus !== "" && s.defocus != null) tgt += " <span style='color:#888'>离焦 " + s.defocus + "</span>";
+      h += "<td style='white-space:nowrap'>" + tgt + "</td>";
       h += "<td><input class='e' data-i='" + i + "' value='" +
            (s.energy || "").replace(/'/g,"&#39;") +
            "' placeholder='如 2.35' onkeydown='if(event.key===\"Enter\")send(" + i + ",false)'></td>";
@@ -633,6 +677,19 @@ function apply(j){
     if (el.textContent !== d){
       el.textContent = d;
       if (document.getElementById("dirMask").style.display === "flex") openDirs();
+    }
+  }
+  if (j.target){          // 重频靶系统实时状态 → 信息条
+    var t = j.target, e2 = document.getElementById("tgt"),
+        e3 = document.getElementById("tgtF");
+    if (t.ok && t.pos){
+      e2.textContent = t.pos;
+      e2.style.color = "#2c3e50";
+      e3.textContent = t.defocus !== "" ? "（离焦 " + t.defocus + "）" : "";
+    } else {
+      e2.textContent = "离线";
+      e2.style.color = "#c0392b";
+      e3.textContent = "";
     }
   }
 }
@@ -796,10 +853,12 @@ class Handler(BaseHTTPRequestHandler):
             shots = [dict(s) for s in STATE["shots"]]
             fm = STATE.get("forming_shot")
             dirs = list(WATCH_DIRS)     # 随快照下发：目录变更所有页面实时同步
+            tgt = dict(TARGET)          # 靶位/离焦实时状态
         out = ([dict(fm)] if fm else []) + shots   # "检测中"行置顶
         return json.dumps(
             {"ok": True, "shots": out[:200], "server": SERVER_URL,
-             "queue": len(STATE["queue"]), "dirs": dirs}, ensure_ascii=False)
+             "queue": len(STATE["queue"]), "dirs": dirs, "target": tgt},
+            ensure_ascii=False)
 
     def do_GET(self):
         if urlparse(self.path).path == "/":
@@ -970,6 +1029,11 @@ def main():
     t = threading.Thread(target=monitor_loop,
                          args=(interval, window), daemon=True)
     t.start()
+    tt = threading.Thread(target=target_poll_loop, daemon=True)
+    tt.start()
+    log("靶位采集线程已启动（重频靶系统 %s:%s，每 5s 刷新）" %
+        (target_client._load_cfg().get("host", "10.0.23.116"),
+         target_client._load_cfg().get("port", 5362)))
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
         log("汤姆逊能量上报页面: http://127.0.0.1:%d" % port)
