@@ -750,6 +750,7 @@ document.getElementById("win").textContent = CFG_WINDOW;
 document.getElementById("dirs").textContent = CFG_DIRS;
 document.getElementById("efield").textContent = CFG_FIELD;
 refresh(); connectSSE(); setInterval(refresh, 15000);   // SSE 实时推送，15s 轮询仅作兜底
+if (location.hash === "#dirs") openDirs();   // URL 直达目录管理面板
 /* 切回标签页/窗口聚焦时立即刷新，不等下一个 4 秒节拍 */
 document.addEventListener("visibilitychange", function(){ if (!document.hidden) refresh(); });
 window.addEventListener("focus", refresh);
