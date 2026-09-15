@@ -404,6 +404,48 @@ def set_watch_dirs(new_dirs):
             "dirs": [{"path": d, "exists": os.path.isdir(d)} for d in dirs]}
 
 
+def sheet_label(sn):
+    """绑定值 -> 页面展示文案"""
+    if sn == "@date":
+        return "按日期自动分表"
+    return sn or "实时打靶(默认)"
+
+
+def get_sheet_binding():
+    """8767 页面"上报表格绑定"数据：当前绑定值 + A 机已有表格列表"""
+    cur = str((CFG or {}).get("sheet_name", "") or "").strip()
+    sheets = []
+    try:
+        req = urllib.request.Request(
+            SERVER_URL.rstrip("/") + "/api/sheets",
+            headers={"Accept": "application/json"})
+        j = json.loads(urllib.request.urlopen(req, timeout=6).read()
+                       .decode("utf-8"))
+        sheets = [{"id": s.get("id"), "name": s.get("name"),
+                   "count": s.get("count")} for s in j.get("sheets", [])]
+    except Exception:
+        pass  # A 机暂不可达：下拉框只显示特殊选项，不影响改绑定
+    return {"ok": True, "sheet_name": cur, "label": sheet_label(cur),
+            "sheets": sheets}
+
+
+def set_sheet_binding(name):
+    """8767 页面切换上报目标表：写 config_helper.json 并同步 config_b.local.json
+    （b_watcher 检测到配置 mtime 变化会自动热重载，无需重启）。"""
+    sn = str(name or "").strip()
+    if sn not in ("", "@date") and re.search(r'[\\/:*?"<>|]', sn):
+        return {"ok": False, "error": "表名含非法字符 \\ / : * ? \" < > |"}
+    with _state_lock:
+        CFG["sheet_name"] = sn
+        save_json(CONFIG_PATH, CFG)
+        bl = load_json(B_LOCAL_CONFIG_PATH, None)
+        if bl:
+            bl["sheet_name"] = sn
+            save_json(B_LOCAL_CONFIG_PATH, bl)
+    log("上报目标表切换为: %s" % sheet_label(sn))
+    return {"ok": True, "sheet_name": sn, "label": sheet_label(sn)}
+
+
 def monitor_loop(interval, window):
     """监视循环：每轮取 WATCH_DIRS 快照，页面改目录后下一轮立即生效"""
     seen_first = not os.path.exists(STATE_PATH)
@@ -578,6 +620,8 @@ HELP_PAGE = r"""<!DOCTYPE html>
 <div id="bar">
   <span>监视目录：<b id="dirs" style="cursor:pointer;border-bottom:1px dotted #888"
         onclick="openDirs()" title="点击管理监视目录">-</b></span>
+  <span>上报表格：<b id="sheetName" style="cursor:pointer;border-bottom:1px dotted #888"
+        onclick="openSheet()" title="点击选择打靶上报写入的表格">-</b></span>
   <span>待填能量 <b id="npending">0</b> 发</span>
   <span>绑定窗口 ±<b id="win">-</b>s</span>
   <span>能量写入列：<b id="efield">-</b></span>
@@ -619,6 +663,23 @@ HELP_PAGE = r"""<!DOCTYPE html>
       <button class="tbtn" id="btnBrowse" onclick="browseDir()">浏览…</button>
       <button class="tbtn" onclick="addDir()">添加</button>
     </div>
+  </div>
+</div>
+<div id="sheetMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
+     z-index:50;align-items:center;justify-content:center"
+     onclick="if(event.target===this)closeSheet()">
+  <div style="background:#fff;border-radius:12px;width:520px;max-width:92vw;
+       padding:20px 24px;max-height:80vh;overflow:auto">
+    <div style="display:flex;align-items:center;margin-bottom:6px">
+      <b style="font-size:15px">上报表格绑定</b>
+      <span style="margin-left:auto;cursor:pointer;color:#999;font-size:20px;
+            line-height:1" onclick="closeSheet()">✕</span>
+    </div>
+    <div style="font-size:12px;color:#888;margin-bottom:12px">
+      选择打靶记录写入的表格：切换后立即生效（含打靶上报与能量页自动上报），
+      b_watcher 同步跟随，无需重启。表格不存在时 A 机会自动创建。
+    </div>
+    <div id="sheetList"></div>
   </div>
 </div>
 <script>
@@ -778,6 +839,70 @@ function browseDir(){
     }, 500);
   }).catch(function(){ toast("无法打开选择窗口"); });
 }
+/* ---------- 上报表格绑定面板 ---------- */
+var CUR_SHEET = "";
+function sheetLabel(sn){
+  return sn === "@date" ? "按日期自动分表" : (sn || "实时打靶(默认)");
+}
+function loadSheetBinding(){
+  fetch("/api/sheetname", {cache:"no-store"}).then(function(r){ return r.json(); })
+  .then(function(j){
+    if (!j.ok) return;
+    CUR_SHEET = j.sheet_name || "";
+    document.getElementById("sheetName").textContent = j.label || sheetLabel(CUR_SHEET);
+  }).catch(function(){});
+}
+function openSheet(){
+  document.getElementById("sheetMask").style.display = "flex";
+  document.getElementById("sheetList").innerHTML =
+    "<div style='color:#999;font-size:13px'>加载中…</div>";
+  fetch("/api/sheetname", {cache:"no-store"}).then(function(r){ return r.json(); })
+  .then(function(j){
+    if (!j.ok){ toast("读取失败"); return; }
+    CUR_SHEET = j.sheet_name || "";
+    renderSheet(j.sheets || []);
+  }).catch(function(){
+    document.getElementById("sheetList").innerHTML =
+      "<div style='color:#c0392b;font-size:13px'>连接失败，请稍后重试</div>";
+  });
+}
+function closeSheet(){ document.getElementById("sheetMask").style.display = "none"; }
+function renderSheet(sheets){
+  var h = "";
+  h += sheetRow("@date", "按打靶日期自动分表", "每天打靶自动写入当天日期命名的表（如 2026-09-15），不存在自动创建");
+  h += sheetRow("", "实时打靶（默认表）", "所有打靶集中写这一张固定表");
+  if (sheets.length){
+    h += "<div style='font-size:11px;color:#999;margin:10px 0 6px'>—— A 机已有表格 ——</div>";
+    sheets.forEach(function(s, i){
+      h += sheetRow(s.name, s.name, s.count + " 条记录", "@dateornull_" + i);
+    });
+  } else {
+    h += "<div style='font-size:11px;color:#999;margin:10px 0 4px'>（A 机表格列表获取失败，仅显示常用选项）</div>";
+  }
+  document.getElementById("sheetList").innerHTML = h;
+}
+function sheetRow(val, title, sub, key){
+  var sel = (CUR_SHEET === val) ? "border:2px solid #2c3e50;background:#f2f7ff" :
+            "border:1px solid #e6e8eb";
+  return "<div onclick='selectSheet(this)' data-v=\"" + val.replace(/"/g,"&quot;") +
+         "\" style='" + sel + ";border-radius:8px;padding:9px 12px;margin-bottom:6px;" +
+         "cursor:pointer'><div style='font-size:13px;font-weight:bold'>" + title +
+         (CUR_SHEET === val ? " <span style='color:#2ecc71;font-size:12px'>✓ 当前</span>" : "") +
+         "</div><div style='font-size:11px;color:#888;margin-top:2px'>" + sub + "</div></div>";
+}
+function selectSheet(el){
+  var v = el.getAttribute("data-v");
+  fetch("/api/sheetname", {method:"POST", cache:"no-store",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({sheet_name: v})})
+  .then(function(r){ return r.json(); }).then(function(j){
+    if (!j.ok){ toast(j.error || "保存失败"); return; }
+    CUR_SHEET = j.sheet_name || "";
+    document.getElementById("sheetName").textContent = j.label;
+    toast("上报表格已切换为：" + j.label);
+    openSheet();   // 重新渲染列表高亮
+  }).catch(function(){ toast("保存失败（网络错误）"); });
+}
 function refresh(){
   fetch("/api/local", {cache:"no-store"}).then(function(r){ return r.json(); }).then(apply)
   .catch(function(){
@@ -826,6 +951,7 @@ document.getElementById("win").textContent = CFG_WINDOW;
 document.getElementById("dirs").textContent = CFG_DIRS;
 document.getElementById("efield").textContent = CFG_FIELD;
 refresh(); connectSSE(); setInterval(refresh, 15000);   // SSE 实时推送，15s 轮询仅作兜底
+loadSheetBinding();
 if (location.hash === "#dirs") openDirs();   // URL 直达目录管理面板
 /* 切回标签页/窗口聚焦时立即刷新，不等下一个 4 秒节拍 */
 document.addEventListener("visibilitychange", function(){ if (!document.hidden) refresh(); });
@@ -884,6 +1010,8 @@ class Handler(BaseHTTPRequestHandler):
                                        for d in WATCH_DIRS]}, ensure_ascii=False))
         elif urlparse(self.path).path == "/api/pickdir":
             self._send(200, json.dumps(pick_dir_status(), ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/sheetname":
+            self._send(200, json.dumps(get_sheet_binding(), ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -922,6 +1050,10 @@ class Handler(BaseHTTPRequestHandler):
                 set_watch_dirs(p.get("dirs") or []), ensure_ascii=False))
         elif urlparse(self.path).path == "/api/pickdir":
             self._send(200, json.dumps(pick_dir_start(), ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/sheetname":
+            p = self._json_body()
+            self._send(200, json.dumps(
+                set_sheet_binding(p.get("sheet_name")), ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
