@@ -295,7 +295,11 @@ def main():
                     added = [d for d in nd if d not in watch_dirs]
                     gone = [d for d in watch_dirs if d not in nd]
                     watch_dirs = nd
-                    c = register_silent_dirs(watch_dirs, seen, registered_dirs)
+                    # 新增（含"移除后重新添加"）的目录：一律静默登记现有文件。
+                    # 不能依赖 registered_dirs 历史记忆——目录被移除监视期间
+                    # 产生的新文件也属"历史数据"，重新纳入时不得上报。
+                    c = register_silent_dirs(added, seen, set())
+                    registered_dirs.update(os.path.abspath(d) for d in added)
                     if c:
                         save_json(STATE_PATH, seen)
                     save_json(REG_DIRS_PATH, sorted(registered_dirs))
