@@ -1,7 +1,8 @@
 @echo off
 rem 一键启动打靶日志系统 B 机全部组件（本机 = B-DAQ-01）
+rem 【测试/演示模式】会连发次模拟器一起启动；真实打靶请用 start_real.bat
 rem 双击即可：打靶监测 + 能量页(8767) + 模拟器GUI
-title 打靶日志系统 B机 启动器
+title 打靶日志系统 B机 启动器（测试模式，含模拟器）
 cd /d %~dp0
 
 echo [1/3] 启动打靶监测 b_watcher...
