@@ -8,12 +8,13 @@
   再把能量绑定到对应发次，发给 A 机的实验日志系统。
 
 工作方式：
-  1. 监视汤姆逊图片目录，按时间窗分组：一组图片 = 一次发次，
-     组内最早 mtime = 发次时间（与 b_watcher 同款分组逻辑）。
-  2. 每个发次自动上报给 A 机 /api/shot（写入日志表，可关 auto_report）。
-  3. 本机启动一个小页面 (http://127.0.0.1:8767)，按发次列出待填能量；
-     解谱完成后填入能量点"发送"→ A 机 /api/energy 按时间窗口自动绑定
-     到对应发次行（写 fiber_p_energy 列）。
+  1. 监视谱仪/数据目录，按时间窗分组：一组文件 = 一次发次，
+     组内最早 mtime = 该发次的打靶时间（与 b_watcher 同款分组逻辑）。
+  2. 发次先进本页面"待确认"列表（b_watcher confirm 模式也会把检测到的
+     发次送到这里），绝不自动写 A 机；实验人员点「确认上报」后才写入
+     （auto_report=true 的旧直报模式仍保留，可通过配置切回）。
+  3. 本机页面 http://127.0.0.1:8767：确认上报（可先不填能量）→ 打靶行
+     写入 A 机；解谱后填入能量点"发送"→ A 机 /api/energy 绑定/覆盖能量列。
   4. 绑定问题兜底：
      - 发送失败 → 状态"发送失败"，可重发；
      - 窗口内找不到发次（如 A 机漏记）→ 状态"无匹配发次"，
@@ -88,7 +89,9 @@ WATCH_DIRS = []
 ENERGY_FIELD = "fiber_p_energy"
 MATCH_WINDOW = 15.0
 AUTO_REPORT = True
-# 展示/绑定状态：pending 待输入 | sent 已绑定 | no_match 无匹配 | error 发送失败
+BW_MACHINE = ""   # b_watcher 的机名（读 config_b.local.json）：确认上报时与
+                  # b_watcher 旧直报记录对齐，A 机去重才不会产生重复行
+# 展示/绑定状态：pending 待确认 | sent 已绑定 | no_match 无匹配 | error 发送失败
 
 
 def load_json(path, default):
@@ -215,7 +218,8 @@ def make_shot(group):
     return {"shot_time": st, "files": names, "file_count": len(group),
             "no": parse_shot_no(names),
             "target": "", "defocus": "",
-            "energy": "", "status": "pending", "info": "", "row_id": None}
+            "energy": "", "status": "pending", "info": "", "row_id": None,
+            "reported": False}
 
 
 def attach_target(shot):
@@ -226,15 +230,66 @@ def attach_target(shot):
     return shot
 
 
-def report_shot(shot):
-    """把发次上报给 A 机（与 b_watcher 同一入口，A 端按 machine+时间+首文件去重）"""
+def _time_diff(a, b):
+    """两个 'YYYY-MM-DD HH:MM:SS' 的秒差（绝对值）；解析失败返回极大值"""
+    try:
+        return abs((datetime.strptime(a, "%Y-%m-%d %H:%M:%S")
+                    - datetime.strptime(b, "%Y-%m-%d %H:%M:%S")).total_seconds())
+    except Exception:
+        return 1e9
+
+
+def ingest_detect(payload):
+    """/api/detect：接收 b_watcher（confirm 模式）送来的发次，进入"待确认"列表。
+    这里只是登记，绝不直接写 A 机——必须等实验人员在页面点「确认上报」。
+    按 shot_time（±2s）去重合并：同一发次 b_watcher / 本页监视都可能发现。"""
+    st = str(payload.get("shot_time", "")).strip()
+    if not st:
+        return {"ok": False, "error": "shot_time 为空"}
+    files = payload.get("files") or []
+    names = [(f.get("name", "") if isinstance(f, dict) else str(f))
+             for f in files]
+    flds = payload.get("fields") or {}
+    with _state_lock:
+        shot = next((s for s in STATE["shots"]
+                     if _time_diff(s["shot_time"], st) <= 2.0), None)
+        merged = shot is not None
+        if shot is None:
+            shot = {"shot_time": st, "files": names, "file_count": len(files),
+                    "no": None, "target": "", "defocus": "", "energy": "",
+                    "status": "pending", "info": "", "row_id": None,
+                    "reported": False}
+            STATE["shots"].insert(0, shot)
+        if len(names) > shot.get("file_count", 0):
+            shot["files"] = names
+            shot["file_count"] = len(files)
+        if flds.get("no") is not None:
+            shot["no"] = flds["no"]
+        if flds.get("target_pos") and not shot.get("target"):
+            shot["target"] = flds["target_pos"]
+        tdf = flds.get("target_defocus")
+        if tdf not in ("", None) and shot.get("defocus", "") == "":
+            shot["defocus"] = str(tdf)
+        bump_ver()
+        save_state()
+    log("收到待确认发次: %s (%d 个文件%s)"
+        % (st, len(files), "，已合并同名发次" if merged else ""))
+    return {"ok": True, "merged": merged}
+
+
+def report_shot(shot, energy=""):
+    """把发次上报给 A 机（人工点「确认上报」后才会走到这里）。
+    machine 用 b_watcher 的机名：A 机按 machine+时间+首文件去重，
+    与 b_watcher 旧直报记录对齐后不会产生重复行。能量一并写入该行。"""
     files = [{"name": n, "mtime": 0} for n in shot["files"]]
     fields = {"no": shot["no"]} if shot.get("no") is not None else {}
     if shot.get("target"):
         fields["target_pos"] = shot["target"]       # A 机表已有"靶位"列
     if shot.get("defocus") != "":
         fields["target_defocus"] = str(shot["defocus"])  # A 机表"靶离焦"列
-    payload = {"machine": MACHINE, "shot_time": shot["shot_time"],
+    if energy:
+        fields[ENERGY_FIELD] = energy
+    payload = {"machine": BW_MACHINE or MACHINE, "shot_time": shot["shot_time"],
                "files": files, "fields": fields, "reported_at":
                datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     # 上报目标表：""=默认"实时打靶"；"@date"=按打靶日期自动分表；其他=固定表名
@@ -503,7 +558,25 @@ def monitor_loop(interval, window):
                         if shot.get("no") is None:
                             shot["no"] = seq.get(day, 0) + 1
                         seq[day] = max(seq.get(day, 0), shot["no"])
-                        STATE["shots"].insert(0, shot)
+                        # 去重合并：b_watcher(confirm 模式)可能已把同一发次
+                        # 送进待确认列表，±2s 内视为同一次打靶，只保留一条
+                        dup = next((s for s in STATE["shots"]
+                                    if _time_diff(s["shot_time"],
+                                                  shot["shot_time"]) <= 2.0),
+                                   None)
+                        if dup is not None:
+                            if shot.get("file_count", 0) > dup.get("file_count", 0):
+                                dup["files"] = shot["files"]
+                                dup["file_count"] = shot["file_count"]
+                            if shot.get("target") and not dup.get("target"):
+                                dup["target"] = shot["target"]
+                            if shot.get("defocus", "") != "" and \
+                                    dup.get("defocus", "") == "":
+                                dup["defocus"] = shot["defocus"]
+                            if shot.get("no") is not None and dup.get("no") is None:
+                                dup["no"] = shot["no"]
+                        else:
+                            STATE["shots"].insert(0, shot)
                         STATE["forming_shot"] = None
                         bump_ver()
                         save_state()
@@ -637,7 +710,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
     <tbody id="tb"></tbody>
   </table>
 </div>
-<div id="foot">No. 自动取自文件名（shot-3 → 3），可手动修正 ｜ 能量按时间窗绑定，未命中时按 No. 兜底 ｜ 能量可"重发"覆盖</div>
+<div id="foot">打靶需在页面点「确认上报」后才写入日志系统 ｜ No. 自动取自文件名（shot-3 → 3），可手动修正 ｜ 能量填后点"发送"绑定，可"重发"覆盖</div>
 <div id="toast"></div>
 <div id="dirMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
      z-index:50;align-items:center;justify-content:center"
@@ -690,7 +763,7 @@ function toast(s){
   clearTimeout(T); T = setTimeout(function(){ t.style.display = "none"; }, 2600);
 }
 function stLabel(s){
-  return {pending:"待输入", sent:"已绑定", no_match:"无匹配发次",
+  return {pending:"待确认", sent:"已绑定", no_match:"无匹配发次",
           error:"发送失败", forming:"检测中…"}[s] || s;
 }
 function render(){
@@ -721,6 +794,8 @@ function render(){
         h += "<span style='color:#999;font-size:12px'>等待文件到齐…</span>";
       } else if (s.status === "no_match"){
         h += "<button class='tbtn orange' onclick='send(" + i + ",true)'>补录</button> ";
+      } else if (!s.reported){
+        h += "<button class='tbtn green' onclick='send(" + i + ",false)'>确认上报</button> ";
       } else {
         h += "<button class='tbtn' onclick='send(" + i + ",false)'>" +
              (s.status === "sent" ? "重发" : "发送") + "</button> ";
@@ -922,7 +997,8 @@ function connectSSE(){
 function send(i, create){
   var inp = document.querySelector("input.e[data-i='" + i + "']");
   var v = (inp ? inp.value : SHOTS[i].energy).trim();
-  if (!v){ toast("先填能量再发送"); return; }
+  var s = SHOTS[i];
+  if (!v && s.reported && !create){ toast("先填能量再发送"); return; }
   var ninp = document.querySelector("input.n[data-i='" + i + "']");
   var no = parseInt((ninp ? ninp.value : SHOTS[i].no), 10) || 0;
   fetch("/api/bind", {method:"POST", headers:{"Content-Type":"application/json"},
@@ -930,7 +1006,9 @@ function send(i, create){
                           shot_no: no, create: create})})
     .then(function(r){ return r.json(); })
     .then(function(j){
-      if (j.ok && (j.matched !== undefined)){
+      if (j.ok && j.confirmed){
+        toast("已确认上报：打靶行已写入日志系统（能量待填）");
+      } else if (j.ok && (j.matched !== undefined)){
         toast(j.by_no ? ("时间窗未命中，已按 No." + no + " 绑定到 " + j.matched_time)
                       : ("已绑定到发次 " + j.matched_time + "（差 " + (+j.diff_sec).toFixed(1) + "s）"));
       } else if (j.ok && j.created){
@@ -1044,6 +1122,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if urlparse(self.path).path == "/api/bind":
             self.api_bind()
+        elif urlparse(self.path).path == "/api/detect":
+            p = self._json_body()
+            self._send(200, json.dumps(ingest_detect(p), ensure_ascii=False))
         elif urlparse(self.path).path == "/api/watchdirs":
             p = self._json_body()
             self._send(200, json.dumps(
@@ -1061,6 +1142,10 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def api_bind(self):
+        """「确认上报 / 发送能量」统一入口（两步走）：
+        第 1 步（人工确认）：该发次尚未上报过 → 才把打靶行写入 A 机
+        （机器+时间+首文件去重，重复确认不会产生重复行；可无能量只确认发次）。
+        第 2 步（能量绑定）：填了能量 → /api/energy 按时间窗绑定/覆盖能量列。"""
         p = self._json_body()
         st = str(p.get("shot_time", "")).strip()
         energy = str(p.get("energy", "")).strip()
@@ -1071,19 +1156,43 @@ class Handler(BaseHTTPRequestHandler):
         if shot is None:
             return self._send(200, json.dumps(
                 {"ok": False, "error": "shot_not_found"}))
-        if not energy:
-            return self._send(200, json.dumps(
-                {"ok": False, "error": "能量值不能为空"}))
-        shot["energy"] = energy
         try:
             no_in = int(p.get("shot_no") or 0)
         except (TypeError, ValueError):
             no_in = 0
         if no_in:
             shot["no"] = no_in          # 手动改过 No. 以页面为准
+        if not energy and shot.get("reported"):
+            return self._send(200, json.dumps(
+                {"ok": False, "error": "已上报过：填入能量后可重发/覆盖",
+                 "already_reported": True}))
+        if energy:
+            shot["energy"] = energy
         bump_ver()
+
+        # 第 1 步：确认上报——打靶行写入 A 机（带靶位/离焦/No.，含能量如有）
+        if not shot.get("reported"):
+            try:
+                report_shot(shot, energy=energy)
+            except Exception as e:
+                shot["status"], shot["info"] = "error", "上报日志系统失败"
+                save_state()
+                log("确认上报失败: %s %r" % (st, e))
+                return self._send(200, json.dumps(
+                    {"ok": False, "error": "connect_failed", "message": repr(e)},
+                    ensure_ascii=False))
+            shot["reported"] = True
+            shot["info"] = "打靶行已上报" + ("（含能量）" if energy else "，能量待填")
+            save_state()
+            log("确认上报: %s%s" % (st, "（能量 %s）" % energy if energy else ""))
+            if not energy:
+                bump_ver()
+                return self._send(200, json.dumps(
+                    {"ok": True, "confirmed": True}, ensure_ascii=False))
+
+        # 第 2 步：能量绑定（窗口内命中刚上报的行，重发可覆盖修正）
         payload = {"shot_time": st, "energy": energy, "field": ENERGY_FIELD,
-                   "machine": MACHINE, "window_sec": MATCH_WINDOW,
+                   "machine": BW_MACHINE or MACHINE, "window_sec": MATCH_WINDOW,
                    "shot_no": no_in or (shot.get("no") or 0),
                    "create": create}
         try:
@@ -1127,7 +1236,7 @@ CFG = {}
 
 
 def main():
-    global SERVER_URL, MACHINE, WATCH_DIRS, ENERGY_FIELD, MATCH_WINDOW, AUTO_REPORT, CFG
+    global SERVER_URL, MACHINE, WATCH_DIRS, ENERGY_FIELD, MATCH_WINDOW, AUTO_REPORT, BW_MACHINE, CFG
     CFG = load_json(CONFIG_PATH, None)
     if CFG is None:
         save_json(CONFIG_PATH, {
@@ -1156,6 +1265,12 @@ def main():
     ENERGY_FIELD = CFG.get("energy_field", "fiber_p_energy")
     AUTO_REPORT = bool(CFG.get("auto_report", True))
     port = int(CFG.get("helper_port", 8767))
+    # b_watcher 机名：确认上报的行用它做 machine，与 b_watcher 去重键对齐
+    try:
+        BW_MACHINE = (load_json(B_LOCAL_CONFIG_PATH, {}) or {}).get(
+            "machine_name", "") or ""
+    except Exception:
+        BW_MACHINE = ""
 
     st = load_json(STATE_PATH, None)
     if st:

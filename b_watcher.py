@@ -90,6 +90,16 @@ def send_shot(server_url, payload, timeout=5):
     urllib.request.urlopen(req, timeout=timeout).read()
 
 
+def send_detect(helper_url, payload, timeout=5):
+    """confirm 模式：把检测到的发次送到本机上报系统（8767）"待确认"列表，
+    不直接写 A 机。实验人员在页面上点「确认上报」后才写入。"""
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        helper_url.rstrip("/") + "/api/detect", data=data,
+        headers={"Content-Type": "application/json"}, method="POST")
+    urllib.request.urlopen(req, timeout=timeout).read()
+
+
 def send_alert(server_url, machine_name, level, message, timeout=5):
     """向 A 机上报告警（目录失效等），失败不影响主流程"""
     try:
@@ -248,6 +258,10 @@ def main():
     window = float(cfg.get("group_window_sec", 8))
     # 上报目标表：""=默认"实时打靶"；"@date"=按打靶日期自动分表；其他=固定表名
     sheet_name = str(cfg.get("sheet_name", "") or "").strip()
+    # 上报模式："direct"=检测到打靶直接上报 A 机（旧行为）；
+    # "confirm"=只送到本机 8767 上报系统待确认，人工点「确认上报」才写 A 机
+    report_mode = str(cfg.get("report_mode", "direct") or "direct").strip().lower()
+    helper_url = str(cfg.get("helper_url", "") or "http://127.0.0.1:8767").strip()
 
     seen = load_json(STATE_PATH, {})      # {路径: mtime}
     pend = load_json(PENDING_PATH, [])    # 已见但尚未归组上报的 [[路径, mtime], ...]
@@ -278,12 +292,15 @@ def main():
 
     while True:
         try:
-            # 1) 补发失败队列
+            # 1) 补发失败队列（按 dst 标记路由：helper=上报系统，a=A 机）
             if pending:
                 still = []
                 for pl in pending:
                     try:
-                        send_shot(server_url, pl)
+                        if pl.get("dst") == "helper":
+                            send_detect(helper_url, pl)
+                        else:
+                            send_shot(server_url, pl)
                         log("补发成功: %s" % pl.get("shot_time"))
                     except Exception:
                         still.append(pl)
@@ -319,6 +336,16 @@ def main():
                         sheet_name = ns
                         log("配置热重载：上报目标表 -> %s"
                             % (ns or "实时打靶(默认)"))
+                    # 上报模式热更新
+                    nmode = str(nc.get("report_mode", "direct") or "direct").strip().lower()
+                    if nmode != report_mode:
+                        report_mode = nmode
+                        log("配置热重载：上报模式 -> %s"
+                            % ("确认后上报（8767 页面点「确认上报」）"
+                               if nmode == "confirm" else "直接上报 A 机"))
+                    nhu = str(nc.get("helper_url", "") or "").strip()
+                    if nhu and nhu != helper_url:
+                        helper_url = nhu
                 if nc and nc.get("watch_dirs") and nc["watch_dirs"] != watch_dirs:
                     nd = [os.path.normpath(d) for d in nc["watch_dirs"] if d]
                     added = [d for d in nd if d not in watch_dirs]
@@ -360,14 +387,28 @@ def main():
                     save_json(PENDING_PATH, pend)
                     for g in done_groups:
                         pl = make_payload(machine_name, g, sheet_name)
-                        try:
-                            send_shot(server_url, pl)
-                            log("已上报 1 次打靶: %s  (%d 个文件, 首=%s)"
-                                % (pl["shot_time"], len(g), g[0][0].split(os.sep)[-1]))
-                        except Exception as e:
-                            log("上报失败(%s)，已暂存队列" % e)
-                            pending.append(pl)
-                            save_json(QUEUE_PATH, pending)
+                        if report_mode == "confirm":
+                            # 确认模式：不直接写 A 机，先送本机 8767 待确认
+                            pl["dst"] = "helper"
+                            try:
+                                send_detect(helper_url, pl)
+                                log("已送上报系统待确认: %s  (%d 个文件, 首=%s)"
+                                    % (pl["shot_time"], len(g),
+                                       g[0][0].split(os.sep)[-1]))
+                            except Exception as e:
+                                log("上报系统(8767)不可达(%r)，发次暂存队列" % e)
+                                pending.append(pl)
+                                save_json(QUEUE_PATH, pending)
+                        else:
+                            try:
+                                send_shot(server_url, pl)
+                                log("已上报 1 次打靶: %s  (%d 个文件, 首=%s)"
+                                    % (pl["shot_time"], len(g),
+                                       g[0][0].split(os.sep)[-1]))
+                            except Exception as e:
+                                log("上报失败(%s)，已暂存队列" % e)
+                                pending.append(pl)
+                                save_json(QUEUE_PATH, pending)
 
             time.sleep(interval)
         except KeyboardInterrupt:
