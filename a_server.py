@@ -798,6 +798,14 @@ function loadAlerts(){
     var a = j.alerts[0];
     b.textContent = "⚠ [" + a.machine + "] " + a.message + "  (" + a.at + ")" +
                     (j.alerts.length > 1 ? "  —— 共 " + j.alerts.length + " 条告警" : "");
+    var btn = document.createElement("span");
+    btn.textContent = "  [清除告警]";
+    btn.style.cssText = "cursor:pointer;text-decoration:underline;margin-left:8px";
+    btn.onclick = function(){
+      if (!confirm("清除全部告警记录？")) return;
+      api("/api/alerts/clear", {}, function(){ toast("告警已清除"); loadAlerts(); });
+    };
+    b.appendChild(btn);
     b.className = a.level === "error" ? "" : "info";
     b.style.display = "block";
   }).catch(function(){});
@@ -929,6 +937,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/sheets/update": self.api_sheet_update,
             "/api/sheets/delete": self.api_sheet_delete,
             "/api/alert": self.api_alert,
+            "/api/alerts/clear": self.api_alerts_clear,
             "/api/trash/restore": self.api_trash_restore,
             "/api/trash/delete": self.api_trash_delete,
         }
@@ -1390,6 +1399,11 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps(
             {"ok": True, "alerts": Handler._alerts}, ensure_ascii=False),
             "application/json")
+
+    def api_alerts_clear(self):
+        with Handler._alerts_lock:
+            Handler._alerts.clear()
+        self._ok()
 
     # ---------- 导出 ----------
     def _export_rows(self, q):

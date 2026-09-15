@@ -1,20 +1,18 @@
 @echo off
-rem 一键启动打靶日志系统 B 机全部组件（本机 = B-DAQ-01）
-rem 【测试/演示模式】会连发次模拟器一起启动；真实打靶请用 start_real.bat
-rem 双击即可：打靶监测 + 能量页(8767) + 模拟器GUI
-title 打靶日志系统 B机 启动器（测试模式，含模拟器）
+rem Demo mode: start b_watcher + energy page + shot simulator
+title laser-shot-log B-side launcher (demo mode with simulator)
 cd /d %~dp0
 
-echo [1/3] 启动打靶监测 b_watcher...
-start "BWatcher" /min "C:\Users\CLAPA\.workbuddy\binaries\python\versions\3.13.12\python.exe" b_watcher.py
+echo [1/3] Starting b_watcher...
+start "BWatcher" /min py b_watcher.py
 
-echo [2/3] 启动能量填报页 (http://127.0.0.1:8767)...
-start "THelper" /min "C:\Users\CLAPA\.workbuddy\binaries\python\versions\3.13.12\python.exe" thomson_helper.py
+echo [2/3] Starting energy page (http://127.0.0.1:8767)...
+start "THelper" /min py thomson_helper.py
 
-echo [3/3] 启动打靶模拟器...
-start "" "D:\Program Files\Python310\python.exe" shot_simulator.py
+echo [3/3] Starting shot simulator...
+start "" py shot_simulator.py
 
 echo.
-echo 全部已启动：监测中 / 8767 能量页 / 模拟器
-echo (本窗口可以关闭)
+echo All started: watcher / 8767 energy page / simulator
+echo (you can close this window)
 timeout /t 3 >nul

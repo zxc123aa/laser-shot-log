@@ -281,7 +281,12 @@ def _find_tk_python():
     if _PICK_PY:
         return _PICK_PY
     import subprocess
-    for exe in (r"D:\Program Files\Python310\python.exe", sys.executable):
+    cands = (r"D:\Program Files\Python310\python.exe",
+             r"D:\anaconda\python.exe",
+             r"D:\Python\python.exe",
+             r"C:\Windows\py.exe",
+             sys.executable)
+    for exe in cands:
         try:
             r = subprocess.run([exe, "-c", "import tkinter; print('ok')"],
                                capture_output=True, timeout=30)
