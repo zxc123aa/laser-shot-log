@@ -239,6 +239,45 @@ def _time_diff(a, b):
         return 1e9
 
 
+def api_ignore_shot(shot_time):
+    """忽略一条发次：从待确认列表里移除（不写 A 机）。
+    用于历史残留 / 误检的清理。已上报过的发次建议保留作记录，但同样允许移除。"""
+    st = str(shot_time or "").strip()
+    with _state_lock:
+        n0 = len(STATE["shots"])
+        STATE["shots"] = [s for s in STATE["shots"]
+                          if s["shot_time"] != st]
+        removed = n0 - len(STATE["shots"])
+        if removed:
+            STATE["forming_shot"] = None
+            bump_ver()
+            save_state()
+    if removed:
+        log("忽略发次: %s" % st)
+    return {"ok": True, "removed": removed}
+
+
+def api_shots_clear(mode):
+    """批量清理待确认列表：
+    sent = 只移除已绑定/已失败确认的发次（默认，保守）；
+    all  = 清空整个列表（不含正在形成的发次）。"""
+    with _state_lock:
+        n0 = len(STATE["shots"])
+        if mode == "all":
+            STATE["shots"] = [s for s in STATE["shots"]
+                              if s["status"] == "forming"]
+        else:
+            STATE["shots"] = [s for s in STATE["shots"]
+                              if s["status"] not in ("sent", "error")]
+        removed = n0 - len(STATE["shots"])
+        if removed:
+            bump_ver()
+            save_state()
+    log("清理发次列表[%s]: 移除 %d 条，剩 %d 条" %
+        (mode, removed, len(STATE["shots"])))
+    return {"ok": True, "removed": removed, "left": len(STATE["shots"])}
+
+
 def ingest_detect(payload):
     """/api/detect：接收 b_watcher（confirm 模式）送来的发次，进入"待确认"列表。
     这里只是登记，绝不直接写 A 机——必须等实验人员在页面点「确认上报」。
@@ -699,6 +738,12 @@ HELP_PAGE = r"""<!DOCTYPE html>
   <span>绑定窗口 ±<b id="win">-</b>s</span>
   <span>能量写入列：<b id="efield">-</b></span>
   <span>当前靶位：<b id="tgt">…</b><span id="tgtF" style="color:#888;font-size:12px"></span></span>
+  <span style="margin-left:auto">
+    <button onclick="clearShots('sent')" style="padding:3px 10px;cursor:pointer;
+      border:1px solid #ccd;border-radius:6px;background:#fff">清理已绑定</button>
+    <button onclick="clearShots('all')" style="padding:3px 10px;cursor:pointer;
+      border:1px solid #ecc;border-radius:6px;background:#fff;color:#c33">清空列表</button>
+  </span>
 </div>
 <div class="wrap">
   <table>
@@ -710,7 +755,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
     <tbody id="tb"></tbody>
   </table>
 </div>
-<div id="foot">打靶需在页面点「确认上报」后才写入日志系统 ｜ No. 自动取自文件名（shot-3 → 3），可手动修正 ｜ 能量填后点"发送"绑定，可"重发"覆盖</div>
+<div id="foot">打靶需在页面点「确认上报」后才写入日志系统 ｜ 旧/误发次点"忽略"移除，右上可"清理已绑定/清空列表"（不影响日志系统已有记录） ｜ No. 自动取自文件名，可手动修正</div>
 <div id="toast"></div>
 <div id="dirMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
      z-index:50;align-items:center;justify-content:center"
@@ -799,6 +844,10 @@ function render(){
       } else {
         h += "<button class='tbtn' onclick='send(" + i + ",false)'>" +
              (s.status === "sent" ? "重发" : "发送") + "</button> ";
+      }
+      if (s.status !== "forming"){
+        h += "<button class='tbtn' style='background:#fff;color:#999;border-color:#ddd' " +
+             "onclick='ignoreShot(" + i + ")' title='从列表移除，不写日志系统'>忽略</button>";
       }
       h += "</td></tr>";
     });
@@ -994,6 +1043,29 @@ function connectSSE(){
   };
   ES.onerror = function(){ document.getElementById("dot").className = "dot bad"; };
 }
+function ignoreShot(i){
+  var s = SHOTS[i];
+  var msg = s.reported
+    ? ("该发次已在日志系统里（列表移除不影响已有记录）。忽略 " + s.shot_time + " ？")
+    : ("忽略 " + s.shot_time + " ？\n只从本列表移除，不会写入日志系统。");
+  if (!confirm(msg)) return;
+  fetch("/api/ignore", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({shot_time: s.shot_time})})
+    .then(function(r){ return r.json(); })
+    .then(function(j){ toast(j.removed ? "已忽略" : "未找到该发次"); refresh(); LASTJSON = ""; })
+    .catch(function(e){ toast("请求失败: " + e); });
+}
+function clearShots(mode){
+  var msg = mode === "all"
+    ? "清空整个发次列表？\n（正在检测中的发次会保留；日志系统里已有的记录不受影响）"
+    : "清理所有已绑定/发送失败的发次？\n（未确认的发次保留）";
+  if (!confirm(msg)) return;
+  fetch("/api/shots_clear", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({mode: mode})})
+    .then(function(r){ return r.json(); })
+    .then(function(j){ toast("已移除 " + j.removed + " 条，剩 " + j.left + " 条"); refresh(); LASTJSON = ""; })
+    .catch(function(e){ toast("请求失败: " + e); });
+}
 function send(i, create){
   var inp = document.querySelector("input.e[data-i='" + i + "']");
   var v = (inp ? inp.value : SHOTS[i].energy).trim();
@@ -1135,6 +1207,14 @@ class Handler(BaseHTTPRequestHandler):
             p = self._json_body()
             self._send(200, json.dumps(
                 set_sheet_binding(p.get("sheet_name")), ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/ignore":
+            p = self._json_body()
+            self._send(200, json.dumps(
+                api_ignore_shot(p.get("shot_time")), ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/shots_clear":
+            p = self._json_body()
+            self._send(200, json.dumps(
+                api_shots_clear(str(p.get("mode", "sent"))), ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 

@@ -366,7 +366,12 @@ PAGE = r"""<!DOCTYPE html>
   <div class="logo">打靶日志系统<small>BLAC 实验数据 · 内网</small></div>
   <div id="sheetlist"></div>
   <div class="foot">
-    <button class="fbtn orange" onclick="newSheet()">＋ 新建表格</button>
+    <button class="fbtn orange" onclick="toggleNewSheet()">＋ 新建表格</button>
+    <div id="newrow" style="display:none;margin:6px 0">
+      <input id="ns_name" placeholder="表格名，如 2026-09-16" style="width:100%;box-sizing:border-box;padding:5px 6px;border:1px solid #d88;border-radius:6px;font-size:12px"
+             onkeydown="if(event.key==='Enter')createSheet()">
+      <button class="fbtn orange" style="width:100%;margin-top:4px" onclick="createSheet()">创建（回车也行）</button>
+    </div>
     <button class="fbtn" onclick="openTrash()">回收站</button>
     <a class="fbtn" href="/export.xlsx" id="exportAll">导出全部 (xlsx)</a>
   </div>
@@ -482,12 +487,18 @@ function renderSheets(){
     el.appendChild(d);
   });
 }
-function newSheet(){
-  var name = prompt("新表格名称（建议用实验日期，如 2026-09-07）：", todayStr());
-  if (!name) return;
-  var note = prompt("备注（可空）：", "") || "";
-  api("/api/sheets", {name:name.trim(), note:note}, function(j){
-    S.cur = j.id; S.checked.clear(); loadSheets(); toast("表格已创建");
+function toggleNewSheet(){
+  var r = document.getElementById("newrow");
+  var show = r.style.display === "none";
+  r.style.display = show ? "block" : "none";
+  if (show){ var i = document.getElementById("ns_name"); i.value = todayStr(); i.focus(); i.select(); }
+}
+function createSheet(){
+  var name = document.getElementById("ns_name").value.trim();
+  if (!name){ toast("先填表格名"); return; }
+  api("/api/sheets", {name:name}, function(j){
+    document.getElementById("newrow").style.display = "none";
+    S.cur = j.id; S.checked.clear(); loadSheets(); toast("表格已创建: " + name);
   });
 }
 function renameSheet(){
