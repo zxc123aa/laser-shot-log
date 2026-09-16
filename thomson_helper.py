@@ -52,7 +52,7 @@ B_LOCAL_CONFIG_PATH = os.path.join(BASE, "config_b.local.json")  # b_watcher 本
 # RLock：save_state() 在调用方已持锁时也会被调用，必须可重入
 _state_lock = threading.RLock()
 STATE = {"seen": {}, "pend": [], "shots": [], "queue": [], "no_seq": {},
-         "forming_shot": None}
+         "forming_shot": None, "trash": []}
 STATE_VER = 0          # 页面 SSE 推送用的状态版本号：shots/queue 一变就 +1
 
 # 重频靶系统实时状态（后台线程每 5s 刷新；靶位/离焦随 SSE 推到页面）
@@ -240,42 +240,163 @@ def _time_diff(a, b):
 
 
 def api_ignore_shot(shot_time):
-    """忽略一条发次：从待确认列表里移除（不写 A 机）。
-    用于历史残留 / 误检的清理。已上报过的发次建议保留作记录，但同样允许移除。"""
+    """忽略一条发次：从待确认列表移入回收站（不写 A 机，可在回收站恢复）。
+    用于历史残留 / 误检的清理。已上报过的发次同样允许移入回收站。"""
     st = str(shot_time or "").strip()
     with _state_lock:
-        n0 = len(STATE["shots"])
-        STATE["shots"] = [s for s in STATE["shots"]
-                          if s["shot_time"] != st]
-        removed = n0 - len(STATE["shots"])
+        removed = [s for s in STATE["shots"] if s["shot_time"] == st]
         if removed:
+            STATE["shots"] = [s for s in STATE["shots"]
+                              if s["shot_time"] != st]
+            trash = STATE.setdefault("trash", [])
+            for s in removed:           # 新的在前
+                trash.insert(0, dict(s))
+            del trash[500:]             # 回收站最多保留 500 条
             STATE["forming_shot"] = None
             bump_ver()
             save_state()
     if removed:
-        log("忽略发次: %s" % st)
-    return {"ok": True, "removed": removed}
+        log("忽略发次(入回收站): %s" % st)
+    return {"ok": True, "removed": len(removed)}
 
 
 def api_shots_clear(mode):
-    """批量清理待确认列表：
+    """批量清理待确认列表（移除的进回收站，可恢复）：
     sent = 只移除已绑定/已失败确认的发次（默认，保守）；
     all  = 清空整个列表（不含正在形成的发次）。"""
     with _state_lock:
-        n0 = len(STATE["shots"])
         if mode == "all":
-            STATE["shots"] = [s for s in STATE["shots"]
-                              if s["status"] == "forming"]
+            removed = [s for s in STATE["shots"]
+                       if s["status"] != "forming"]
         else:
-            STATE["shots"] = [s for s in STATE["shots"]
-                              if s["status"] not in ("sent", "error")]
-        removed = n0 - len(STATE["shots"])
+            removed = [s for s in STATE["shots"]
+                       if s["status"] in ("sent", "error")]
         if removed:
+            keep = set(id(s) for s in removed)
+            STATE["shots"] = [s for s in STATE["shots"]
+                              if id(s) not in keep]
+            trash = STATE.setdefault("trash", [])
+            for s in removed:           # 新的在前
+                trash.insert(0, dict(s))
+            del trash[500:]
             bump_ver()
             save_state()
-    log("清理发次列表[%s]: 移除 %d 条，剩 %d 条" %
-        (mode, removed, len(STATE["shots"])))
-    return {"ok": True, "removed": removed, "left": len(STATE["shots"])}
+    log("清理发次列表[%s]: 移除 %d 条（已入回收站），剩 %d 条" %
+        (mode, len(removed), len(STATE["shots"])))
+    return {"ok": True, "removed": len(removed),
+            "left": len(STATE["shots"])}
+
+
+def api_trash_act(p):
+    """回收站操作：act = restore 恢复回列表 / delete 彻底删除一条 / clear 清空"""
+    act = str(p.get("act", "")).strip()
+    st = str(p.get("shot_time", "")).strip()
+    with _state_lock:
+        trash = STATE.setdefault("trash", [])
+        if act == "restore":
+            hit = [s for s in trash if s["shot_time"] == st]
+            if not hit:
+                return {"ok": False, "error": "回收站里没有这条记录"}
+            if not any(x["shot_time"] == st for x in STATE["shots"]):
+                STATE["shots"].insert(0, dict(hit[0]))
+                bump_ver()
+            trash[:] = [x for x in trash if x["shot_time"] != st]
+            save_state()
+            log("回收站恢复: %s" % st)
+            return {"ok": True}
+        if act == "delete":
+            n0 = len(trash)
+            trash[:] = [x for x in trash if x["shot_time"] != st]
+            if len(trash) != n0:
+                save_state()
+            return {"ok": True, "removed": n0 - len(trash)}
+        if act == "clear":
+            n = len(trash)
+            trash[:] = []
+            save_state()
+            return {"ok": True, "removed": n}
+    return {"ok": False, "error": "未知操作"}
+
+
+# ---------------- Excel 导出（纯标准库手写 xlsx，无 openpyxl 依赖） ----------------
+
+_ST_LABEL = {"pending": "待确认", "sent": "已绑定", "no_match": "无匹配发次",
+             "error": "发送失败", "forming": "检测中"}
+
+
+def _xml_esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def build_xlsx(shots):
+    """把发次列表写成最小合法 xlsx（zip + inlineStr），9 列。
+    列：No. / 发次时间 / 图片数 / 图片文件 / 靶位 / 离焦 / 能量 / 状态 / 备注"""
+    import io
+    import zipfile
+    cols = ["No.", "发次时间", "图片数", "图片文件", "靶位", "离焦",
+            "能量", "状态", "备注"]
+
+    def row_xml(rn, values):
+        cells = []
+        for i, v in enumerate(values):
+            col = chr(ord("A") + i)
+            cells.append('<c r="%s%d" t="inlineStr"><is><t xml:space="preserve">'
+                         "%s</t></is></c>" % (col, rn, _xml_esc(v)))
+        return '<row r="%d">%s</row>' % (rn, "".join(cells))
+
+    body = [row_xml(1, cols)]
+    for n, s in enumerate(shots, 2):
+        body.append(row_xml(n, [
+            s.get("no") or "", s.get("shot_time") or "",
+            s.get("file_count") or 0, " ".join(s.get("files") or []),
+            s.get("target") or "", s.get("defocus") or "",
+            s.get("energy") or "",
+            _ST_LABEL.get(s.get("status"), s.get("status") or ""),
+            s.get("info") or ""]))
+    sheet = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+             '<worksheet xmlns="http://schemas.openxmlformats.org/'
+             'spreadsheetml/2006/main"><sheetData>%s</sheetData></worksheet>'
+             % "".join(body))
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Types xmlns="http://schemas.openxmlformats.org/package/'
+                   '2006/content-types">'
+                   '<Default Extension="rels" ContentType="application/'
+                   'vnd.openxmlformats-package.relationships+xml"/>'
+                   '<Default Extension="xml" ContentType="application/xml"/>'
+                   '<Override PartName="/xl/workbook.xml" ContentType='
+                   '"application/vnd.openxmlformats-officedocument.'
+                   'spreadsheetml.sheet.main+xml"/>'
+                   '<Override PartName="/xl/worksheets/sheet1.xml" '
+                   'ContentType="application/vnd.openxmlformats-officedocument.'
+                   'spreadsheetml.worksheet+xml"/></Types>')
+        z.writestr("_rels/.rels",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/'
+                   'package/2006/relationships">'
+                   '<Relationship Id="rId1" Type="http://schemas.openxmlformats'
+                   '.org/officeDocument/2006/relationships/officeDocument" '
+                   'Target="xl/workbook.xml"/></Relationships>')
+        z.writestr("xl/workbook.xml",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<workbook xmlns="http://schemas.openxmlformats.org/'
+                   'spreadsheetml/2006/main" xmlns:r="http://schemas.'
+                   'openxmlformats.org/officeDocument/2006/relationships">'
+                   '<sheets><sheet name="上报记录" sheetId="1" r:id="rId1"/>'
+                   '</sheets></workbook>')
+        z.writestr("xl/_rels/workbook.xml.rels",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/'
+                   'package/2006/relationships">'
+                   '<Relationship Id="rId1" Type="http://schemas.openxmlformats'
+                   '.org/officeDocument/2006/relationships/worksheet" '
+                   'Target="worksheets/sheet1.xml"/></Relationships>')
+        z.writestr("xl/worksheets/sheet1.xml", sheet)
+    return buf.getvalue()
 
 
 def ingest_detect(payload):
@@ -745,6 +866,11 @@ HELP_PAGE = r"""<!DOCTYPE html>
       border:1px solid #ccd;border-radius:6px;background:#fff">清理已绑定</button>
     <button onclick="clearShots('all')" style="padding:3px 10px;cursor:pointer;
       border:1px solid #ecc;border-radius:6px;background:#fff;color:#c33">清空列表</button>
+    <button onclick="openTrash()" style="padding:3px 10px;cursor:pointer;
+      border:1px solid #ccd;border-radius:6px;background:#fff">回收站</button>
+    <button onclick="window.open('/export.xlsx')" style="padding:3px 10px;cursor:pointer;
+      border:1px solid #9c8;border-radius:6px;background:#f4fbf4;
+      color:#2a7">导出Excel</button>
   </span>
 </div>
 <div class="wrap">
@@ -757,7 +883,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
     <tbody id="tb"></tbody>
   </table>
 </div>
-<div id="foot">打靶需在页面点「确认上报」后才写入日志系统 ｜ 旧/误发次点"忽略"移除，右上可"清理已绑定/清空列表"（不影响日志系统已有记录） ｜ No. 自动取自文件名，可手动修正</div>
+<div id="foot">打靶需在页面点「确认上报」后才写入日志系统 ｜ 旧/误发次点"忽略"进回收站（右上可恢复） ｜ 右上「导出Excel」备份当前列表 ｜ No. 自动取自文件名，可手动修正</div>
 <div id="toast"></div>
 <div id="dirMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
      z-index:50;align-items:center;justify-content:center"
@@ -800,6 +926,27 @@ HELP_PAGE = r"""<!DOCTYPE html>
       b_watcher 同步跟随，无需重启。表格不存在时 A 机会自动创建。
     </div>
     <div id="sheetList"></div>
+  </div>
+</div>
+<div id="trashMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
+     z-index:50;align-items:center;justify-content:center"
+     onclick="if(event.target===this)closeTrash()">
+  <div style="background:#fff;border-radius:12px;width:640px;max-width:92vw;
+       padding:20px 24px;max-height:80vh;overflow:auto">
+    <div style="display:flex;align-items:center;margin-bottom:6px">
+      <b style="font-size:15px">回收站（忽略/清理的发次都在这里，可恢复）</b>
+      <span style="margin-left:auto;cursor:pointer;color:#999;font-size:20px;
+            line-height:1" onclick="closeTrash()">✕</span>
+    </div>
+    <div style="font-size:12px;color:#888;margin-bottom:12px">
+      「忽略」和「清理/清空列表」只是把发次移到这里，不写日志系统也不丢数据；
+      可单条「恢复」回待确认列表，或「彻底删除」永久移除（无法恢复）。
+    </div>
+    <div style="margin-bottom:10px">
+      <button onclick="clearTrash()" style="padding:3px 10px;cursor:pointer;
+        border:1px solid #ecc;border-radius:6px;background:#fff;color:#c33">清空回收站</button>
+    </div>
+    <div id="trashList"></div>
   </div>
 </div>
 <script>
@@ -1033,6 +1180,59 @@ function selectSheet(el){
     openSheet();   // 重新渲染列表高亮
   }).catch(function(){ toast("保存失败（网络错误）"); });
 }
+function tesc(s){ return String(s==null?"":s).replace(/&/g,"&amp;")
+  .replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+function openTrash(){
+  document.getElementById("trashMask").style.display = "flex";
+  fetch("/api/trash", {cache:"no-store"}).then(function(r){ return r.json(); })
+  .then(function(j){
+    var b = document.getElementById("trashList");
+    var list = j.trash || [];
+    if (!list.length){
+      b.innerHTML = "<div style='color:#999;padding:24px 0;text-align:center'>" +
+                    "回收站是空的</div>";
+      return;
+    }
+    var h = "<table style='width:100%;border-collapse:collapse;font-size:13px'>";
+    h += "<tr style='text-align:left;color:#888;font-size:12px'>" +
+         "<th style='padding:4px 6px'>发次时间</th><th>No.</th><th>图片</th>" +
+         "<th>能量</th><th>状态</th><th>操作</th></tr>";
+    list.forEach(function(s){
+      h += "<tr style='border-top:1px solid #eee'>" +
+           "<td style='padding:5px 6px;white-space:nowrap'>" + tesc(s.shot_time) + "</td>" +
+           "<td>" + (s.no || "-") + "</td><td>" + (s.file_count || 0) + "</td>" +
+           "<td>" + tesc(s.energy || "") + "</td><td>" + stLabel(s.status) + "</td>" +
+           "<td style='white-space:nowrap'>" +
+           "<span style='color:#2471a3;cursor:pointer;text-decoration:underline' " +
+           "onclick='trashAct(\"" + s.shot_time + "\",\"restore\")'>恢复</span> " +
+           "<span style='color:#c0392b;cursor:pointer;text-decoration:underline' " +
+           "onclick='trashAct(\"" + s.shot_time + "\",\"delete\")'>彻底删除</span>" +
+           "</td></tr>";
+    });
+    b.innerHTML = h + "</table>";
+  }).catch(function(){
+    document.getElementById("trashList").innerHTML =
+      "<div style='color:#c0392b;font-size:13px'>读取回收站失败</div>";
+  });
+}
+function closeTrash(){ document.getElementById("trashMask").style.display = "none"; }
+function trashAct(st, act){
+  if (act === "delete" &&
+      !confirm("彻底删除该发次（" + st + "）？将无法恢复！")) return;
+  fetch("/api/trash", {method:"POST", cache:"no-store",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({act: act, shot_time: st})})
+  .then(function(r){ return r.json(); }).then(function(j){
+    if (!j.ok){ toast(j.error || "操作失败"); return; }
+    toast(act === "restore" ? "已恢复到待确认列表" :
+          act === "clear" ? "回收站已清空" : "已彻底删除");
+    openTrash(); refresh(); LASTJSON = "";
+  }).catch(function(){ toast("操作失败（网络错误）"); });
+}
+function clearTrash(){
+  if (!confirm("清空回收站？里面的发次将永久删除，无法恢复！")) return;
+  trashAct("", "clear");
+}
 function refresh(){
   fetch("/api/local", {cache:"no-store"}).then(function(r){ return r.json(); }).then(apply)
   .catch(function(){
@@ -1168,6 +1368,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(pick_dir_status(), ensure_ascii=False))
         elif urlparse(self.path).path == "/api/sheetname":
             self._send(200, json.dumps(get_sheet_binding(), ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/trash":
+            with _state_lock:
+                t = [dict(s) for s in STATE.get("trash", [])]
+            self._send(200, json.dumps({"ok": True, "trash": t},
+                                       ensure_ascii=False))
+        elif urlparse(self.path).path == "/export.xlsx":
+            with _state_lock:
+                shots = [dict(s) for s in STATE["shots"]]
+            data = build_xlsx(shots)
+            name = ("report_shots_%s.xlsx"
+                    % datetime.now().strftime("%Y%m%d_%H%M%S"))
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "application/vnd.openxmlformats-officedocument."
+                             "spreadsheetml.sheet")
+            self.send_header("Content-Disposition",
+                             "attachment; filename=%s" % name)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -1221,6 +1441,9 @@ class Handler(BaseHTTPRequestHandler):
             p = self._json_body()
             self._send(200, json.dumps(
                 api_shots_clear(str(p.get("mode", "sent"))), ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/trash":
+            p = self._json_body()
+            self._send(200, json.dumps(api_trash_act(p), ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -1363,6 +1586,7 @@ def main():
         with _state_lock:
             STATE.update(st)
             STATE["forming_shot"] = None   # 上次运行残留的"检测中"行不恢复
+            STATE.setdefault("trash", [])  # 旧状态文件没有回收站字段
             n_pending = sum(1 for s in STATE["shots"] if s["status"] != "sent")
         log("已恢复状态: %d 条发次记录（其中 %d 条待绑定能量）"
             % (len(STATE["shots"]), n_pending))
