@@ -40,7 +40,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import target_client
 
@@ -649,19 +649,22 @@ def get_sheet_binding():
 _SRV_ROWS = {"t": 0.0, "name": "__init__", "rows": [], "label": "", "ok": True}
 
 
-def get_server_rows(sheet_name):
-    """拉取"当前绑定表"在 A 机的已上报记录（只读视图，5s 缓存）。
-    页面切换绑定时下方列表跟着换：切到 0915 就看到 0915 的记录。"""
+def get_server_rows(sheet_name, date=None):
+    """拉取绑定表在 A 机的已上报记录（只读视图，5s 缓存）。
+    绑定为 @date 时按 date 参数（默认今天）解析到对应日期表，
+    页面日期切换器选 0915 就看 0915 的表。"""
     sn = str(sheet_name or "").strip()
     now = time.time()
+    key = sn + "|" + str(date or "")
     with _state_lock:
-        if _SRV_ROWS["name"] == sn and now - _SRV_ROWS["t"] < 5:
+        if _SRV_ROWS["name"] == key and now - _SRV_ROWS["t"] < 5:
             return dict(_SRV_ROWS)
     label = sheet_label(sn)
-    rows, ok = [], True
+    rows, ok, view_url = [], True, ""
     try:
         if sn == "@date":
-            name = datetime.now().strftime("%Y-%m-%d")
+            name = str(date or "").strip() or datetime.now().strftime("%Y-%m-%d")
+            label = name + "（按日期自动）"
         elif sn:
             name = sn
         else:
@@ -674,6 +677,7 @@ def get_server_rows(sheet_name):
         sid = next((s.get("id") for s in j.get("sheets", [])
                     if s.get("name") == name), None)
         if sid is not None:
+            view_url = base + "/#sheet=" + str(sid)
             req2 = urllib.request.Request(
                 base + "/api/rows?sheet_id=%s&page=1&page_size=200"
                        "&q=&sort=shot_time&dir=desc" % sid,
@@ -697,8 +701,9 @@ def get_server_rows(sheet_name):
     except Exception:
         ok = False
     with _state_lock:
-        _SRV_ROWS.update(t=now, name=sn, rows=rows, label=label, ok=ok)
-    return {"ok": ok, "label": label, "rows": rows}
+        _SRV_ROWS.update(t=now, name=key, rows=rows, label=label, ok=ok,
+                         view_url=view_url)
+    return {"ok": ok, "label": label, "rows": rows, "view_url": view_url}
 
 
 def set_sheet_binding(name):
@@ -939,7 +944,16 @@ HELP_PAGE = r"""<!DOCTYPE html>
   </table>
 </div>
 <div class="wrap" style="margin-top:14px">
-  <div id="srvHead" style="font-size:13px;font-weight:bold;margin-bottom:6px">已上报记录（来自 A 机，只读）</div>
+  <div id="srvHead" style="font-size:13px;font-weight:bold;margin-bottom:6px;
+       display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+    <span id="srvTitle">已上报记录（来自 A 机，只读）</span>
+    <span style="font-weight:normal;font-size:12px;color:#888">查看日期：
+      <input type="date" id="srvDate" onchange="loadSrv()"
+             style="padding:2px 6px;border:1px solid #d5d8dc;border-radius:6px">
+    </span>
+    <a id="srvView" target="_blank" style="font-weight:normal;font-size:12px;
+       color:#3498db">在 A 机页面打开 →</a>
+  </div>
   <table>
     <thead><tr>
       <th>发次时间</th><th>No.</th><th>靶位</th><th>离焦</th><th>能量</th><th>图片数</th><th>首个文件</th>
@@ -1299,12 +1313,14 @@ function clearTrash(){
   trashAct("", "clear");
 }
 function loadSrv(){
-  fetch("/api/serverrows", {cache:"no-store"}).then(function(r){ return r.json(); })
+  var d = document.getElementById("srvDate").value || "";
+  fetch("/api/serverrows?date=" + encodeURIComponent(d), {cache:"no-store"})
+  .then(function(r){ return r.json(); })
   .then(function(j){
-    document.getElementById("srvHead").innerHTML =
-      "「" + tesc(j.label) + "」表已上报记录（" + j.rows.length +
-      " 条，来自 A 机，只读；切换上方绑定表格会跟着换）" +
-      (j.ok ? "" : " <span style='color:#c0392b;font-size:12px'>（A 机暂不可达）</span>");
+    document.getElementById("srvTitle").textContent =
+      "「" + j.label + "」已上报记录（" + j.rows.length + " 条）" +
+      (j.ok ? "" : "（A 机暂不可达）");
+    document.getElementById("srvView").href = j.view_url || "#";
     var tb = document.getElementById("srvtb");
     if (!j.rows.length){
       tb.innerHTML = "<tr><td colspan='7' style='color:#999;padding:10px'>" +
@@ -1466,8 +1482,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True, "trash": t},
                                        ensure_ascii=False))
         elif urlparse(self.path).path == "/api/serverrows":
+            q = parse_qs(urlparse(self.path).query)
             self._send(200, json.dumps(
-                get_server_rows((CFG or {}).get("sheet_name", "")),
+                get_server_rows((CFG or {}).get("sheet_name", ""),
+                                (q.get("date") or [None])[0]),
                 ensure_ascii=False))
         elif urlparse(self.path).path == "/export.xlsx":
             with _state_lock:
