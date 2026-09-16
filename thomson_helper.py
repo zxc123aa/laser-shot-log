@@ -516,7 +516,9 @@ def get_sheet_binding():
         j = json.loads(urllib.request.urlopen(req, timeout=6).read()
                        .decode("utf-8"))
         sheets = [{"id": s.get("id"), "name": s.get("name"),
-                   "count": s.get("count")} for s in j.get("sheets", [])]
+                   "count": s.get("count"),
+                   "view_url": SERVER_URL.rstrip("/") + "/#sheet=" +
+                               str(s.get("id"))} for s in j.get("sheets", [])]
     except Exception:
         pass  # A 机暂不可达：下拉框只显示特殊选项，不影响改绑定
     return {"ok": True, "sheet_name": cur, "label": sheet_label(cur),
@@ -992,25 +994,29 @@ function openSheet(){
 }
 function closeSheet(){ document.getElementById("sheetMask").style.display = "none"; }
 function renderSheet(sheets){
-  var h = "";
+  var h = "<div style='font-size:11px;color:#888;background:#f6f8fa;border-radius:6px;" +
+          "padding:6px 10px;margin-bottom:8px'>点卡片＝切换上报绑定；点「查看 →」＝在 A 机页面打开该表看记录</div>";
   h += sheetRow("@date", "按打靶日期自动分表", "每天打靶自动写入当天日期命名的表（如 2026-09-15），不存在自动创建");
   h += sheetRow("", "实时打靶（默认表）", "所有打靶集中写这一张固定表");
   if (sheets.length){
     h += "<div style='font-size:11px;color:#999;margin:10px 0 6px'>—— A 机已有表格 ——</div>";
     sheets.forEach(function(s, i){
-      h += sheetRow(s.name, s.name, s.count + " 条记录", "@dateornull_" + i);
+      h += sheetRow(s.name, s.name, s.count + " 条记录", "@dateornull_" + i, s.view_url);
     });
   } else {
     h += "<div style='font-size:11px;color:#999;margin:10px 0 4px'>（A 机表格列表获取失败，仅显示常用选项）</div>";
   }
   document.getElementById("sheetList").innerHTML = h;
 }
-function sheetRow(val, title, sub, key){
+function sheetRow(val, title, sub, key, viewUrl){
   var sel = (CUR_SHEET === val) ? "border:2px solid #2c3e50;background:#f2f7ff" :
             "border:1px solid #e6e8eb";
+  var view = viewUrl ? " <span onclick='event.stopPropagation();window.open(\"" +
+             viewUrl + "\")' style='color:#2471a3;font-size:11px;cursor:pointer;" +
+             "text-decoration:underline;margin-left:6px'>查看 →</span>" : "";
   return "<div onclick='selectSheet(this)' data-v=\"" + val.replace(/"/g,"&quot;") +
          "\" style='" + sel + ";border-radius:8px;padding:9px 12px;margin-bottom:6px;" +
-         "cursor:pointer'><div style='font-size:13px;font-weight:bold'>" + title +
+         "cursor:pointer'><div style='font-size:13px;font-weight:bold'>" + title + view +
          (CUR_SHEET === val ? " <span style='color:#2ecc71;font-size:12px'>✓ 当前</span>" : "") +
          "</div><div style='font-size:11px;color:#888;margin-top:2px'>" + sub + "</div></div>";
 }
