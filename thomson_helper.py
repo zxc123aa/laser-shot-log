@@ -1015,7 +1015,8 @@ HELP_PAGE = r"""<!DOCTYPE html>
         onclick="openDirs()" title="点击管理监视目录">-</b></span>
   <span>上报表格：<b id="sheetName" style="cursor:pointer;border-bottom:1px dotted #888"
         onclick="openSheet()" title="点击选择打靶上报写入的表格">-</b></span>
-  <span>查看日期：<input type="date" id="viewDate" onchange="render()"
+  <span>查看日期：<input type="date" id="viewDate"
+        onchange="VDATE=this.value || todayStr(); render(); LASTJSON=''"
         style="padding:2px 6px;border:1px solid #d5d8dc;border-radius:6px;
         font-family:inherit"></span>
   <span>本日 <b id="nday">0</b> 发 ｜ 未上报 <b id="npending" style="color:#c0392b">0</b> 发</span>
