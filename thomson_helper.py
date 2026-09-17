@@ -88,6 +88,76 @@ def _bypass_proxy_for_lan():
 
 
 _bypass_proxy_for_lan()
+
+# ---------- 靶位 → 靶类型 映射（来自"第x次打靶靶位"xls，如 D:\怀柔实验规范平台\shotlist20260917.xls） ----------
+TTM_JSON = os.path.join(BASE, "target_type_map.json")
+TTM_STATE = {"xls_mtime": None, "map": {}, "next_check": 0.0,
+             "lock": threading.Lock()}
+
+
+def _ttm_cfg():
+    """配置 target_type_map: {"xls": xls文件或目录, "python": 带xlrd的解释器}
+    xls 填目录时自动取目录里最新的 shotlist*.xls（映射表每天一份新文件）。"""
+    c = (CFG or {}).get("target_type_map") or {}
+    return (str(c.get("xls") or "").strip(),
+            str(c.get("python") or "D:/anaconda/python.exe").strip())
+
+
+def _ttm_pick_xls(p):
+    if not p:
+        return ""
+    if os.path.isdir(p):
+        cands = [os.path.join(p, f) for f in os.listdir(p)
+                 if f.lower().startswith("shotlist")
+                 and f.lower().endswith(".xls")]
+        return max(cands, key=os.path.getmtime) if cands else ""
+    return p
+
+
+def get_target_type_map(force=False):
+    """取 靶位→靶类型 映射（60s 节流；xls 变新后自动重转 JSON）。"""
+    xls_cfg, pyexe = _ttm_cfg()
+    now = time.time()
+    with TTM_STATE["lock"]:
+        if not force and now < TTM_STATE["next_check"]:
+            return TTM_STATE["map"]
+        TTM_STATE["next_check"] = now + 60
+        xls = _ttm_pick_xls(xls_cfg)
+        if xls and os.path.exists(xls):
+            mt = os.path.getmtime(xls)
+            if mt != TTM_STATE["xls_mtime"] or not os.path.exists(TTM_JSON):
+                try:
+                    import subprocess
+                    r = subprocess.run(
+                        [pyexe, os.path.join(BASE, "xls_target_map.py"),
+                         xls, TTM_JSON],
+                        capture_output=True, timeout=60)
+                    if r.returncode == 0:
+                        TTM_STATE["xls_mtime"] = mt
+                        log("靶类型映射已更新: %s" % os.path.basename(xls))
+                    else:
+                        log("靶类型映射转换失败: %s"
+                            % r.stderr.decode("utf-8", "replace")[-200:])
+                except Exception as e:
+                    log("靶类型映射转换异常: %r" % e)
+        elif xls_cfg and not xls:
+            log("靶类型映射：找不到 shotlist*.xls（配置目录里没有）")
+        m = {}
+        try:
+            m = json.load(open(TTM_JSON, encoding="utf-8")).get("map", {})
+        except Exception:
+            pass
+        TTM_STATE["map"] = m
+        return m
+
+
+def lookup_target_type(pos):
+    pos = str(pos or "").strip()
+    if not pos:
+        return ""
+    return get_target_type_map().get(pos, "")
+
+
 STATE_PATH = os.path.join(BASE, "state_helper.json")
 B_LOCAL_CONFIG_PATH = os.path.join(BASE, "config_b.local.json")  # b_watcher 本机配置（监视目录变更需同步给它）
 
@@ -487,6 +557,9 @@ def report_shot(shot, energy=""):
     fields = {"no": shot["no"]} if shot.get("no") is not None else {}
     if shot.get("target"):
         fields["target_pos"] = shot["target"]       # A 机表已有"靶位"列
+        tt = lookup_target_type(shot["target"])     # 靶位 → 靶类型（映射表）
+        if tt:
+            fields["target_type"] = tt              # A 机表已有"靶类型"列
     if shot.get("defocus") != "":
         fields["target_defocus"] = str(shot["defocus"])  # A 机表"靶离焦"列
     if energy:
@@ -736,6 +809,7 @@ def get_server_rows(sheet_name, date=None):
                 rows.append({
                     "shot_time": r.get("shot_time", ""),
                     "no": f.get("no", ""), "target": f.get("target_pos", ""),
+                    "ttype": f.get("target_type", ""),
                     "defocus": f.get("target_defocus", ""),
                     "energy": f.get(ENERGY_FIELD, ""),
                     "file_count": r.get("file_count", 0),
@@ -979,7 +1053,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
   <table>
     <thead><tr>
       <th>No.</th><th>发次时间</th><th>图片数</th><th>图片文件</th>
-      <th>靶位/离焦</th>
+      <th>靶位/离焦</th><th>靶类型</th>
       <th>闪烁光纤能量</th><th>状态</th><th>操作</th>
     </tr></thead>
     <tbody id="tb"></tbody>
@@ -998,7 +1072,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
   </div>
   <table>
     <thead><tr>
-      <th>发次时间</th><th>No.</th><th>靶位</th><th>离焦</th><th>能量</th><th>图片数</th><th>首个文件</th>
+      <th>发次时间</th><th>No.</th><th>靶位</th><th>靶类型</th><th>离焦</th><th>能量</th><th>图片数</th><th>首个文件</th>
     </tr></thead>
     <tbody id="srvtb"></tbody>
   </table>
@@ -1083,7 +1157,7 @@ function stLabel(s){
 function render(){
   var tb = document.getElementById("tb");
   if (!SHOTS.length){
-    tb.innerHTML = "<tr><td colspan=8 class='empty'>暂未检测到发次——等待谱仪图片落盘…</td></tr>";
+    tb.innerHTML = "<tr><td colspan=9 class='empty'>暂未检测到发次——等待谱仪图片落盘…</td></tr>";
   } else {
     var h = "";
     SHOTS.forEach(function(s, i){
@@ -1097,6 +1171,7 @@ function render(){
       var tgt = s.target || "-";
       if (s.defocus !== "" && s.defocus != null) tgt += " <span style='color:#888'>离焦 " + s.defocus + "</span>";
       h += "<td style='white-space:nowrap'>" + tgt + "</td>";
+      h += "<td style='white-space:nowrap;color:#1a6fb5'>" + (s.ttype || "-") + "</td>";
       h += "<td><input class='e' data-i='" + i + "' value='" +
            (s.energy || "").replace(/'/g,"&#39;") +
            "' placeholder='如 2.35' onkeydown='if(event.key===\"Enter\")send(" + i + ",false)'></td>";
@@ -1365,7 +1440,7 @@ function loadSrv(){
     document.getElementById("srvView").href = j.view_url || "#";
     var tb = document.getElementById("srvtb");
     if (!j.rows.length){
-      tb.innerHTML = "<tr><td colspan='7' style='color:#999;padding:10px'>" +
+      tb.innerHTML = "<tr><td colspan='8' style='color:#999;padding:10px'>" +
                      "该表还没有记录</td></tr>";
       return;
     }
@@ -1374,6 +1449,7 @@ function loadSrv(){
       h += "<tr><td style='white-space:nowrap'>" + tesc(r.shot_time) + "</td>" +
            "<td>" + (r.no === 0 || r.no ? r.no : "-") + "</td>" +
            "<td>" + tesc(r.target || "") + "</td>" +
+           "<td style='color:#1a6fb5'>" + tesc(r.ttype || "-") + "</td>" +
            "<td>" + tesc(r.defocus || "") + "</td>" +
            "<td>" + tesc(r.energy || "") + "</td>" +
            "<td>" + (r.file_count || 0) + "</td>" +
@@ -1492,12 +1568,21 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, html, "text/html; charset=utf-8")
 
     def _snapshot(self):
+        ttm = get_target_type_map()
         with _state_lock:
-            shots = [dict(s) for s in STATE["shots"]]
+            shots = []
+            for s in STATE["shots"]:
+                d = dict(s)
+                if not d.get("ttype"):
+                    d["ttype"] = ttm.get(str(d.get("target") or "").strip(), "")
+                shots.append(d)
             fm = STATE.get("forming_shot")
+            if fm:
+                fm = dict(fm)
+                fm["ttype"] = ttm.get(str(fm.get("target") or "").strip(), "")
             dirs = list(WATCH_DIRS)     # 随快照下发：目录变更所有页面实时同步
             tgt = dict(TARGET)          # 靶位/离焦实时状态
-        out = ([dict(fm)] if fm else []) + shots   # "检测中"行置顶
+        out = ([fm] if fm else []) + shots   # "检测中"行置顶
         return json.dumps(
             {"ok": True, "shots": out[:200], "server": SERVER_URL,
              "queue": len(STATE["queue"]), "dirs": dirs, "target": tgt},
