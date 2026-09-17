@@ -820,8 +820,12 @@ def get_server_rows(sheet_name, date=None):
     label = sheet_label(sn)
     rows, ok, view_url = [], True, ""
     try:
-        if sn == "@date":
-            name = str(date or "").strip() or datetime.now().strftime("%Y-%m-%d")
+        if sn == "@date" or re.match(r"^\d{4}-\d{2}-\d{2}$", sn):
+            # @date 绑定（或绑定被切成了具体日期表）都按日期浏览：
+            # 页面传了日期就以前端选择为准，没传则用绑定表名/今天
+            name = (str(date or "").strip()
+                    or (sn if sn != "@date"
+                        else datetime.now().strftime("%Y-%m-%d")))
             label = name + "（按日期自动）"
         elif sn:
             name = sn
