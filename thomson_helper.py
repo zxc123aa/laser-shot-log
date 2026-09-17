@@ -810,6 +810,10 @@ def set_sheet_binding(name):
     sn = str(name or "").strip()
     if sn not in ("", "@date") and re.search(r'[\\/:*?"<>|]', sn):
         return {"ok": False, "error": "表名含非法字符 \\ / : * ? \" < > |"}
+    if sn not in ("", "@date") and re.match(r"^\d{4}-\d{2}-\d{2}$", sn):
+        return {"ok": False,
+                "error": "历史日期表仅供查看：绑定「按打靶日期自动分表」即可，"
+                         "每天自动写入当天日期命名的表"}
     with _state_lock:
         CFG["sheet_name"] = sn
         save_json(CONFIG_PATH, CFG)
@@ -1346,29 +1350,38 @@ function openSheet(){
 function closeSheet(){ document.getElementById("sheetMask").style.display = "none"; }
 function renderSheet(sheets){
   var h = "<div style='font-size:11px;color:#888;background:#f6f8fa;border-radius:6px;" +
-          "padding:6px 10px;margin-bottom:8px'>点卡片＝切换上报目标表（默认按打靶日期自动分表，一天一张表）；点「查看 →」＝在 A 机页面打开该表</div>";
+          "padding:6px 10px;margin-bottom:8px'>上报目标默认「按打靶日期自动分表」：每天自动写入当天日期命名的表，一天一张、与日志一一对应。历史日期表仅供查看，不能选为上报目标。</div>";
   h += sheetRow("@date", "按打靶日期自动分表", "每天打靶自动写入当天日期命名的表（如 2026-09-15），不存在自动创建");
   h += sheetRow("", "实时打靶（默认表）", "所有打靶集中写这一张固定表");
   if (sheets.length){
-    h += "<div style='font-size:11px;color:#999;margin:10px 0 6px'>—— A 机已有表格 ——</div>";
+    h += "<div style='font-size:11px;color:#999;margin:10px 0 6px'>—— A 机已有表格（点「查看 →」打开）——</div>";
     sheets.forEach(function(s, i){
-      h += sheetRow(s.name, s.name, s.count + " 条记录", "@dateornull_" + i, s.view_url);
+      var ro = /^\d{4}-\d{2}-\d{2}$/.test(s.name);   // 日期命名的表 = 历史表，只读
+      h += sheetRow(s.name, s.name,
+                    ro ? (s.count + " 条记录 ｜ 历史表，仅供查看") : (s.count + " 条记录"),
+                    "@dateornull_" + i, s.view_url, ro);
     });
   } else {
     h += "<div style='font-size:11px;color:#999;margin:10px 0 4px'>（A 机表格列表获取失败，仅显示常用选项）</div>";
   }
   document.getElementById("sheetList").innerHTML = h;
 }
-function sheetRow(val, title, sub, key, viewUrl){
-  var sel = (CUR_SHEET === val) ? "border:2px solid #2c3e50;background:#f2f7ff" :
+function sheetRow(val, title, sub, key, viewUrl, viewonly){
+  viewonly = !!viewonly;
+  var sel = viewonly ? "border:1px dashed #d8dce0;background:#fafbfc" :
+            (CUR_SHEET === val) ? "border:2px solid #2c3e50;background:#f2f7ff" :
             "border:1px solid #e6e8eb";
   var view = viewUrl ? " <span onclick='event.stopPropagation();window.open(\"" +
              viewUrl + "\")' style='color:#2471a3;font-size:11px;cursor:pointer;" +
              "text-decoration:underline;margin-left:6px'>查看 →</span>" : "";
-  return "<div onclick='selectSheet(this)' data-v=\"" + val.replace(/"/g,"&quot;") +
-         "\" style='" + sel + ";border-radius:8px;padding:9px 12px;margin-bottom:6px;" +
-         "cursor:pointer'><div style='font-size:13px;font-weight:bold'>" + title + view +
-         (CUR_SHEET === val ? " <span style='color:#2ecc71;font-size:12px'>✓ 当前</span>" : "") +
+  var click = viewonly ? "<div" :
+          "<div onclick='selectSheet(this)' data-v=\"" + val.replace(/"/g,"&quot;") + "\"";
+  return click +
+         " style='" + sel + ";border-radius:8px;padding:9px 12px;margin-bottom:6px;" +
+         (viewonly ? "" : "cursor:pointer") + "'><div style='font-size:13px;" +
+         "font-weight:bold" + (viewonly ? ";color:#999" : "") + "'>" + title + view +
+         (!viewonly && CUR_SHEET === val ?
+          " <span style='color:#2ecc71;font-size:12px'>✓ 当前</span>" : "") +
          "</div><div style='font-size:11px;color:#888;margin-top:2px'>" + sub + "</div></div>";
 }
 function selectSheet(el){
