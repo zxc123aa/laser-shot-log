@@ -18,6 +18,42 @@ import time
 import urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+def _bypass_proxy_for_lan():
+    """实验室内网地址不走系统代理（http_proxy 是会话级动态端口，会把
+    10.0.23.x 内网请求拖死）。把 A 机/靶系统主机名加入 NO_PROXY。"""
+    from urllib.parse import urlparse as _up
+    hosts = {"127.0.0.1", "localhost"}
+    for cfg in ("config_b.local.json", "config_helper.json"):
+        p = os.path.join(BASE, cfg)
+        if not os.path.exists(p):
+            continue
+        try:
+            c = json.load(open(p, encoding="utf-8"))
+        except Exception:
+            continue
+        for key in ("server_url",):
+            u = c.get(key)
+            if u:
+                h = _up(str(u)).hostname
+                if h:
+                    hosts.add(h)
+        tm = c.get("target_monitor") or {}
+        for key in ("url", "server"):
+            u = tm.get(key)
+            if u:
+                h = _up(str(u)).hostname
+                if h:
+                    hosts.add(h)
+    cur = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    for h in sorted(hosts):
+        if h and h not in cur:
+            cur = (cur + "," + h) if cur else h
+    os.environ["NO_PROXY"] = cur
+    os.environ["no_proxy"] = cur
+
+
+_bypass_proxy_for_lan()
 SERVER_URL = "http://10.0.23.155:8765"
 OUT_ROOT = os.path.join(BASE, "shotlist")
 INTERVAL_SEC = 30

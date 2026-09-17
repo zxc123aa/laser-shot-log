@@ -46,6 +46,48 @@ import target_client
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config_helper.json")
+
+
+def _bypass_proxy_for_lan():
+    """实验室内网地址不走系统代理。
+
+    WorkBuddy/每个 shell 会话会注入动态 http_proxy（端口常变，如 52759），
+    urllib 默认经代理访问会把 10.0.23.x 内网请求拖死/拦截。
+    这里把本服务和靶系统的主机名加入 NO_PROXY，进程内立即生效。"""
+    hosts = {"127.0.0.1", "localhost"}
+    try:
+        from urllib.parse import urlparse as _up
+        for cfg in ("config_helper.json", "config_b.local.json"):
+            p = os.path.join(BASE, cfg)
+            if os.path.exists(p):
+                try:
+                    c = json.load(open(p, encoding="utf-8"))
+                except Exception:
+                    continue
+                for key in ("server_url",):
+                    u = c.get(key)
+                    if u:
+                        h = _up(str(u)).hostname
+                        if h:
+                            hosts.add(h)
+                tm = c.get("target_monitor") or {}
+                for key in ("url", "server"):
+                    u = tm.get(key)
+                    if u:
+                        h = _up(str(u)).hostname
+                        if h:
+                            hosts.add(h)
+    except Exception:
+        pass
+    cur = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    for h in sorted(hosts):
+        if h and h not in cur:
+            cur = (cur + "," + h) if cur else h
+    os.environ["NO_PROXY"] = cur
+    os.environ["no_proxy"] = cur
+
+
+_bypass_proxy_for_lan()
 STATE_PATH = os.path.join(BASE, "state_helper.json")
 B_LOCAL_CONFIG_PATH = os.path.join(BASE, "config_b.local.json")  # b_watcher 本机配置（监视目录变更需同步给它）
 
