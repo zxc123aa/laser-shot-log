@@ -392,6 +392,8 @@ PAGE = r"""<!DOCTYPE html>
     <button class="tbtn" onclick="doExport('xlsx')">导出 Excel</button>
     <button class="tbtn" onclick="doExport('csv')">导出 CSV</button>
     <button class="tbtn" onclick="window.print()" title="打印当前页表格">打印</button>
+    <button class="tbtn" id="hideBtn" onclick="toggleHidden()"
+            title="少用的列默认隐藏，点这里临时展开/收起">-</button>
     <span id="info"></span>
   </div>
   <div class="wrap" id="wrap"></div>
@@ -413,6 +415,18 @@ PAGE = r"""<!DOCTYPE html>
 var S = {sheets: [], cur: null, page: 1, q: "", f: {}, ftimer: null,
          sort: "", dir: "asc", timer: null, editing: false, checked: new Set()};
 var COL_OPTS = {};
+/* 少用列默认隐藏（shotlist_cols.json 里 "hide": true 的列），
+   工具栏「显示隐藏列」可临时展开；只影响页面显示，导出仍是全列 */
+var SHOW_ALL = false;
+function vcols(){ return SHOW_ALL ? COLS : COLS.filter(function(c){ return !c.hide; }); }
+function updateHideBtn(){
+  var n = COLS.filter(function(c){ return c.hide; }).length;
+  document.getElementById("hideBtn").textContent =
+    SHOW_ALL ? "收起少用列" : "显示隐藏列 (" + n + ")";
+}
+function toggleHidden(){
+  SHOW_ALL = !SHOW_ALL; updateHideBtn(); renderHead(); loadRows();
+}
 
 function toast(m){
   var t = document.createElement("div"); t.className = "toast"; t.textContent = m;
@@ -563,12 +577,13 @@ function loadRows(){
   });
 }
 function renderHead(){
+  var VC = vcols();
   var h = "<table><thead><tr><th class='ck'><input type=checkbox id=ckall></th><th data-k='shot_time'>时间</th>";
-  COLS.forEach(function(c){ h += "<th data-k='" + c.key + "'>" + esc(c.name) + "</th>"; });
+  VC.forEach(function(c){ h += "<th data-k='" + c.key + "'>" + esc(c.name) + "</th>"; });
   h += "<th data-k='machine'>来源</th><th data-k='file_count'>文件数</th><th data-k='first_file'>首个文件</th><th>操作</th></tr>";
   /* 列级筛选行 */
   h += "<tr class='frow'><th class='ck'></th>";
-  ["shot_time"].concat(COLS.map(function(c){return c.key;})).concat(["machine","first_file"]).forEach(function(k){
+  ["shot_time"].concat(VC.map(function(c){return c.key;})).concat(["machine","first_file"]).forEach(function(k){
     h += "<th class='fh'><input class='frin' data-f='" + k + "' placeholder='筛选' value='" +
          esc(S.f[k]||"") + "'></th>";
   });
@@ -606,7 +621,7 @@ function renderHead(){
 }
 function renderRows(rows){
   var tb = document.getElementById("tb");
-  if (!rows.length){ tb.innerHTML = "<tr><td colspan=" + (COLS.length + 6) +
+  if (!rows.length){ tb.innerHTML = "<tr><td colspan=" + (vcols().length + 6) +
     " class='empty'>没有匹配的记录</td></tr>";
     var ck0 = document.getElementById("ckall");
     if (ck0){ ck0.checked = false; ck0.indeterminate = false; }
@@ -615,7 +630,7 @@ function renderRows(rows){
   rows.forEach(function(r){
     h += "<tr data-id='" + r.id + "' data-rev='" + (r.rev||1) + "'><td class='ck'><input type=checkbox></td>";
     h += "<td class='t ed' data-f='shot_time' data-ph='点击填写'>" + esc(r.shot_time) + "</td>";
-    COLS.forEach(function(c){
+    vcols().forEach(function(c){
       h += "<td class='ed' style='min-width:" + c.width + "px' data-f='" + c.key +
            "' data-ph='点击填写'>" + esc(r.fields[c.key] || "") + "</td>";
     });
@@ -655,7 +670,7 @@ function setCell(cell, v){
   else { rowQ[key] = []; task(); }
 }
 function bindEdit(){
-  var pitch = COLS.length + 1;   // 每行可编辑单元格数：时间 + 全部列
+  var pitch = vcols().length + 1;   // 每行可编辑单元格数：时间 + 当前显示列
   document.querySelectorAll("td.ed").forEach(function(td){
     td.addEventListener("click", function(){
       if (S.editing) return;
@@ -858,6 +873,7 @@ connectSSE();
 /* ---------- 启动 ---------- */
 var COLS = __COLS__;
 COLS.forEach(function(c){ if (c.options) COL_OPTS[c.key] = c.options; });
+updateHideBtn();
 loadHash();
 loadSheets();
 loadAlerts();
