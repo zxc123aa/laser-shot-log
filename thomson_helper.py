@@ -804,72 +804,6 @@ def get_sheet_binding():
             "sheets": sheets}
 
 
-_SRV_ROWS = {"t": 0.0, "name": "__init__", "rows": [], "label": "", "ok": True}
-
-
-def get_server_rows(sheet_name, date=None):
-    """拉取绑定表在 A 机的已上报记录（只读视图，5s 缓存）。
-    绑定为 @date 时按 date 参数（默认今天）解析到对应日期表，
-    页面日期切换器选 0915 就看 0915 的表。"""
-    sn = str(sheet_name or "").strip()
-    now = time.time()
-    key = sn + "|" + str(date or "")
-    with _state_lock:
-        if _SRV_ROWS["name"] == key and now - _SRV_ROWS["t"] < 5:
-            return dict(_SRV_ROWS)
-    label = sheet_label(sn)
-    rows, ok, view_url = [], True, ""
-    try:
-        if sn == "@date" or re.match(r"^\d{4}-\d{2}-\d{2}$", sn):
-            # @date 绑定（或绑定被切成了具体日期表）都按日期浏览：
-            # 页面传了日期就以前端选择为准，没传则用绑定表名/今天
-            name = (str(date or "").strip()
-                    or (sn if sn != "@date"
-                        else datetime.now().strftime("%Y-%m-%d")))
-            label = name + "（按日期自动）"
-        elif sn:
-            name = sn
-        else:
-            name = "实时打靶"
-        base = SERVER_URL.rstrip("/")
-        req = urllib.request.Request(base + "/api/sheets",
-                                     headers={"Accept": "application/json"})
-        j = json.loads(urllib.request.urlopen(req, timeout=6).read()
-                       .decode("utf-8"))
-        sid = next((s.get("id") for s in j.get("sheets", [])
-                    if s.get("name") == name), None)
-        if sid is not None:
-            view_url = base + "/#sheet=" + str(sid)
-            req2 = urllib.request.Request(
-                base + "/api/rows?sheet_id=%s&page=1&page_size=200"
-                       "&q=&sort=shot_time&dir=desc" % sid,
-                headers={"Accept": "application/json"})
-            j2 = json.loads(urllib.request.urlopen(req2, timeout=6).read()
-                            .decode("utf-8"))
-            for r in j2.get("rows", []):
-                f = r.get("fields") or {}
-                if isinstance(f, str):
-                    try:
-                        f = json.loads(f)
-                    except Exception:
-                        f = {}
-                rows.append({
-                    "shot_time": r.get("shot_time", ""),
-                    "no": f.get("no", ""), "target": f.get("target_pos", ""),
-                    "ttype": f.get("target_type", ""),
-                    "defocus": f.get("target_defocus", ""),
-                    "energy": f.get(ekey0(), ""),
-                    "energies": {k: f.get(k, "") for k in efield_keys()},
-                    "file_count": r.get("file_count", 0),
-                    "first_file": r.get("first_file", "")})
-    except Exception:
-        ok = False
-    with _state_lock:
-        _SRV_ROWS.update(t=now, name=key, rows=rows, label=label, ok=ok,
-                         view_url=view_url)
-    return {"ok": ok, "label": label, "rows": rows, "view_url": view_url}
-
-
 def set_sheet_binding(name):
     """8767 页面切换上报目标表：写 config_helper.json 并同步 config_b.local.json
     （b_watcher 检测到配置 mtime 变化会自动热重载，无需重启）。"""
@@ -1081,7 +1015,10 @@ HELP_PAGE = r"""<!DOCTYPE html>
         onclick="openDirs()" title="点击管理监视目录">-</b></span>
   <span>上报表格：<b id="sheetName" style="cursor:pointer;border-bottom:1px dotted #888"
         onclick="openSheet()" title="点击选择打靶上报写入的表格">-</b></span>
-  <span>待填能量 <b id="npending">0</b> 发</span>
+  <span>查看日期：<input type="date" id="viewDate" onchange="render()"
+        style="padding:2px 6px;border:1px solid #d5d8dc;border-radius:6px;
+        font-family:inherit"></span>
+  <span>本日 <b id="nday">0</b> 发 ｜ 未上报 <b id="npending" style="color:#c0392b">0</b> 发</span>
   <span>绑定窗口 ±<b id="win">-</b>s</span>
   <span>能量写入列：<b id="efields">-</b></span>
   <span>当前靶位：<b id="tgt">…</b><span id="tgtF" style="color:#888;font-size:12px"></span></span>
@@ -1107,23 +1044,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
     <tbody id="tb"></tbody>
   </table>
 </div>
-<div class="wrap" style="margin-top:14px">
-  <div id="srvHead" style="font-size:13px;font-weight:bold;margin-bottom:6px;
-       display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-    <span id="srvTitle">已上报记录（来自 A 机，只读）</span>
-    <span style="font-weight:normal;font-size:12px;color:#888">查看日期：
-      <input type="date" id="srvDate" onchange="loadSrv()"
-             style="padding:2px 6px;border:1px solid #d5d8dc;border-radius:6px">
-    </span>
-    <a id="srvView" target="_blank" style="font-weight:normal;font-size:12px;
-       color:#3498db">在 A 机页面打开 →</a>
-  </div>
-  <table>
-    <thead><tr id="srvHead"></tr></thead>
-    <tbody id="srvtb"></tbody>
-  </table>
-</div>
-<div id="foot">打靶需在页面点「确认上报」后才写入日志系统 ｜ 旧/误发次点"忽略"进回收站（右上可恢复） ｜ 右上「导出Excel」备份当前列表 ｜ No. 自动取自文件名，可手动修正</div>
+<div id="foot">打靶需在页面点「确认上报」后才写入日志系统 ｜ 切换「查看日期」可回看当天上报情况（未上报/漏报一目了然）｜ 旧/误发次点"忽略"进回收站（右上可恢复） ｜ 右上「导出Excel」备份当前列表</div>
 <div id="toast"></div>
 <div id="dirMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
      z-index:50;align-items:center;justify-content:center"
@@ -1210,13 +1131,30 @@ function eStr(s){
   if (!parts.length && s.energy) parts.push(String(s.energy));
   return parts.join("  ");
 }
+function todayStr(){
+  var d = new Date();
+  return d.getFullYear() + "-" + ("0"+(d.getMonth()+1)).slice(-2) +
+         "-" + ("0"+d.getDate()).slice(-2);
+}
+var VDATE = "";
+function viewIdx(){   // 当前查看日期对应的 SHOTS 下标（本地留痕，按发次时间过滤）
+  if (!VDATE) return SHOTS.map(function(_, i){ return i; });
+  return SHOTS.map(function(_, i){ return i; })
+              .filter(function(i){ return (SHOTS[i].shot_time || "")
+                                            .slice(0, 10) === VDATE; });
+}
 function render(){
   var tb = document.getElementById("tb");
-  if (!SHOTS.length){
-    tb.innerHTML = "<tr><td colspan=9 class='empty'>暂未检测到发次——等待谱仪图片落盘…</td></tr>";
+  var view = viewIdx();
+  if (!view.length){
+    tb.innerHTML = "<tr><td colspan=9 class='empty'>" +
+      (VDATE && VDATE !== todayStr()
+        ? VDATE + " 当天没有发次记录"
+        : "暂未检测到发次——等待谱仪图片落盘…") + "</td></tr>";
   } else {
     var h = "";
-    SHOTS.forEach(function(s, i){
+    view.forEach(function(i){
+      var s = SHOTS[i];
       h += "<tr data-i='" + i + "'>";
       h += "<td><input class='n' data-i='" + i + "' value='" +
            (s.no != null ? s.no : "") + "'></td>";
@@ -1261,8 +1199,14 @@ function render(){
     });
     tb.innerHTML = h;
   }
-  var np = SHOTS.filter(function(s){ return s.status !== "sent"; }).length;
+  var dayStr = VDATE || todayStr();
+  document.getElementById("nday").textContent = view.length;
+  var np = view.filter(function(i){
+    return SHOTS[i].status !== "sent"; }).length;
   document.getElementById("npending").textContent = np;
+  if (VDATE && VDATE !== todayStr()){
+    document.getElementById("npending").style.color = np ? "#c0392b" : "#256029";
+  }
 }
 function apply(j){
   document.getElementById("dot").className = "dot ok";
@@ -1401,7 +1345,7 @@ function openSheet(){
 function closeSheet(){ document.getElementById("sheetMask").style.display = "none"; }
 function renderSheet(sheets){
   var h = "<div style='font-size:11px;color:#888;background:#f6f8fa;border-radius:6px;" +
-          "padding:6px 10px;margin-bottom:8px'>点卡片＝切换上报目标表，页面下方「已上报记录」立即跟着换成该表；点「查看 →」＝在 A 机页面打开该表</div>";
+          "padding:6px 10px;margin-bottom:8px'>点卡片＝切换上报目标表（默认按打靶日期自动分表，一天一张表）；点「查看 →」＝在 A 机页面打开该表</div>";
   h += sheetRow("@date", "按打靶日期自动分表", "每天打靶自动写入当天日期命名的表（如 2026-09-15），不存在自动创建");
   h += sheetRow("", "实时打靶（默认表）", "所有打靶集中写这一张固定表");
   if (sheets.length){
@@ -1436,7 +1380,6 @@ function selectSheet(el){
     CUR_SHEET = j.sheet_name || "";
     document.getElementById("sheetName").textContent = j.label;
     toast("上报表格已切换为：" + j.label);
-    loadSrv();     // 下方"已上报记录"跟着切换到该表
     openSheet();   // 重新渲染列表高亮
   }).catch(function(){ toast("保存失败（网络错误）"); });
 }
@@ -1492,43 +1435,6 @@ function trashAct(st, act){
 function clearTrash(){
   if (!confirm("清空回收站？里面的发次将永久删除，无法恢复！")) return;
   trashAct("", "clear");
-}
-function loadSrv(){
-  var d = document.getElementById("srvDate").value || "";
-  fetch("/api/serverrows?date=" + encodeURIComponent(d), {cache:"no-store"})
-  .then(function(r){ return r.json(); })
-  .then(function(j){
-    document.getElementById("srvTitle").textContent =
-      "「" + j.label + "」已上报记录（" + j.rows.length + " 条）" +
-      (j.ok ? "" : "（A 机暂不可达）");
-    document.getElementById("srvView").href = j.view_url || "#";
-    var hh = "<th>发次时间</th><th>No.</th><th>靶位</th><th>靶类型</th><th>离焦</th>";
-    CFG_EFIELDS.forEach(function(ef){ hh += "<th>" + ef.label + "</th>"; });
-    hh += "<th>图片数</th><th>首个文件</th>";
-    document.getElementById("srvCols").innerHTML = hh;
-    var tb = document.getElementById("srvtb");
-    if (!j.rows.length){
-      tb.innerHTML = "<tr><td colspan='" + (5 + CFG_EFIELDS.length + 2) +
-                     "' style='color:#999;padding:10px'>该表还没有记录</td></tr>";
-      return;
-    }
-    var h = "";
-    j.rows.forEach(function(r){
-      var es = r.energies || {};
-      h += "<tr><td style='white-space:nowrap'>" + tesc(r.shot_time) + "</td>" +
-           "<td>" + (r.no === 0 || r.no ? r.no : "-") + "</td>" +
-           "<td>" + tesc(r.target || "") + "</td>" +
-           "<td style='color:#1a6fb5'>" + tesc(r.ttype || "-") + "</td>" +
-           "<td>" + tesc(r.defocus || "") + "</td>";
-      CFG_EFIELDS.forEach(function(ef){
-        h += "<td>" + tesc(String(es[ef.key] || "")) + "</td>";
-      });
-      h += "<td>" + (r.file_count || 0) + "</td>" +
-           "<td style='color:#888;font-size:12px'>" + tesc(r.first_file || "") +
-           "</td></tr>";
-    });
-    tb.innerHTML = h;
-  }).catch(function(){});
 }
 function refresh(){
   fetch("/api/local", {cache:"no-store"}).then(function(r){ return r.json(); }).then(apply)
@@ -1609,7 +1515,9 @@ document.getElementById("dirs").textContent = CFG_DIRS;
 document.getElementById("efields").textContent =
   CFG_EFIELDS.map(function(f){ return f.label; }).join(" / ");
 refresh(); connectSSE(); setInterval(refresh, 15000);   // SSE 实时推送，15s 轮询仅作兜底
-loadSheetBinding(); loadSrv(); setInterval(loadSrv, 10000);
+loadSheetBinding();
+VDATE = todayStr();
+document.getElementById("viewDate").value = VDATE;
 if (location.hash === "#dirs") openDirs();   // URL 直达目录管理面板
 /* 切回标签页/窗口聚焦时立即刷新，不等下一个 4 秒节拍 */
 document.addEventListener("visibilitychange", function(){ if (!document.hidden) refresh(); });
@@ -1685,12 +1593,6 @@ class Handler(BaseHTTPRequestHandler):
                 t = [dict(s) for s in STATE.get("trash", [])]
             self._send(200, json.dumps({"ok": True, "trash": t},
                                        ensure_ascii=False))
-        elif urlparse(self.path).path == "/api/serverrows":
-            q = parse_qs(urlparse(self.path).query)
-            self._send(200, json.dumps(
-                get_server_rows((CFG or {}).get("sheet_name", ""),
-                                (q.get("date") or [None])[0]),
-                ensure_ascii=False))
         elif urlparse(self.path).path == "/export.xlsx":
             with _state_lock:
                 shots = [dict(s) for s in STATE["shots"]]
