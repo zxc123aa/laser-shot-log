@@ -198,8 +198,47 @@ def bump_ver():
 SERVER_URL = ""
 MACHINE = ""
 WATCH_DIRS = []
-ENERGY_FIELD = "fiber_p_energy"
+# 能量字段清单（顺序即页面显示顺序）：117 等任一台电脑打开 8767 页面，
+# 都可同时上传 闪烁光纤能量 / TPS: H+ / TPS: C6，分别写入 A 机对应列。
+DEFAULT_ENERGY_FIELDS = [
+    {"key": "fiber_p_energy", "label": "闪烁光纤能量", "ph": "如 2.35"},
+    {"key": "tps_h",          "label": "TPS: H+能量",  "ph": "如 12.5"},
+    {"key": "tps_c6",         "label": "TPS: C6能量",  "ph": "如 35"},
+]
+ENERGY_FIELD = "fiber_p_energy"   # 旧单字段（兼容保留，取第一个 key）
+ENERGY_FIELDS = [dict(DEFAULT_ENERGY_FIELDS[0])]
 MATCH_WINDOW = 15.0
+
+
+def efield_keys():
+    return [f["key"] for f in ENERGY_FIELDS]
+
+
+def ekey0():
+    return ENERGY_FIELDS[0]["key"]
+
+
+def norm_energies(s):
+    """把一条发次的能量统一成 energies 字典（兼容旧版单 energy 字符串）"""
+    e = s.get("energies")
+    if not isinstance(e, dict):
+        e = {}
+    legacy = str(s.get("energy") or "").strip()
+    if legacy and not str(e.get(ekey0()) or "").strip():
+        e[ekey0()] = legacy
+    s["energies"] = e
+    return e
+
+
+def energy_cell(s):
+    """一行发次的全部能量，紧凑展示（回收站 / 导出用）"""
+    e = norm_energies(s)
+    parts = []
+    for f in ENERGY_FIELDS:
+        v = str(e.get(f["key"]) or "").strip()
+        if v:
+            parts.append("%s:%s" % (f["label"].replace("能量", ""), v))
+    return "  ".join(parts)
 AUTO_REPORT = True
 BW_MACHINE = ""   # b_watcher 的机名（读 config_b.local.json）：确认上报时与
                   # b_watcher 旧直报记录对齐，A 机去重才不会产生重复行
@@ -330,8 +369,8 @@ def make_shot(group):
     return {"shot_time": st, "files": names, "file_count": len(group),
             "no": parse_shot_no(names),
             "target": "", "defocus": "",
-            "energy": "", "status": "pending", "info": "", "row_id": None,
-            "reported": False}
+            "energy": "", "energies": {}, "status": "pending", "info": "",
+            "row_id": None, "reported": False}
 
 
 def attach_target(shot):
@@ -442,12 +481,12 @@ def _xml_esc(s):
 
 
 def build_xlsx(shots):
-    """把发次列表写成最小合法 xlsx（zip + inlineStr），9 列。
-    列：No. / 发次时间 / 图片数 / 图片文件 / 靶位 / 离焦 / 能量 / 状态 / 备注"""
+    """把发次列表写成最小合法 xlsx（zip + inlineStr）。
+    列：No. / 发次时间 / 图片数 / 图片文件 / 靶位 / 离焦 / 各能量列 / 状态 / 备注"""
     import io
     import zipfile
-    cols = ["No.", "发次时间", "图片数", "图片文件", "靶位", "离焦",
-            "能量", "状态", "备注"]
+    cols = (["No.", "发次时间", "图片数", "图片文件", "靶位", "离焦"] +
+            [f["label"] for f in ENERGY_FIELDS] + ["状态", "备注"])
 
     def row_xml(rn, values):
         cells = []
@@ -459,11 +498,12 @@ def build_xlsx(shots):
 
     body = [row_xml(1, cols)]
     for n, s in enumerate(shots, 2):
+        e = norm_energies(s)
         body.append(row_xml(n, [
             s.get("no") or "", s.get("shot_time") or "",
             s.get("file_count") or 0, " ".join(s.get("files") or []),
             s.get("target") or "", s.get("defocus") or "",
-            s.get("energy") or "",
+            *[str(e.get(f["key"]) or "") for f in ENERGY_FIELDS],
             _ST_LABEL.get(s.get("status"), s.get("status") or ""),
             s.get("info") or ""]))
     sheet = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -529,8 +569,8 @@ def ingest_detect(payload):
         if shot is None:
             shot = {"shot_time": st, "files": names, "file_count": len(files),
                     "no": None, "target": "", "defocus": "", "energy": "",
-                    "status": "pending", "info": "", "row_id": None,
-                    "reported": False}
+                    "energies": {}, "status": "pending", "info": "",
+                    "row_id": None, "reported": False}
             STATE["shots"].insert(0, shot)
         if len(names) > shot.get("file_count", 0):
             shot["files"] = names
@@ -549,10 +589,10 @@ def ingest_detect(payload):
     return {"ok": True, "merged": merged}
 
 
-def report_shot(shot, energy=""):
+def report_shot(shot):
     """把发次上报给 A 机（人工点「确认上报」后才会走到这里）。
     machine 用 b_watcher 的机名：A 机按 machine+时间+首文件去重，
-    与 b_watcher 旧直报记录对齐后不会产生重复行。能量一并写入该行。"""
+    与 b_watcher 旧直报记录对齐后不会产生重复行。已填的各能量一并写入该行。"""
     files = [{"name": n, "mtime": 0} for n in shot["files"]]
     fields = {"no": shot["no"]} if shot.get("no") is not None else {}
     if shot.get("target"):
@@ -562,8 +602,11 @@ def report_shot(shot, energy=""):
             fields["target_type"] = tt              # A 机表已有"靶类型"列
     if shot.get("defocus") != "":
         fields["target_defocus"] = str(shot["defocus"])  # A 机表"靶离焦"列
-    if energy:
-        fields[ENERGY_FIELD] = energy
+    e = norm_energies(shot)
+    for key in efield_keys():
+        v = str(e.get(key) or "").strip()
+        if v:
+            fields[key] = v                # fiber_p_energy / tps_h / tps_c6 …
     payload = {"machine": BW_MACHINE or MACHINE, "shot_time": shot["shot_time"],
                "files": files, "fields": fields, "reported_at":
                datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -811,7 +854,8 @@ def get_server_rows(sheet_name, date=None):
                     "no": f.get("no", ""), "target": f.get("target_pos", ""),
                     "ttype": f.get("target_type", ""),
                     "defocus": f.get("target_defocus", ""),
-                    "energy": f.get(ENERGY_FIELD, ""),
+                    "energy": f.get(ekey0(), ""),
+                    "energies": {k: f.get(k, "") for k in efield_keys()},
                     "file_count": r.get("file_count", 0),
                     "first_file": r.get("first_file", "")})
     except Exception:
@@ -1035,7 +1079,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
         onclick="openSheet()" title="点击选择打靶上报写入的表格">-</b></span>
   <span>待填能量 <b id="npending">0</b> 发</span>
   <span>绑定窗口 ±<b id="win">-</b>s</span>
-  <span>能量写入列：<b id="efield">-</b></span>
+  <span>能量写入列：<b id="efields">-</b></span>
   <span>当前靶位：<b id="tgt">…</b><span id="tgtF" style="color:#888;font-size:12px"></span></span>
   <span style="margin-left:auto">
     <button onclick="clearShots('sent')" style="padding:3px 10px;cursor:pointer;
@@ -1054,7 +1098,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
     <thead><tr>
       <th>No.</th><th>发次时间</th><th>图片数</th><th>图片文件</th>
       <th>靶位/离焦</th><th>靶类型</th>
-      <th>闪烁光纤能量</th><th>状态</th><th>操作</th>
+      <th>能量（闪烁光纤 / TPS）</th><th>状态</th><th>操作</th>
     </tr></thead>
     <tbody id="tb"></tbody>
   </table>
@@ -1071,9 +1115,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
        color:#3498db">在 A 机页面打开 →</a>
   </div>
   <table>
-    <thead><tr>
-      <th>发次时间</th><th>No.</th><th>靶位</th><th>靶类型</th><th>离焦</th><th>能量</th><th>图片数</th><th>首个文件</th>
-    </tr></thead>
+    <thead><tr id="srvHead"></tr></thead>
     <tbody id="srvtb"></tbody>
   </table>
 </div>
@@ -1145,6 +1187,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
 </div>
 <script>
 var SHOTS = [], LASTJSON = "", T = null;
+var CFG_EFIELDS = CFG_EFIELDS_JSON;   /* 能量列清单（服务端注入，只替换一次） */
 function toast(s){
   var t = document.getElementById("toast");
   t.textContent = s; t.style.display = "block";
@@ -1153,6 +1196,15 @@ function toast(s){
 function stLabel(s){
   return {pending:"待确认", sent:"已绑定", no_match:"无匹配发次",
           error:"发送失败", forming:"检测中…"}[s] || s;
+}
+function eStr(s){
+  var es = s.energies || {}, parts = [];
+  CFG_EFIELDS.forEach(function(ef){
+    var v = String(es[ef.key] || "").trim();
+    if (v) parts.push(ef.label.replace("能量","") + ":" + v);
+  });
+  if (!parts.length && s.energy) parts.push(String(s.energy));
+  return parts.join("  ");
 }
 function render(){
   var tb = document.getElementById("tb");
@@ -1172,9 +1224,17 @@ function render(){
       if (s.defocus !== "" && s.defocus != null) tgt += " <span style='color:#888'>离焦 " + s.defocus + "</span>";
       h += "<td style='white-space:nowrap'>" + tgt + "</td>";
       h += "<td style='white-space:nowrap;color:#1a6fb5'>" + (s.ttype || "-") + "</td>";
-      h += "<td><input class='e' data-i='" + i + "' value='" +
-           (s.energy || "").replace(/'/g,"&#39;") +
-           "' placeholder='如 2.35' onkeydown='if(event.key===\"Enter\")send(" + i + ",false)'></td>";
+      var es = s.energies || {};
+      h += "<td>";
+      CFG_EFIELDS.forEach(function(ef){
+        h += "<div style='display:flex;align-items:center;gap:5px;margin:2px 0'>" +
+             "<span style='font-size:11px;color:#888;min-width:70px;white-space:nowrap'>" +
+             ef.label + "</span>" +
+             "<input class='e' data-f='" + ef.key + "' data-i='" + i + "' value='" +
+             String(es[ef.key] || "").replace(/'/g,"&#39;") +
+             "' placeholder='" + ef.ph + "' onkeydown='if(event.key===\"Enter\")send(" + i + ",false)'></div>";
+      });
+      h += "</td>";
       var cls = s.status || "pending";
       h += "<td><span class='st " + cls + "'>" + stLabel(cls) + "</span>" +
            (s.info ? "<div style='color:#999;font-size:11px;margin-top:2px'>" + s.info + "</div>" : "") + "</td>";
@@ -1397,7 +1457,7 @@ function openTrash(){
       h += "<tr style='border-top:1px solid #eee'>" +
            "<td style='padding:5px 6px;white-space:nowrap'>" + tesc(s.shot_time) + "</td>" +
            "<td>" + (s.no || "-") + "</td><td>" + (s.file_count || 0) + "</td>" +
-           "<td>" + tesc(s.energy || "") + "</td><td>" + stLabel(s.status) + "</td>" +
+           "<td>" + tesc(eStr(s)) + "</td><td>" + stLabel(s.status) + "</td>" +
            "<td style='white-space:nowrap'>" +
            "<span style='color:#2471a3;cursor:pointer;text-decoration:underline' " +
            "onclick='trashAct(\"" + s.shot_time + "\",\"restore\")'>恢复</span> " +
@@ -1438,21 +1498,28 @@ function loadSrv(){
       "「" + j.label + "」已上报记录（" + j.rows.length + " 条）" +
       (j.ok ? "" : "（A 机暂不可达）");
     document.getElementById("srvView").href = j.view_url || "#";
+    var hh = "<th>发次时间</th><th>No.</th><th>靶位</th><th>靶类型</th><th>离焦</th>";
+    CFG_EFIELDS.forEach(function(ef){ hh += "<th>" + ef.label + "</th>"; });
+    hh += "<th>图片数</th><th>首个文件</th>";
+    document.getElementById("srvCols").innerHTML = hh;
     var tb = document.getElementById("srvtb");
     if (!j.rows.length){
-      tb.innerHTML = "<tr><td colspan='8' style='color:#999;padding:10px'>" +
-                     "该表还没有记录</td></tr>";
+      tb.innerHTML = "<tr><td colspan='" + (5 + CFG_EFIELDS.length + 2) +
+                     "' style='color:#999;padding:10px'>该表还没有记录</td></tr>";
       return;
     }
     var h = "";
     j.rows.forEach(function(r){
+      var es = r.energies || {};
       h += "<tr><td style='white-space:nowrap'>" + tesc(r.shot_time) + "</td>" +
            "<td>" + (r.no === 0 || r.no ? r.no : "-") + "</td>" +
            "<td>" + tesc(r.target || "") + "</td>" +
            "<td style='color:#1a6fb5'>" + tesc(r.ttype || "-") + "</td>" +
-           "<td>" + tesc(r.defocus || "") + "</td>" +
-           "<td>" + tesc(r.energy || "") + "</td>" +
-           "<td>" + (r.file_count || 0) + "</td>" +
+           "<td>" + tesc(r.defocus || "") + "</td>";
+      CFG_EFIELDS.forEach(function(ef){
+        h += "<td>" + tesc(String(es[ef.key] || "")) + "</td>";
+      });
+      h += "<td>" + (r.file_count || 0) + "</td>" +
            "<td style='color:#888;font-size:12px'>" + tesc(r.first_file || "") +
            "</td></tr>";
     });
@@ -1499,14 +1566,18 @@ function clearShots(mode){
     .catch(function(e){ toast("请求失败: " + e); });
 }
 function send(i, create){
-  var inp = document.querySelector("input.e[data-i='" + i + "']");
-  var v = (inp ? inp.value : SHOTS[i].energy).trim();
   var s = SHOTS[i];
-  if (!v && s.reported && !create){ toast("先填能量再发送"); return; }
+  var energies = {}, any = false;
+  document.querySelectorAll("input.e[data-i='" + i + "']").forEach(function(inp){
+    var v = (inp.value || "").trim();
+    if (v){ energies[inp.getAttribute("data-f")] = v; any = true; }
+  });
+  if (!any && s.reported && !create){ toast("先填能量再发送"); return; }
   var ninp = document.querySelector("input.n[data-i='" + i + "']");
   var no = parseInt((ninp ? ninp.value : SHOTS[i].no), 10) || 0;
   fetch("/api/bind", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({shot_time: SHOTS[i].shot_time, energy: v,
+    body: JSON.stringify({shot_time: SHOTS[i].shot_time, energies: energies,
+                          energy: energies[CFG_EFIELDS[0].key] || "",
                           shot_no: no, create: create})})
     .then(function(r){ return r.json(); })
     .then(function(j){
@@ -1531,7 +1602,8 @@ document.getElementById("machine").textContent = "本机: " + CFG_MACHINE;
 document.getElementById("srv").textContent = CFG_SERVER;
 document.getElementById("win").textContent = CFG_WINDOW;
 document.getElementById("dirs").textContent = CFG_DIRS;
-document.getElementById("efield").textContent = CFG_FIELD;
+document.getElementById("efields").textContent =
+  CFG_EFIELDS.map(function(f){ return f.label; }).join(" / ");
 refresh(); connectSSE(); setInterval(refresh, 15000);   // SSE 实时推送，15s 轮询仅作兜底
 loadSheetBinding(); loadSrv(); setInterval(loadSrv, 10000);
 if (location.hash === "#dirs") openDirs();   // URL 直达目录管理面板
@@ -1559,11 +1631,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _page(self):
         # 模板变量：CFG_SERVER/CFG_WINDOW 必须生成合法 JS 字面量（带引号/数字）
+        efs = [dict(f, ph=f.get("ph") or "如 2.35") for f in ENERGY_FIELDS]
         html = (HELP_PAGE
                 .replace("CFG_SERVER", json.dumps(SERVER_URL))
                 .replace("CFG_MACHINE", json.dumps(MACHINE))
                 .replace("CFG_DIRS", json.dumps("；".join(WATCH_DIRS)))
-                .replace("CFG_FIELD", json.dumps(ENERGY_FIELD))
+                .replace("CFG_EFIELDS_JSON", json.dumps(efs, ensure_ascii=False))
                 .replace("CFG_WINDOW", str(int(MATCH_WINDOW))))
         self._send(200, html, "text/html; charset=utf-8")
 
@@ -1695,11 +1768,19 @@ class Handler(BaseHTTPRequestHandler):
         """「确认上报 / 发送能量」统一入口（两步走）：
         第 1 步（人工确认）：该发次尚未上报过 → 才把打靶行写入 A 机
         （机器+时间+首文件去重，重复确认不会产生重复行；可无能量只确认发次）。
-        第 2 步（能量绑定）：填了能量 → /api/energy 按时间窗绑定/覆盖能量列。"""
+        第 2 步（能量绑定）：填了任一能量 → 每个能量列独立调 /api/energy
+        （fiber_p_energy / tps_h / tps_c6 …），按时间窗绑定/覆盖对应列。"""
         p = self._json_body()
         st = str(p.get("shot_time", "")).strip()
-        energy = str(p.get("energy", "")).strip()
         create = bool(p.get("create"))
+        energies = p.get("energies")
+        if not isinstance(energies, dict):
+            energies = {}
+        legacy = str(p.get("energy", "")).strip()      # 兼容旧客户端单 energy
+        if legacy and not str(energies.get(ekey0()) or "").strip():
+            energies[ekey0()] = legacy
+        energies = {str(k): str(v).strip() for k, v in energies.items()
+                    if str(v).strip() and k in efield_keys()}
         with _state_lock:
             shot = next((s for s in STATE["shots"]
                          if s["shot_time"] == st), None)
@@ -1712,18 +1793,20 @@ class Handler(BaseHTTPRequestHandler):
             no_in = 0
         if no_in:
             shot["no"] = no_in          # 手动改过 No. 以页面为准
-        if not energy and shot.get("reported"):
+        if not energies and shot.get("reported"):
             return self._send(200, json.dumps(
                 {"ok": False, "error": "已上报过：填入能量后可重发/覆盖",
                  "already_reported": True}))
-        if energy:
-            shot["energy"] = energy
+        if energies:
+            e = norm_energies(shot)
+            e.update(energies)
+            shot["energy"] = str(e.get(ekey0()) or "")   # 兼容旧展示字段
         bump_ver()
 
         # 第 1 步：确认上报——打靶行写入 A 机（带靶位/离焦/No.，含能量如有）
         if not shot.get("reported"):
             try:
-                report_shot(shot, energy=energy)
+                report_shot(shot)
             except Exception as e:
                 shot["status"], shot["info"] = "error", "上报日志系统失败"
                 save_state()
@@ -1732,61 +1815,88 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "connect_failed", "message": repr(e)},
                     ensure_ascii=False))
             shot["reported"] = True
-            shot["info"] = "打靶行已上报" + ("（含能量）" if energy else "，能量待填")
+            shot["info"] = ("打靶行已上报（含能量）" if energies
+                            else "打靶行已上报，能量待填")
             save_state()
-            log("确认上报: %s%s" % (st, "（能量 %s）" % energy if energy else ""))
-            if not energy:
+            log("确认上报: %s%s" % (st, ("（" + energy_cell(shot) + "）")
+                                     if energies else ""))
+            if not energies:
                 bump_ver()
                 return self._send(200, json.dumps(
                     {"ok": True, "confirmed": True}, ensure_ascii=False))
 
-        # 第 2 步：能量绑定（窗口内命中刚上报的行，重发可覆盖修正）
-        payload = {"shot_time": st, "energy": energy, "field": ENERGY_FIELD,
-                   "machine": BW_MACHINE or MACHINE, "window_sec": MATCH_WINDOW,
-                   "shot_no": no_in or (shot.get("no") or 0),
-                   "create": create}
-        try:
-            j = http_post_json(SERVER_URL.rstrip("/") + "/api/energy", payload)
-        except urllib.error.HTTPError as e:
+        # 第 2 步：能量绑定（每个能量列独立调 /api/energy，窗口内命中，
+        # 重发可覆盖修正；带 create 时第一列会补录独立记录，后续列
+        # 因补录行 shot_time 精确命中同一行，不会产生多条记录）
+        results = []   # [(字段label, A机返回), ...]
+        for key in efield_keys():
+            v = str(norm_energies(shot).get(key) or "").strip()
+            if not v:
+                continue
+            payload = {"shot_time": st, "energy": v, "field": key,
+                       "machine": BW_MACHINE or MACHINE,
+                       "window_sec": MATCH_WINDOW,
+                       "shot_no": no_in or (shot.get("no") or 0),
+                       "create": create}
             try:
-                j = json.loads(e.read().decode("utf-8"))
-            except Exception:
-                j = {"ok": False, "error": "HTTP %s" % e.code}
-        except Exception as e:
-            shot["status"], shot["info"] = "error", "连接日志系统失败"
-            save_state()
-            return self._send(200, json.dumps(
-                {"ok": False, "error": "connect_failed", "message": repr(e)},
-                ensure_ascii=False))
-        if j.get("ok") and j.get("matched") is not None:
+                j = http_post_json(SERVER_URL.rstrip("/") + "/api/energy", payload)
+            except urllib.error.HTTPError as e:
+                try:
+                    j = json.loads(e.read().decode("utf-8"))
+                except Exception:
+                    j = {"ok": False, "error": "HTTP %s" % e.code}
+            except Exception as e:
+                shot["status"], shot["info"] = "error", "连接日志系统失败"
+                save_state()
+                return self._send(200, json.dumps(
+                    {"ok": False, "error": "connect_failed", "message": repr(e)},
+                    ensure_ascii=False))
+            lab = next((f["label"] for f in ENERGY_FIELDS
+                        if f["key"] == key), key)
+            results.append((lab, j))
+        # 汇总各能量列结果 → 单一状态
+        oks, nms, infos, first_id = [], [], [], None
+        for lab, j in results:
+            if j.get("ok") and j.get("matched") is not None:
+                oks.append(j)
+                if first_id is None:
+                    first_id = j.get("matched")
+                tag = "按No." if j.get("by_no") else "差%.1fs" % j.get("diff_sec", 0)
+                infos.append("%s→%s (%s)" % (lab, j.get("matched_time", ""), tag))
+            elif j.get("ok") and j.get("created") is not None:
+                oks.append(j)
+                if first_id is None:
+                    first_id = j.get("created")
+                infos.append("%s→补录 #%s" % (lab, j.get("created")))
+            elif j.get("error") == "no_match":
+                nms.append(j)
+                near = (j.get("nearest") or {}).get("shot_time", "无记录")
+                infos.append("%s→窗口内无发次｜最近: %s" % (lab, near))
+            else:
+                infos.append("%s→%s" % (lab, j.get("error") or
+                                        j.get("message") or "未知错误"))
+        if results and len(oks) == len(results):
             shot["status"] = "sent"
-            shot["row_id"] = j.get("matched")
-            tag = "按No." if j.get("by_no") else "差%.1fs" % j.get("diff_sec", 0)
-            shot["info"] = "→ %s (%s)" % (j.get("matched_time", ""), tag)
-        elif j.get("ok") and j.get("created") is not None:
-            shot["status"] = "sent"
-            shot["row_id"] = j.get("created")
-            shot["info"] = "已补录独立记录 #%s" % j.get("created")
-        elif j.get("error") == "no_match":
+            shot["row_id"] = first_id
+        elif results and len(nms) == len(results):
             shot["status"] = "no_match"
-            near = j.get("nearest") or {}
-            shot["info"] = ("窗口±%gs内无发次｜最近: %s"
-                            % (j.get("window_sec", MATCH_WINDOW),
-                               near.get("shot_time", "无记录")))
-        else:
+        elif results:
             shot["status"] = "error"
-            shot["info"] = str(j.get("error") or j.get("message") or "未知错误")
+        shot["info"] = "；".join(infos) if infos else shot.get("info", "")
         save_state()
-        log("能量绑定[%s]: %s = %s → %s" %
-            (shot["status"], st, energy, shot["info"]))
-        self._send(200, json.dumps(j, ensure_ascii=False))
+        log("能量绑定[%s]: %s %s → %s" %
+            (shot["status"], st, energy_cell(shot), shot["info"]))
+        # 页面提示用第一个能量列的原始返回（完整字段），逐列细节见表格"状态"列
+        self._send(200, json.dumps(results[0][1] if results else
+                                   {"ok": True, "confirmed": True},
+                                   ensure_ascii=False))
 
 
 CFG = {}
 
 
 def main():
-    global SERVER_URL, MACHINE, WATCH_DIRS, ENERGY_FIELD, MATCH_WINDOW, AUTO_REPORT, BW_MACHINE, CFG
+    global SERVER_URL, MACHINE, WATCH_DIRS, ENERGY_FIELDS, MATCH_WINDOW, AUTO_REPORT, BW_MACHINE, CFG
     CFG = load_json(CONFIG_PATH, None)
     if CFG is None:
         save_json(CONFIG_PATH, {
@@ -1797,7 +1907,8 @@ def main():
             "group_window_sec": 8,
             "match_window_sec": 15,
             "helper_port": 8767,
-            "energy_field": "fiber_p_energy",
+            "energy_fields": [{"key": f["key"], "label": f["label"]}
+                              for f in DEFAULT_ENERGY_FIELDS],
             "auto_report": True,
         })
         print("已生成默认配置 config_helper.json，请修改 watch_dirs / server_url 后重新运行。")
@@ -1812,7 +1923,20 @@ def main():
     interval = float(CFG.get("scan_interval_sec", 2))
     window = float(CFG.get("group_window_sec", 8))
     MATCH_WINDOW = float(CFG.get("match_window_sec", 15))
-    ENERGY_FIELD = CFG.get("energy_field", "fiber_p_energy")
+    # 能量字段清单：默认 闪烁光纤 / TPS: H+ / TPS: C6 三列，可在
+    # config_helper.json 的 energy_fields 里增删（key=A 机列字段名）
+    efs = CFG.get("energy_fields")
+    if isinstance(efs, list) and efs:
+        fl = []
+        for it in efs:
+            if isinstance(it, dict) and it.get("key"):
+                fl.append({"key": str(it["key"]),
+                           "label": str(it.get("label") or it["key"])})
+            elif isinstance(it, str):
+                fl.append({"key": it, "label": it})
+        if fl:
+            ENERGY_FIELDS = fl
+    ENERGY_FIELD = ekey0()   # 兼容旧展示
     AUTO_REPORT = bool(CFG.get("auto_report", True))
     port = int(CFG.get("helper_port", 8767))
     # b_watcher 机名：确认上报的行用它做 machine，与 b_watcher 去重键对齐
@@ -1828,6 +1952,10 @@ def main():
             STATE.update(st)
             STATE["forming_shot"] = None   # 上次运行残留的"检测中"行不恢复
             STATE.setdefault("trash", [])  # 旧状态文件没有回收站字段
+            for s in STATE["shots"]:       # 旧单 energy 字符串 → energies 字典
+                norm_energies(s)
+            for s in STATE.get("trash", []):
+                norm_energies(s)
             n_pending = sum(1 for s in STATE["shots"] if s["status"] != "sent")
         log("已恢复状态: %d 条发次记录（其中 %d 条待绑定能量）"
             % (len(STATE["shots"]), n_pending))
