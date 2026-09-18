@@ -168,6 +168,27 @@ def lookup_target_type(pos):
 TTM_OVERRIDES_PATH = os.path.join(BASE, "target_type_overrides.json")
 _TTM_OVR = {"mtime": None, "data": {}}
 
+TTM_TITLE_PATH = os.path.join(BASE, "target_type_title.json")   # 映射表标题（可改日期）
+
+
+def _ttm_title():
+    """靶类型映射表大标题（如"第x次打靶靶位 20260617"），手动编辑优先"""
+    try:
+        with open(TTM_TITLE_PATH, encoding="utf-8") as f:
+            return str((json.load(f) or {}).get("title") or "")
+    except Exception:
+        return ""
+
+
+def _save_ttm_title(t):
+    try:
+        with open(TTM_TITLE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"title": t}, f, ensure_ascii=False, indent=1)
+        return True
+    except Exception as e:
+        log("靶类型标题保存失败: %r" % e)
+        return False
+
 
 def _ttm_overrides():
     """手动维护的 靶位→靶类型 覆盖（持久化 target_type_overrides.json，mtime 缓存）"""
@@ -1046,10 +1067,23 @@ HELP_PAGE = r"""<!DOCTYPE html>
               align-items:center;gap:8px}
   .dot{width:9px;height:9px;border-radius:50%;background:#666;display:inline-block}
   .dot.ok{background:#2ecc71}.dot.bad{background:#e74c3c}
-  /* ---------- 信息条（同主系统 toolbar） ---------- */
-  #bar{background:#fff;padding:9px 20px;border-bottom:1px solid #e2e4e8;font-size:13px;
-       color:#666;display:flex;gap:18px;flex-wrap:wrap;flex-shrink:0}
-  #bar b{color:#2c3e50}
+  /* ---------- 信息条（两行分组：操作/状态在上，环境信息在下） ---------- */
+  #bar{background:#fff;padding:8px 16px;border-bottom:1px solid #e2e4e8;font-size:13px;
+       color:#666;flex-shrink:0}
+  .brow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .brow + .brow{margin-top:7px}
+  .chip{display:inline-flex;align-items:center;gap:5px;background:#f6f8fa;
+        border:1px solid #e4e8ec;border-radius:8px;padding:4px 10px;white-space:nowrap}
+  .chip b{color:#2c3e50}
+  #dirs{display:inline-block;max-width:460px;overflow:hidden;text-overflow:ellipsis;
+        vertical-align:bottom;white-space:nowrap}
+  .bbtn{padding:4px 12px;cursor:pointer;border-radius:6px;font-size:12px;
+        font-family:inherit;background:#fff;color:#333;border:1px solid #ccd}
+  .bbtn:hover{background:#f0f3f6}
+  .bbtn.red{border-color:#ecc;color:#c33}
+  .bbtn.red:hover{background:#fdf3f3}
+  .bbtn.green{border-color:#9c8;background:#f4fbf4;color:#2a7}
+  .bbtn.green:hover{background:#e9f7e9}
   /* ---------- 表格（同主系统数据表） ---------- */
   .wrap{flex:1;overflow:auto;background:#fff}
   table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;
@@ -1107,31 +1141,31 @@ HELP_PAGE = r"""<!DOCTYPE html>
   </span>
 </div>
 <div id="bar">
-  <span>监视目录：<b id="dirs" style="cursor:pointer;border-bottom:1px dotted #888"
-        onclick="openDirs()" title="点击管理监视目录">-</b></span>
-  <span>上报表格：<b id="sheetName" style="cursor:pointer;border-bottom:1px dotted #888"
-        onclick="openSheet()" title="点击选择打靶上报写入的表格">-</b></span>
-  <span>查看日期：<input type="date" id="viewDate"
-        onchange="VDATE=this.value || todayStr(); render(); LASTJSON=''"
-        style="padding:2px 6px;border:1px solid #d5d8dc;border-radius:6px;
-        font-family:inherit"></span>
-  <span>本日 <b id="nday">0</b> 发 ｜ 未上报 <b id="npending" style="color:#c0392b">0</b> 发</span>
-  <span>绑定窗口 ±<b id="win">-</b>s</span>
-  <span>能量写入列：<b id="efields">-</b></span>
-  <span>当前靶位：<b id="tgt">…</b><span id="tgtF" style="color:#888;font-size:12px"></span></span>
-  <span style="margin-left:auto">
-    <button onclick="clearShots('sent')" style="padding:3px 10px;cursor:pointer;
-      border:1px solid #ccd;border-radius:6px;background:#fff">清理已绑定</button>
-    <button onclick="clearShots('all')" style="padding:3px 10px;cursor:pointer;
-      border:1px solid #ecc;border-radius:6px;background:#fff;color:#c33">清空列表</button>
-    <button onclick="openTmap()" style="padding:3px 10px;cursor:pointer;
-      border:1px solid #ccd;border-radius:6px;background:#fff">靶类型</button>
-    <button onclick="openTrash()" style="padding:3px 10px;cursor:pointer;
-      border:1px solid #ccd;border-radius:6px;background:#fff">回收站</button>
-    <button onclick="window.open('/export.xlsx')" style="padding:3px 10px;cursor:pointer;
-      border:1px solid #9c8;border-radius:6px;background:#f4fbf4;
-      color:#2a7">导出Excel</button>
-  </span>
+  <div class="brow">
+    <span class="chip">上报表格：<b id="sheetName" style="cursor:pointer;border-bottom:1px dotted #888"
+          onclick="openSheet()" title="点击选择打靶上报写入的表格">-</b></span>
+    <span class="chip">查看日期：<input type="date" id="viewDate"
+          onchange="VDATE=this.value || todayStr(); render(); LASTJSON=''"
+          style="padding:1px 4px;border:1px solid #d5d8dc;border-radius:5px;
+          font-family:inherit;font-size:12px"></span>
+    <span class="chip">本日 <b id="nday">0</b> 发｜未上报 <b id="npending"
+          style="color:#c0392b">0</b> 发</span>
+    <span class="chip">当前靶位：<b id="tgt">…</b><span id="tgtF"
+          style="color:#888;font-size:12px"></span></span>
+    <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
+      <button class="bbtn" onclick="clearShots('sent')">清理已绑定</button>
+      <button class="bbtn red" onclick="clearShots('all')">清空列表</button>
+      <button class="bbtn" onclick="openTmap()">靶类型</button>
+      <button class="bbtn" onclick="openTrash()">回收站</button>
+      <button class="bbtn green" onclick="window.open('/export.xlsx')">导出Excel</button>
+    </span>
+  </div>
+  <div class="brow">
+    <span class="chip">监视目录：<b id="dirs" style="cursor:pointer;border-bottom:1px dotted #888"
+          onclick="openDirs()" title="点击管理监视目录">-</b></span>
+    <span class="chip">绑定窗口 ±<b id="win">-</b>s</span>
+    <span class="chip">能量写入列：<b id="efields">-</b></span>
+  </div>
 </div>
 <div class="wrap">
   <table>
@@ -1520,10 +1554,12 @@ function renderTmap(j){
   L.labels.forEach(function(a){ labelAt[a[0] + "," + a[1]] = a[2]; });
   var HR = (typeof L.header_row === "number" && L.header_row >= 0)
            ? L.header_row : -1;
+  var TTLOVR = j.title || "";
 
   var h = "<div style='font-size:11px;color:#888;margin-bottom:6px'>版面复刻自 " +
           tesc(L.sheet) + "：蓝格＝靶类型（合并大格＝同一靶块，改一处整块生效），" +
-          "白格＝靶位编号/待填，橙格＝手动覆盖过，清空＝恢复 xls 自动值</div>" +
+          "白格＝靶位编号/待填，橙格＝手动覆盖过，清空＝恢复 xls 自动值；" +
+          "大标题（含日期）可直接点击修改</div>" +
           "<table style='border-collapse:collapse;font-size:12px;table-layout:fixed'>";
   if (L.ncols > 1){
     h += "<colgroup><col style='width:34px'>";
@@ -1556,10 +1592,14 @@ function renderTmap(j){
         } else {                                       // 标题 / 靶位编号块
           var txt = (L.merge_text && L.merge_text[k]) ||
                     (L.values && L.values[ck]) || "";
-          if (HR >= 0 && a[0] < HR){                   // 标题行：无边框加粗
-            h += "<td" + span + " style='border:none;text-align:center;" +
-                 "font-weight:bold;font-size:14px;color:#111;padding:4px'>" +
-                 tesc(txt) + "</td>";
+          if (HR >= 0 && a[0] < HR){                   // 标题行：可编辑（如日期）
+            var tv = TTLOVR || txt;
+            h += "<td" + span + " style='border:none;text-align:center;padding:4px'>" +
+                 "<input value='" + tesc(tv).replace(/'/g,"&#39;") +
+                 "' title='点击修改标题（如打靶日期）' onchange='saveTmapTitle(this)' " +
+                 "style='width:96%;font-weight:bold;font-size:14px;text-align:center;" +
+                 "border:none;outline:none;background:transparent;color:#111;" +
+                 "font-family:inherit'></td>";
           } else {                                     // 编号块：白底黑字
             h += "<td" + span + " style='border:1px solid #8a8f98;background:#fff;" +
                  "text-align:center;color:#111;padding:2px'>" + tesc(txt) + "</td>";
@@ -1645,6 +1685,16 @@ function saveTmapBlock(inp){
     refresh(); LASTJSON = "";
   })
   .catch(function(){ toast("保存失败（网络错误）"); });
+}
+function saveTmapTitle(inp){
+  fetch("/api/targetmap_title", {method:"POST", cache:"no-store",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({title: inp.value.trim()})})
+  .then(function(r){ return r.json(); })
+  .then(function(j){
+    toast(j.ok ? "标题已保存" : (j.error || "标题保存失败"));
+  })
+  .catch(function(){ toast("标题保存失败（网络错误）"); });
 }
 function renderSheet(sheets){
   var h = "<div style='font-size:11px;color:#888;background:#f6f8fa;border-radius:6px;" +
@@ -1910,6 +1960,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(
                 {"ok": True, "map": effective_target_map(),
                  "overrides": _ttm_overrides(),
+                 "title": _ttm_title(),
                  "layout": get_target_type_layout()},
                 ensure_ascii=False))
         elif urlparse(self.path).path == "/export.xlsx":
@@ -1988,6 +2039,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(
                 api_targetmap_set(p.get("pos"), p.get("type"),
                                   p.get("positions")),
+                ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/targetmap_title":
+            p = self._json_body()
+            t = str(p.get("title") or "").strip()
+            self._send(200, json.dumps(
+                {"ok": _save_ttm_title(t), "title": t},
                 ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
