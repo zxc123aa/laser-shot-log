@@ -1199,7 +1199,7 @@ HELP_PAGE = r"""<!DOCTYPE html>
             line-height:1" onclick="closeTmap()">✕</span>
     </div>
     <div style="font-size:12px;color:#888;margin-bottom:12px">
-      1:1 复刻打靶靶位表（Sheet4）：灰底小字＝靶位编号，白格＝靶类型；
+      1:1 复刻打靶靶位表（Sheet4）：蓝格＝靶类型，白格＝靶位编号/待填；
       合并的大格＝同一靶块（一个类型管整块靶位），改一处整块生效，失焦自动保存。
       手动值优先于 xls 自动映射；清空一格 = 整块恢复 xls 自动值。
       保存后待确认列表的靶类型列实时刷新。
@@ -1518,11 +1518,18 @@ function renderTmap(j){
 
   var labelAt = {};
   L.labels.forEach(function(a){ labelAt[a[0] + "," + a[1]] = a[2]; });
+  var HR = (typeof L.header_row === "number" && L.header_row >= 0)
+           ? L.header_row : -1;
 
   var h = "<div style='font-size:11px;color:#888;margin-bottom:6px'>版面复刻自 " +
-          tesc(L.sheet) + "：灰底小字＝靶位编号，白格＝靶类型（合并大格＝同一靶块，改一处整块生效）；" +
-          "橙 ✎＝手动覆盖过，清空＝恢复 xls 自动值</div>" +
+          tesc(L.sheet) + "：蓝格＝靶类型（合并大格＝同一靶块，改一处整块生效），" +
+          "白格＝靶位编号/待填，橙格＝手动覆盖过，清空＝恢复 xls 自动值</div>" +
           "<table style='border-collapse:collapse;font-size:12px;table-layout:fixed'>";
+  if (L.ncols > 1){
+    h += "<colgroup><col style='width:34px'>";
+    for (var ci = 1; ci < L.ncols; ci++) h += "<col style='width:52px'>";
+    h += "</colgroup>";
+  }
   for (var r = 0; r < L.nrows; r++){
     h += "<tr>";
     for (var c = 0; c < L.ncols; c++){
@@ -1535,38 +1542,43 @@ function renderTmap(j){
             rs = a[2] - a[0], cs = a[3] - a[1],
             span = (rs > 1 ? " rowspan='" + rs + "'" : "") +
                    (cs > 1 ? " colspan='" + cs + "'" : "");
-        if (poss.length){
-          var man = anyManual(poss), v = effType(poss);
-          h += "<td" + span + " style='border:1px solid #c8cdd4;padding:3px;" +
-               "background:" + (man ? "#fff7ee" : "#fff") + ";min-width:86px'>" +
-               "<input class='tm' style='min-width:80px' data-positions='" +
+        if (poss.length){                              // 靶类型块（可编辑）
+          var man = anyManual(poss), v = effType(poss),
+              bgc = man ? "#e67e22" : (v ? "#4472C4" : "#fff");
+          h += "<td" + span + " style='border:1px solid #8a8f98;background:" +
+               bgc + ";padding:0'" + (man ? " title='手动覆盖'" : "") + ">" +
+               "<input class='tm' style='width:94%;min-height:24px;" +
+               "background:transparent;border:none;outline:none;" +
+               "text-align:center;font-size:12px;color:#111' data-positions='" +
                poss.join(",") + "' value='" + v.replace(/'/g,"&#39;") +
-               "' placeholder='靶类型' onfocus='this.select()' " +
-               "onchange='saveTmapBlock(this)'>" +
-               "<div style='font-size:10px;color:" + (man ? "#d35400" : "#bbb") +
-               ";margin-top:1px'>" + tesc(poss.join(" ")) + (man ? " ✎" : "") +
-               "</div></td>";
-        } else {                                       // 无靶位的合并区 = 标题等静态文字
+               "' placeholder=' ' onfocus='this.select()' " +
+               "onchange='saveTmapBlock(this)'></td>";
+        } else {                                       // 标题 / 靶位编号块
           var txt = (L.merge_text && L.merge_text[k]) ||
                     (L.values && L.values[ck]) || "";
-          h += "<td" + span + " style='border:1px solid #e6e8eb;padding:3px;" +
-               "background:#f6f8fa;color:#666;text-align:center;font-size:11px'>" +
-               tesc(txt) + "</td>";
+          if (HR >= 0 && a[0] < HR){                   // 标题行：无边框加粗
+            h += "<td" + span + " style='border:none;text-align:center;" +
+                 "font-weight:bold;font-size:14px;color:#111;padding:4px'>" +
+                 tesc(txt) + "</td>";
+          } else {                                     // 编号块：白底黑字
+            h += "<td" + span + " style='border:1px solid #8a8f98;background:#fff;" +
+                 "text-align:center;color:#111;padding:2px'>" + tesc(txt) + "</td>";
+          }
         }
         continue;
       }
-      if (labelAt[ck]){                                // 靶位编号格
-        h += "<td style='border:1px solid #c8cdd4;padding:2px 4px;background:#f2f4f7;" +
-             "text-align:center;font-size:11px;color:#555;white-space:nowrap'>" +
+      if (labelAt[ck]){                                // 靶位编号（未合并）
+        h += "<td style='border:1px solid #8a8f98;background:#fff;" +
+             "text-align:center;color:#111;height:16px'>" +
              tesc(labelAt[ck]) + "</td>";
         continue;
       }
       var v2 = L.values ? L.values[ck] : "";
-      if (v2){                                         // 其它有字格（标题/编号）
-        h += "<td style='border:1px solid #e6e8eb;padding:2px 4px;background:#f6f8fa;" +
-             "color:#666;text-align:center;font-size:11px'>" + tesc(v2) + "</td>";
+      if (v2){                                         // 列号 / 行号等
+        h += "<td style='border:1px solid #8a8f98;background:#fff;" +
+             "text-align:center;color:#111;height:16px'>" + tesc(v2) + "</td>";
       } else {                                         // 空格
-        h += "<td style='border:1px solid #eef0f2;background:#fbfcfd'></td>";
+        h += "<td style='border:1px solid #e3e6ea;background:#fff;height:16px'></td>";
       }
     }
     h += "</tr>";

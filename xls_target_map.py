@@ -34,6 +34,23 @@ def is_num(v):
     return bool(re.match(r"^\s*-?\d+(\.\d+)?\s*$", str(v)))
 
 
+def norm_merges(sh):
+    """xlrd merged_cells 是 (rlo, rhi, clo, chi)，统一转成 (r1, c1, r2, c2)（排他边界）"""
+    return [(rlo, clo, rhi, chi) for (rlo, rhi, clo, chi) in sh.merged_cells]
+
+
+def fmt_cell(v):
+    """单元格文本：浮点整数去掉 .0（Excel 列号/行号 1.0 -> 1）"""
+    if v in (None, ""):
+        return ""
+    if isinstance(v, float) and v == int(v):
+        return str(int(v))
+    s = str(v).strip()
+    if re.match(r"^-?\d+\.0+$", s):
+        s = s.split(".")[0]
+    return s
+
+
 def sheet_labels(sh):
     out = []
     for r in range(sh.nrows):
@@ -94,7 +111,7 @@ def main(xls_path, out_path):
     cand = {}          # pos -> [types...]（按扫描顺序）
     for si in range(wb.nsheets):
         sh = wb.sheet_by_index(si)
-        merges = clean_merges(sh, [tuple(m) for m in sh.merged_cells])
+        merges = clean_merges(sh, norm_merges(sh))
         for (r, c, pos) in sheet_labels(sh):
             ts, _ = pick_type(sh, r, c, merges)
             if ts:
@@ -142,43 +159,92 @@ def main(xls_path, out_path):
     layout = None
     if best_si is not None and best_score > 0:
         sh = wb.sheet_by_index(best_si)
-        merges = clean_merges(sh, [tuple(m) for m in sh.merged_cells])
+        merges = clean_merges(sh, norm_merges(sh))
         mset = set(merges)
-        nrows = ncols = 0
+
+        # ---- 主网格定位（模板：标题行 + 列号头 + 靶位/类型成对合并块）----
+        # 列号头 = 数字格子最多的一行；主网格 = 头行数字列覆盖的范围（含左侧行号列）
+        header_row, best_cnt = -1, 0
+        for r in range(sh.nrows):
+            cnt = sum(1 for c in range(sh.ncols)
+                      if is_num(sh.cell_value(r, c)))
+            if cnt > best_cnt:
+                header_row, best_cnt = r, cnt
+        if best_cnt < 4:
+            header_row = -1                    # 不像本模板，退回全表
+
+        if header_row >= 0:
+            num_cols = [c for c in range(sh.ncols)
+                        if is_num(sh.cell_value(header_row, c))]
+            runs, s, p = [], None, None       # 取最长连续段（排除右侧散落数字）
+            for c in num_cols:
+                if s is None:
+                    s = p = c
+                elif c == p + 1:
+                    p = c
+                else:
+                    runs.append((s, p)); s = p = c
+            if s is not None:
+                runs.append((s, p))
+            if runs:
+                s, e = max(runs, key=lambda t: t[1] - t[0])
+                c1, c2 = max(0, s - 1), e + 1
+            else:
+                c1, c2 = 0, sh.ncols
+            data_labels = [(r, c, p) for (r, c, p) in sheet_labels(sh)
+                           if r > header_row and c1 <= c < c2]
+            nrows, ncols = header_row + 1, min(c2, sh.ncols)
+        else:
+            header_row = -1
+            data_labels = sheet_labels(sh)
+            nrows, ncols = sh.nrows, sh.ncols
+
+        # 类型格区块：向右找锚格（类型值 / 空的待填合并块），跳过编号块内部
+        def type_region_for(r, c):
+            for dc in (1, 2, 3, 4):
+                cc = c + dc
+                if cc >= ncols:
+                    break
+                reg = region_of(r, cc, merges)
+                if reg is None:
+                    reg = (r, cc, r + 1, cc + 1)
+                elif (reg[0], reg[1]) != (r, cc):
+                    continue                   # 在别的合并块内部（编号块）
+                v = sh.cell_value(reg[0], reg[1])
+                ts = fmt_cell(v)
+                if ts and not is_num(v) and not PAT.match(ts):
+                    return ts, reg
+                if ts == "":
+                    return "", reg             # 空块 = 可补填的类型格
+            return "", None
+
         labels_out = []
-        seen_regions = set()
-        for (r, c, pos) in sheet_labels(sh):
-            _t, reg = pick_type(sh, r, c, merges)
-            if reg is None:
-                # 右邻全是空/编号：给一个可补填的空类型格（若该格确实空着）
-                c1 = c + 1
-                if (c1 < sh.ncols
-                        and not str(sh.cell_value(r, c1) or "").strip()
-                        and not PAT.match(str(sh.cell_value(r, c1) or ""))
-                        and region_of(r, c1, merges) is None):
-                    reg = (r, c1, r + 1, c1 + 1)
+        for (r, c, pos) in data_labels:
+            _t, reg = type_region_for(r, c)
             if reg:
                 labels_out.append([r, c, pos,
                                    reg[0], reg[1], reg[2], reg[3]])
-                seen_regions.add(reg)
                 nrows = max(nrows, reg[2]); ncols = max(ncols, reg[3])
             else:
                 labels_out.append([r, c, pos])
-            nrows = max(nrows, r + 1); ncols = max(ncols, c + 1)
+            nrows = max(nrows, r + 1)
+
+        in_box = lambda m: (m[0] >= 0 and m[1] >= 0
+                            and m[2] <= nrows and m[3] <= ncols)
+        merges_out = [m for m in merges if in_box(m)]
         merge_text, values = {}, {}
         for r in range(min(nrows, sh.nrows)):
             for c in range(min(ncols, sh.ncols)):
-                v = sh.cell_value(r, c)
-                ts = str(v).strip() if v not in (None, "") else ""
+                ts = fmt_cell(sh.cell_value(r, c))
                 if ts:
                     values["%d,%d" % (r, c)] = ts
-        for (r1, c1, r2, c2) in mset | seen_regions:
-            if r1 < nrows and c1 < ncols and r1 < sh.nrows and c1 < sh.ncols:
-                v = sh.cell_value(r1, c1)
+        for (r1, c1, r2, c2) in merges_out:
+            if r1 < sh.nrows and c1 < sh.ncols:
                 merge_text["%d,%d,%d,%d" % (r1, c1, r2, c2)] = \
-                    str(v).strip() if v not in (None, "") else ""
+                    fmt_cell(sh.cell_value(r1, c1))
         layout = {"sheet": sh.name, "nrows": nrows, "ncols": ncols,
-                  "merges": [list(m) for m in merges],
+                  "header_row": header_row,
+                  "merges": [list(m) for m in merges_out],
                   "labels": labels_out,
                   "merge_text": merge_text, "values": values}
 
