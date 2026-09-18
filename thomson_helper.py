@@ -263,6 +263,10 @@ STATE_VER = 0          # 页面 SSE 推送用的状态版本号：shots/queue �
 
 # 重频靶系统实时状态（后台线程每 5s 刷新；靶位/离焦随 SSE 推到页面）
 TARGET = dict(target_client.EMPTY)
+# 靶位轮询历史：[(epoch, pos, defocus), ...]——发次转正比打靶晚 15~20s，
+# 挂靶位时取最接近打靶时刻的历史样本，而不是"当前值"（靶可能已被移走）
+TARGET_HIST = []
+TARGET_HIST_MAX = 240        # 5s 一次 × 240 = 20 分钟历史
 
 
 def target_poll_loop(interval=5.0):
@@ -281,9 +285,38 @@ def target_poll_loop(interval=5.0):
                    d.get("ok") != TARGET.get("ok"))
         with _state_lock:
             TARGET = d
+            if not d.get("error"):
+                TARGET_HIST.append((time.time(), d.get("pos") or "",
+                                    d.get("defocus") or ""))
+                del TARGET_HIST[:-TARGET_HIST_MAX]
         if changed:
             bump_ver()   # 靶位/离焦变化也推给页面
         time.sleep(interval)
+
+
+# 发现新文件时的实时查询节流（forming 期间文件陆续落盘会反复触发）
+_LIVE_TGT = {"t": 0.0, "lock": threading.Lock()}
+
+
+def live_fetch_target(timeout=3.0, min_gap=3.0):
+    """发现新文件 → 立即实时查一次靶位（子进程，几百 ms）。
+    结果进 TARGET_HIST（供 attach_target 取打靶时刻最近样本）并更新当前缓存。
+    min_gap 节流，避免文件陆续落盘时子进程轰炸。"""
+    now = time.time()
+    with _LIVE_TGT["lock"]:
+        if now - _LIVE_TGT["t"] < min_gap:
+            return None
+        _LIVE_TGT["t"] = now
+    try:
+        d = target_client.query(timeout=timeout)
+    except Exception:
+        return None
+    with _state_lock:
+        TARGET.update(d)
+        TARGET_HIST.append((time.time(), d.get("pos") or "",
+                            d.get("defocus") or ""))
+        del TARGET_HIST[:-TARGET_HIST_MAX]
+    return d
 
 
 def bump_ver():
@@ -468,10 +501,27 @@ def make_shot(group):
 
 
 def attach_target(shot):
-    """把当前靶位/离焦值（后台轮询缓存，最多 5s 旧）挂到发次上"""
+    """挂靶位/离焦：取打靶时刻（shot_time，即谱仪落盘时间）最接近的
+    轮询历史样本（±30s 内），避免转正晚 15~20s 时靶位已被移走；
+    无历史或超出范围时回落当前缓存（旧行为）。"""
+    try:
+        t0 = datetime.strptime(shot["shot_time"],
+                               "%Y-%m-%d %H:%M:%S").timestamp()
+    except Exception:
+        t0 = 0.0
     with _state_lock:
-        shot["target"] = TARGET.get("pos", "") or ""
-        shot["defocus"] = TARGET.get("defocus", "") or ""
+        best = None
+        if t0 > 0:
+            for (ts, pos, dfc) in TARGET_HIST:
+                dt = abs(ts - t0)
+                if best is None or dt < best[0]:
+                    best = (dt, pos, dfc)
+        if best is not None and best[0] <= 30:
+            shot["target"] = best[1] or ""
+            shot["defocus"] = best[2] or ""
+        else:
+            shot["target"] = TARGET.get("pos", "") or ""
+            shot["defocus"] = TARGET.get("defocus", "") or ""
     return shot
 
 
@@ -990,6 +1040,9 @@ def monitor_loop(interval, window):
                     log("目录已恢复: %s" % d)
             new_entries = [(p, mt) for p, mt in entries
                            if p not in STATE["seen"]]
+            if new_entries:
+                # 关键：发现新文件立刻实时取靶位（不是等转正后的"当前值"）
+                live_fetch_target()
             all_new = [tuple(x) for x in STATE["pend"]] + new_entries
             # 即时行：有未到齐的文件（含刚落盘还没过安静期的）立刻上表显示
             forming = None
