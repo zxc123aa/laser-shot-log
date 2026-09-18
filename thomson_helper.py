@@ -190,6 +190,26 @@ def _save_ttm_title(t):
         return False
 
 
+def set_match_window(sec):
+    """页面可调的能量绑定窗口（秒），持久化到 config_helper.json"""
+    global MATCH_WINDOW
+    try:
+        w = float(sec)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "无效数值"}
+    if not (3 <= w <= 300):
+        return {"ok": False, "error": "窗口需在 3~300 秒之间"}
+    MATCH_WINDOW = w
+    try:
+        CFG["match_window_sec"] = w
+        save_json(CONFIG_PATH, CFG)
+    except Exception as e:
+        log("绑定窗口保存失败: %r" % e)
+    log("绑定窗口调整为 ±%gs" % w)
+    bump_ver()
+    return {"ok": True, "window": w}
+
+
 def _ttm_overrides():
     """手动维护的 靶位→靶类型 覆盖（持久化 target_type_overrides.json，mtime 缓存）"""
     try:
@@ -1163,7 +1183,11 @@ HELP_PAGE = r"""<!DOCTYPE html>
   <div class="brow">
     <span class="chip">监视目录：<b id="dirs" style="cursor:pointer;border-bottom:1px dotted #888"
           onclick="openDirs()" title="点击管理监视目录">-</b></span>
-    <span class="chip">绑定窗口 ±<b id="win">-</b>s</span>
+    <span class="chip">绑定窗口 ±<input id="win" type="number" min="3" max="300"
+          step="1" value="CFG_WINDOW" onchange="setWin(this)"
+          title="能量与发次的时间绑定窗口，改完回车/点别处生效"
+          style="width:48px;padding:1px 4px;border:1px solid #d5d8dc;border-radius:5px;
+          font-family:inherit;font-size:12px;text-align:center">s</span>
     <span class="chip">能量写入列：<b id="efields">-</b></span>
   </div>
 </div>
@@ -1870,9 +1894,25 @@ function send(i, create){
     })
     .catch(function(e){ toast("请求失败: " + e); refresh(); LASTJSON = ""; });
 }
+var WIN_SEC = CFG_WINDOW;   // 当前生效绑定窗口（服务端注入）
+function setWin(inp){
+  var v = parseFloat(inp.value);
+  if (!(v >= 3 && v <= 300)){
+    toast("绑定窗口需在 3~300 秒之间"); inp.value = WIN_SEC; return;
+  }
+  fetch("/api/matchwindow", {method:"POST", cache:"no-store",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({sec: v})})
+  .then(function(r){ return r.json(); })
+  .then(function(j){
+    if (j.ok){ WIN_SEC = j.window; inp.value = j.window;
+               toast("绑定窗口已调整为 ±" + j.window + "s"); }
+    else { toast(j.error || "调整失败"); inp.value = WIN_SEC; }
+  })
+  .catch(function(){ toast("调整失败（网络错误）"); inp.value = WIN_SEC; });
+}
 document.getElementById("machine").textContent = "本机: " + CFG_MACHINE;
 document.getElementById("srv").textContent = CFG_SERVER;
-document.getElementById("win").textContent = CFG_WINDOW;
 document.getElementById("dirs").textContent = CFG_DIRS;
 document.getElementById("efields").textContent =
   CFG_EFIELDS.map(function(f){ return f.label; }).join(" / ");
@@ -2046,6 +2086,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(
                 {"ok": _save_ttm_title(t), "title": t},
                 ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/matchwindow":
+            p = self._json_body()
+            self._send(200, json.dumps(
+                set_match_window(p.get("sec")), ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
