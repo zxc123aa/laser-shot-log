@@ -92,7 +92,7 @@ _bypass_proxy_for_lan()
 # ---------- 靶位 → 靶类型 映射（来自"第x次打靶靶位"xls，如 D:\怀柔实验规范平台\shotlist20260917.xls） ----------
 TTM_JSON = os.path.join(BASE, "target_type_map.json")
 TTM_STATE = {"xls_mtime": None, "map": {}, "next_check": 0.0,
-             "lock": threading.Lock()}
+             "lock": threading.RLock()}   # RLock：锁内可再调 get_target_type_map
 
 
 def _ttm_cfg():
@@ -155,7 +155,50 @@ def lookup_target_type(pos):
     pos = str(pos or "").strip()
     if not pos:
         return ""
+    o = _ttm_overrides()
+    if pos in o:                       # 手动修改优先（含清空 = 置空）
+        return str(o[pos] or "")
     return get_target_type_map().get(pos, "")
+
+
+TTM_OVERRIDES_PATH = os.path.join(BASE, "target_type_overrides.json")
+_TTM_OVR = {"mtime": None, "data": {}}
+
+
+def _ttm_overrides():
+    """手动维护的 靶位→靶类型 覆盖（持久化 target_type_overrides.json，mtime 缓存）"""
+    try:
+        mt = os.path.getmtime(TTM_OVERRIDES_PATH)
+    except OSError:
+        if _TTM_OVR["mtime"] is not None:
+            _TTM_OVR["mtime"], _TTM_OVR["data"] = None, {}
+        return {}
+    if mt != _TTM_OVR["mtime"]:
+        try:
+            _TTM_OVR["data"] = json.load(
+                open(TTM_OVERRIDES_PATH, encoding="utf-8"))
+            _TTM_OVR["mtime"] = mt
+        except Exception:
+            pass
+    return _TTM_OVR["data"]
+
+
+def _save_ttm_overrides(o):
+    try:
+        json.dump(o, open(TTM_OVERRIDES_PATH, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=1)
+        _TTM_OVR["mtime"] = None      # 下次读取强制重载
+        return True
+    except Exception as e:
+        log("靶类型覆盖保存失败: %r" % e)
+        return False
+
+
+def effective_target_map():
+    """自动(xls)映射 + 手动覆盖 合并后的生效映射"""
+    m = dict(get_target_type_map())
+    m.update(_ttm_overrides())
+    return m
 
 
 STATE_PATH = os.path.join(BASE, "state_helper.json")
@@ -436,6 +479,31 @@ def api_shots_clear(mode):
         (mode, len(removed), len(STATE["shots"])))
     return {"ok": True, "removed": len(removed),
             "left": len(STATE["shots"])}
+
+
+def api_targetmap_set(pos, ttype):
+    """手动设置一个靶位的靶类型（覆盖 xls 自动映射）。
+    type 为空 或 与自动映射相同 → 删除覆盖（恢复自动值）。"""
+    pos = str(pos or "").strip()
+    ttype = str(ttype or "").strip()
+    if not re.match(r"^\d{1,3}-\d{1,3}$", pos):
+        return {"ok": False, "error": "靶位格式应为 行-列，如 2-2"}
+    if len(ttype) > 60:
+        return {"ok": False, "error": "靶类型太长（≤60 字符）"}
+    with TTM_STATE["lock"]:
+        o = _ttm_overrides()
+        if not ttype or ttype == TTM_STATE["map"].get(pos, ""):
+            o.pop(pos, None)               # 恢复自动值
+            act = "恢复自动"
+        else:
+            o[pos] = ttype                 # 手动覆盖
+            act = "覆盖"
+        ok = _save_ttm_overrides(o)
+    if ok:
+        bump_ver()                          # SSE 推送 → 页面 ttype 实时刷新
+        log("靶类型%s: %s = %s" % (act, pos, ttype or "（空）"))
+    return {"ok": ok, "pos": pos, "type": ttype,
+            "effective": lookup_target_type(pos)}
 
 
 def api_trash_act(p):
@@ -980,6 +1048,10 @@ HELP_PAGE = r"""<!DOCTYPE html>
   input.n{width:54px;padding:6px 6px;border:1px solid #d5d9de;border-radius:5px;
           font-size:13px;text-align:center;font-family:Consolas,monospace}
   input.n:focus{outline:none;border-color:#9fc3e8;background:#fff8dc}
+  input.tm{width:100%;min-width:72px;box-sizing:border-box;padding:3px 4px;
+           border:1px solid #dde;border-radius:4px;font-size:12px;
+           font-family:inherit;text-align:center}
+  input.tm:focus{outline:none;border-color:#9fc3e8;background:#fff8dc}
   .tbtn{background:#2c3e50;color:#fff;border:none;border-radius:5px;padding:6px 14px;
         font-size:13px;cursor:pointer;font-family:inherit}
   .tbtn:hover{background:#3d5875}
@@ -1032,6 +1104,8 @@ HELP_PAGE = r"""<!DOCTYPE html>
       border:1px solid #ccd;border-radius:6px;background:#fff">清理已绑定</button>
     <button onclick="clearShots('all')" style="padding:3px 10px;cursor:pointer;
       border:1px solid #ecc;border-radius:6px;background:#fff;color:#c33">清空列表</button>
+    <button onclick="openTmap()" style="padding:3px 10px;cursor:pointer;
+      border:1px solid #ccd;border-radius:6px;background:#fff">靶类型</button>
     <button onclick="openTrash()" style="padding:3px 10px;cursor:pointer;
       border:1px solid #ccd;border-radius:6px;background:#fff">回收站</button>
     <button onclick="window.open('/export.xlsx')" style="padding:3px 10px;cursor:pointer;
@@ -1092,6 +1166,24 @@ HELP_PAGE = r"""<!DOCTYPE html>
       b_watcher 同步跟随，无需重启。表格不存在时 A 机会自动创建。
     </div>
     <div id="sheetList"></div>
+  </div>
+</div>
+<div id="tmapMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
+     z-index:50;align-items:center;justify-content:center"
+     onclick="if(event.target===this)closeTmap()">
+  <div style="background:#fff;border-radius:12px;width:960px;max-width:94vw;
+       padding:20px 24px;max-height:84vh;overflow:auto">
+    <div style="display:flex;align-items:center;margin-bottom:6px">
+      <b style="font-size:15px">靶类型映射表（第 x 次打靶靶位表）</b>
+      <span style="margin-left:auto;cursor:pointer;color:#999;font-size:20px;
+            line-height:1" onclick="closeTmap()">✕</span>
+    </div>
+    <div style="font-size:12px;color:#888;margin-bottom:12px">
+      网格按 Sheet4 排布：每格是一个靶位（行-列），格内为靶类型，可直接修改，
+      失焦自动保存。手动值优先于 xls 自动映射；清空一格 = 恢复 xls 自动值。
+      保存后待确认列表的靶类型列实时刷新。
+    </div>
+    <div id="tmapList"></div>
   </div>
 </div>
 <div id="trashMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
@@ -1348,6 +1440,83 @@ function openSheet(){
   });
 }
 function closeSheet(){ document.getElementById("sheetMask").style.display = "none"; }
+/* ---------- 靶类型映射表（Sheet4 网格，可手动修改） ---------- */
+function openTmap(){
+  document.getElementById("tmapMask").style.display = "flex";
+  document.getElementById("tmapList").innerHTML =
+    "<div style='color:#999;font-size:13px'>加载中…</div>";
+  fetch("/api/targetmap", {cache:"no-store"}).then(function(r){ return r.json(); })
+  .then(renderTmap).catch(function(){
+    document.getElementById("tmapList").innerHTML =
+      "<div style='color:#c0392b;font-size:13px'>加载失败，请稍后重试</div>";
+  });
+}
+function closeTmap(){ document.getElementById("tmapMask").style.display = "none"; }
+function renderTmap(j){
+  if (!j.ok){
+    document.getElementById("tmapList").innerHTML =
+      "<div style='color:#c0392b;font-size:13px'>读取失败</div>";
+    return;
+  }
+  var keys = Object.keys(j.map || {});
+  if (!keys.length){
+    document.getElementById("tmapList").innerHTML =
+      "<div style='color:#999;font-size:13px'>映射为空：检查 config_helper.json 的 target_type_map（xls 路径）是否有效</div>";
+    return;
+  }
+  var rows = {}, cols = {};
+  keys.forEach(function(k){
+    var p = k.split("-");
+    rows[parseInt(p[0], 10)] = 1; cols[parseInt(p[1], 10)] = 1;
+  });
+  var rl = Object.keys(rows).map(Number).sort(function(a,b){ return a-b; });
+  var cl = Object.keys(cols).map(Number).sort(function(a,b){ return a-b; });
+  var h = "<table style='border-collapse:collapse;font-size:12px'>" +
+          "<tr><th style='padding:2px 6px;color:#999;background:#f6f8fa'>行\\列</th>";
+  cl.forEach(function(c){
+    h += "<th style='padding:2px 6px;color:#888;background:#f6f8fa;" +
+         "border:1px solid #e6e8eb'>" + c + "</th>";
+  });
+  h += "</tr>";
+  rl.forEach(function(r){
+    h += "<tr><th style='padding:2px 6px;color:#888;background:#f6f8fa;" +
+         "border:1px solid #e6e8eb'>" + r + "</th>";
+    cl.forEach(function(c){
+      var pos = r + "-" + c;
+      if (!j.map.hasOwnProperty(pos)){
+        h += "<td style='border:1px solid #f0f1f3;background:#fafbfc'></td>";
+        return;
+      }
+      var manual = j.overrides && j.overrides.hasOwnProperty(pos);
+      h += "<td style='border:1px solid #e6e8eb;padding:2px'>" +
+           "<div style='font-size:10px;color:" + (manual ? "#d35400" : "#bbb") +
+           ";line-height:1.1'>" + pos + (manual ? " ✎" : "") + "</div>" +
+           "<input class='tm' data-p='" + pos + "' value='" +
+           String(j.map[pos] || "").replace(/'/g,"&#39;") +
+           "' placeholder='靶类型' onfocus='this.select()' " +
+           "onchange='saveTmap(this)'></td>";
+    });
+    h += "</tr>";
+  });
+  h += "</table>";
+  document.getElementById("tmapList").innerHTML = h;
+}
+function saveTmap(inp){
+  var pos = inp.getAttribute("data-p");
+  fetch("/api/targetmap", {method:"POST", cache:"no-store",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({pos: pos, type: inp.value.trim()})})
+  .then(function(r){ return r.json(); })
+  .then(function(j){
+    if (!j.ok){ toast(j.error || "保存失败"); openTmap(); return; }
+    inp.parentNode.querySelector("div").style.color = "#d35400";
+    inp.parentNode.querySelector("div").textContent =
+      pos + (j.type && j.type !== "" ? " ✎" : "");
+    toast("靶类型已保存：" + pos + " = " + (j.effective || "（空）"));
+    refresh(); LASTJSON = "";
+  })
+  .catch(function(){ toast("保存失败（网络错误）"); });
+}
 function renderSheet(sheets){
   var h = "<div style='font-size:11px;color:#888;background:#f6f8fa;border-radius:6px;" +
           "padding:6px 10px;margin-bottom:8px'>上报目标默认「按打靶日期自动分表」：每天自动写入当天日期命名的表，一天一张、与日志一一对应。历史日期表仅供查看，不能选为上报目标。</div>";
@@ -1568,7 +1737,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, html, "text/html; charset=utf-8")
 
     def _snapshot(self):
-        ttm = get_target_type_map()
+        ttm = effective_target_map()   # 自动(xls) + 手动覆盖
         with _state_lock:
             shots = []
             for s in STATE["shots"]:
@@ -1608,6 +1777,10 @@ class Handler(BaseHTTPRequestHandler):
                 t = [dict(s) for s in STATE.get("trash", [])]
             self._send(200, json.dumps({"ok": True, "trash": t},
                                        ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/targetmap":
+            self._send(200, json.dumps(
+                {"ok": True, "map": effective_target_map(),
+                 "overrides": _ttm_overrides()}, ensure_ascii=False))
         elif urlparse(self.path).path == "/export.xlsx":
             with _state_lock:
                 shots = [dict(s) for s in STATE["shots"]]
@@ -1679,6 +1852,11 @@ class Handler(BaseHTTPRequestHandler):
         elif urlparse(self.path).path == "/api/trash":
             p = self._json_body()
             self._send(200, json.dumps(api_trash_act(p), ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/targetmap":
+            p = self._json_body()
+            self._send(200, json.dumps(
+                api_targetmap_set(p.get("pos"), p.get("type")),
+                ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
