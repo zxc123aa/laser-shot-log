@@ -15,9 +15,11 @@
     merge_text 合并区左上角文本（标题等静态文字）
 
 解析规则（对应"第x次打靶靶位"表，如 Sheet4）：
-  - 凡匹配 "x-y" 靶位标签的格子，向右找 1~2 格内第一个"非空、非纯数字、
-    且不是另一个靶位标签"的格子作为靶类型（合并格只有左上有值，正好符合）。
-  - 同一靶位多处出现时，非空类型优先。
+  - 版面：优先名字叫 Sheet4 的表，按 列号头 + 行号列 + 靶位/类型成对合并块 复刻。
+  - 映射：只从版面主网格按"靶块"展开 —— 一个靶块 = 编号块(2×2) + 类型块(2×2)，
+    覆盖 2 行 × 4 列靶位；块内所有靶位（行号,列号）共享该块的靶类型。
+    靶位编号 ≠ 靶块编号：靶位 1-2 在靶块 1-1 内 → 类型 = 靶块 1-1 的类型。
+  - 兜底：无版面时退回全表扫描（x-y 标签向右找类型）。
 """
 import json
 import re
@@ -106,9 +108,44 @@ def pick_type(sh, r, c, merges):
     return "", None
 
 
+def block_mapping(layout):
+    """靶块几何映射：一个靶块 = 编号块 + 类型块，覆盖 2 行 × 4 列靶位，
+    块内所有靶位（行号,列号）共享该块的靶类型。靶位编号 ≠ 靶块编号。"""
+    if not layout or layout.get("header_row", -1) < 0:
+        return None
+    hr = layout["header_row"]
+    values = layout["values"]
+    colnum = {}                         # 网格列 -> 列号（列号表头行）
+    for c in range(layout["ncols"]):
+        v = values.get("%d,%d" % (hr, c), "")
+        if v.isdigit():
+            colnum[c] = int(v)
+    mapping = {}
+    for lab in layout["labels"]:
+        if len(lab) < 7:
+            continue                    # 无类型块的标签跳过
+        r, c = lab[0], lab[1]
+        ts = values.get("%d,%d" % (lab[3], lab[4]), "")
+        if not ts:
+            continue                    # 类型空 = 未填，不产生映射
+        rn = []
+        for rr in (r, r + 1):           # 编号块跨 2 行 -> 2 个靶位行号
+            v = values.get("%d,0" % rr, "")
+            if v.isdigit():
+                rn.append(int(v))
+        cn = [colnum[cc] for cc in (c, c + 1, c + 2, c + 3)
+              if cc in colnum]          # 编号 2 列 + 类型 2 列 = 4 个靶位列号
+        if not rn or len(cn) < 4:
+            continue
+        for rr2 in rn:
+            for cc2 in cn:
+                mapping["%d-%d" % (rr2, cc2)] = ts
+    return mapping or None
+
+
 def main(xls_path, out_path):
     wb = xlrd.open_workbook(xls_path, formatting_info=True)  # 必须开启才有 merged_cells
-    cand = {}          # pos -> [types...]（按扫描顺序）
+    cand = {}          # 靶位 -> [types...]（全表扫描，仅作无版面时的兜底）
     for si in range(wb.nsheets):
         sh = wb.sheet_by_index(si)
         merges = clean_merges(sh, norm_merges(sh))
@@ -116,8 +153,8 @@ def main(xls_path, out_path):
             ts, _ = pick_type(sh, r, c, merges)
             if ts:
                 cand.setdefault(pos, []).append(ts)
-    mapping = {p: (types[0] if types else "")
-               for p, types in cand.items()}
+    fallback_map = {p: (types[0] if types else "")
+                    for p, types in cand.items()}
 
     # ---- 选版面 sheet：类型格落在合并区内的标签最多者（Sheet4 形态）----
     best_si, best_score, best_labels = None, -1, 0
@@ -247,6 +284,11 @@ def main(xls_path, out_path):
                   "merges": [list(m) for m in merges_out],
                   "labels": labels_out,
                   "merge_text": merge_text, "values": values}
+
+    # 映射：优先靶块几何展开（只从版面主网格），无版面时退回全表扫描
+    mapping = block_mapping(layout)
+    if mapping is None:
+        mapping = fallback_map
 
     data = {"source": xls_path, "map": mapping, "layout": layout}
     with open(out_path, "w", encoding="utf-8") as f:
