@@ -541,6 +541,8 @@ def api_targetmap_set(pos, ttype, positions=None):
     if not isinstance(positions, list) or not positions:
         return {"ok": False, "error": "缺少靶位"}
     ttype = str(ttype or "").strip()
+    if ttype in ("0", "0.0"):          # '0' 视为未填类型，防止垃圾覆盖入库
+        ttype = ""
     if len(ttype) > 60:
         return {"ok": False, "error": "靶类型太长（≤60 字符）"}
     pos_ok = []
