@@ -91,8 +91,9 @@ _bypass_proxy_for_lan()
 
 # ---------- 靶位 → 靶类型 映射（来自"第x次打靶靶位"xls，如 D:\怀柔实验规范平台\shotlist20260917.xls） ----------
 TTM_JSON = os.path.join(BASE, "target_type_map.json")
-TTM_STATE = {"xls_mtime": None, "map": {}, "next_check": 0.0,
-             "lock": threading.RLock()}   # RLock：锁内可再调 get_target_type_map
+TTM_STATE = {"xls_mtime": None, "map": {}, "layout": None,
+             "next_check": 0.0, "lock": threading.RLock()}
+# RLock：锁内可再调 get_target_type_map
 
 
 def _ttm_cfg():
@@ -142,12 +143,15 @@ def get_target_type_map(force=False):
                     log("靶类型映射转换异常: %r" % e)
         elif xls_cfg and not xls:
             log("靶类型映射：找不到 shotlist*.xls（配置目录里没有）")
-        m = {}
+        m, layout = {}, None
         try:
-            m = json.load(open(TTM_JSON, encoding="utf-8")).get("map", {})
+            d = json.load(open(TTM_JSON, encoding="utf-8"))
+            m = d.get("map", {})
+            layout = d.get("layout")
         except Exception:
             pass
         TTM_STATE["map"] = m
+        TTM_STATE["layout"] = layout
         return m
 
 
@@ -199,6 +203,12 @@ def effective_target_map():
     m = dict(get_target_type_map())
     m.update(_ttm_overrides())
     return m
+
+
+def get_target_type_layout():
+    """Sheet 版面（含合并区块），无则 None"""
+    get_target_type_map()
+    return TTM_STATE.get("layout")
 
 
 STATE_PATH = os.path.join(BASE, "state_helper.json")
@@ -481,29 +491,39 @@ def api_shots_clear(mode):
             "left": len(STATE["shots"])}
 
 
-def api_targetmap_set(pos, ttype):
-    """手动设置一个靶位的靶类型（覆盖 xls 自动映射）。
-    type 为空 或 与自动映射相同 → 删除覆盖（恢复自动值）。"""
-    pos = str(pos or "").strip()
+def api_targetmap_set(pos, ttype, positions=None):
+    """手动设置靶位的靶类型（覆盖 xls 自动映射）。
+    positions 为合并块内的全部靶位（一次保存整块）；type 为空或与自动映射
+    相同 → 删除覆盖（恢复自动值）。"""
+    if positions is None:
+        positions = [pos] if pos else []
+    if not isinstance(positions, list) or not positions:
+        return {"ok": False, "error": "缺少靶位"}
     ttype = str(ttype or "").strip()
-    if not re.match(r"^\d{1,3}-\d{1,3}$", pos):
-        return {"ok": False, "error": "靶位格式应为 行-列，如 2-2"}
     if len(ttype) > 60:
         return {"ok": False, "error": "靶类型太长（≤60 字符）"}
+    pos_ok = []
+    for p in positions:
+        p = str(p or "").strip()
+        if re.match(r"^\d{1,3}-\d{1,3}$", p):
+            pos_ok.append(p)
+    if not pos_ok:
+        return {"ok": False, "error": "靶位格式应为 行-列，如 2-2"}
     with TTM_STATE["lock"]:
         o = _ttm_overrides()
-        if not ttype or ttype == TTM_STATE["map"].get(pos, ""):
-            o.pop(pos, None)               # 恢复自动值
-            act = "恢复自动"
-        else:
-            o[pos] = ttype                 # 手动覆盖
-            act = "覆盖"
+        for p in pos_ok:
+            if not ttype or ttype == TTM_STATE["map"].get(p, ""):
+                o.pop(p, None)             # 恢复自动值
+            else:
+                o[p] = ttype               # 手动覆盖
         ok = _save_ttm_overrides(o)
     if ok:
         bump_ver()                          # SSE 推送 → 页面 ttype 实时刷新
-        log("靶类型%s: %s = %s" % (act, pos, ttype or "（空）"))
-    return {"ok": ok, "pos": pos, "type": ttype,
-            "effective": lookup_target_type(pos)}
+        log("靶类型覆盖: %s = %s（%d 个靶位）"
+            % (",".join(pos_ok[:5]) + ("…" if len(pos_ok) > 5 else ""),
+               ttype or "（恢复自动）", len(pos_ok)))
+    return {"ok": ok, "type": ttype, "positions": pos_ok,
+            "effective": lookup_target_type(pos_ok[0])}
 
 
 def api_trash_act(p):
@@ -1179,8 +1199,9 @@ HELP_PAGE = r"""<!DOCTYPE html>
             line-height:1" onclick="closeTmap()">✕</span>
     </div>
     <div style="font-size:12px;color:#888;margin-bottom:12px">
-      网格按 Sheet4 排布：每格是一个靶位（行-列），格内为靶类型，可直接修改，
-      失焦自动保存。手动值优先于 xls 自动映射；清空一格 = 恢复 xls 自动值。
+      1:1 复刻打靶靶位表（Sheet4）：灰底小字＝靶位编号，白格＝靶类型；
+      合并的大格＝同一靶块（一个类型管整块靶位），改一处整块生效，失焦自动保存。
+      手动值优先于 xls 自动映射；清空一格 = 整块恢复 xls 自动值。
       保存后待确认列表的靶类型列实时刷新。
     </div>
     <div id="tmapList"></div>
@@ -1458,6 +1479,103 @@ function renderTmap(j){
       "<div style='color:#c0392b;font-size:13px'>读取失败</div>";
     return;
   }
+  var L = j.layout;
+  if (!L || !L.labels || !L.labels.length){ renderTmapFlat(j); return; }
+
+  /* 区块索引：key "r1,c1,r2,c2" -> 覆盖的靶位列表（labels: [r,c,pos,r1,c1,r2,c2]）*/
+  var regionPos = {};
+  L.labels.forEach(function(a){
+    if (a.length >= 7){
+      var k = a[3] + "," + a[4] + "," + a[5] + "," + a[6];
+      (regionPos[k] = regionPos[k] || []).push(a[2]);
+    }
+  });
+  var covered = {}, region = {};
+  function addRegion(k){
+    if (region[k]) return;
+    var a = k.split(",").map(Number);
+    region[k] = a;
+    for (var r = a[0]; r < a[2]; r++)
+      for (var c = a[1]; c < a[3]; c++) covered[r + "," + c] = k;
+  }
+  Object.keys(regionPos).forEach(addRegion);          // 类型格区块（可编辑）
+  (L.merges || []).forEach(function(m){               // 其余合并区（静态文字）
+    addRegion(m.join(","));
+  });
+
+  function effType(poss){                              // 区块生效类型：手动优先
+    for (var i = 0; i < poss.length; i++)
+      if (j.overrides && j.overrides.hasOwnProperty(poss[i]))
+        return String(j.overrides[poss[i]]);
+    for (var i2 = 0; i2 < poss.length; i2++)
+      if (j.map[poss[i2]]) return String(j.map[poss[i2]]);
+    return "";
+  }
+  function anyManual(poss){
+    return poss.some(function(p){
+      return j.overrides && j.overrides.hasOwnProperty(p); });
+  }
+
+  var labelAt = {};
+  L.labels.forEach(function(a){ labelAt[a[0] + "," + a[1]] = a[2]; });
+
+  var h = "<div style='font-size:11px;color:#888;margin-bottom:6px'>版面复刻自 " +
+          tesc(L.sheet) + "：灰底小字＝靶位编号，白格＝靶类型（合并大格＝同一靶块，改一处整块生效）；" +
+          "橙 ✎＝手动覆盖过，清空＝恢复 xls 自动值</div>" +
+          "<table style='border-collapse:collapse;font-size:12px;table-layout:fixed'>";
+  for (var r = 0; r < L.nrows; r++){
+    h += "<tr>";
+    for (var c = 0; c < L.ncols; c++){
+      var ck = r + "," + c, k = covered[ck];
+      if (k && region[k][0] !== r || (k && region[k][0] === r && region[k][1] !== c)){
+        continue;                                      // 合并区内部格
+      }
+      if (k){                                          // 合并区锚格
+        var a = region[k], poss = regionPos[k] || [],
+            rs = a[2] - a[0], cs = a[3] - a[1],
+            span = (rs > 1 ? " rowspan='" + rs + "'" : "") +
+                   (cs > 1 ? " colspan='" + cs + "'" : "");
+        if (poss.length){
+          var man = anyManual(poss), v = effType(poss);
+          h += "<td" + span + " style='border:1px solid #c8cdd4;padding:3px;" +
+               "background:" + (man ? "#fff7ee" : "#fff") + ";min-width:86px'>" +
+               "<input class='tm' style='min-width:80px' data-positions='" +
+               poss.join(",") + "' value='" + v.replace(/'/g,"&#39;") +
+               "' placeholder='靶类型' onfocus='this.select()' " +
+               "onchange='saveTmapBlock(this)'>" +
+               "<div style='font-size:10px;color:" + (man ? "#d35400" : "#bbb") +
+               ";margin-top:1px'>" + tesc(poss.join(" ")) + (man ? " ✎" : "") +
+               "</div></td>";
+        } else {                                       // 无靶位的合并区 = 标题等静态文字
+          var txt = (L.merge_text && L.merge_text[k]) ||
+                    (L.values && L.values[ck]) || "";
+          h += "<td" + span + " style='border:1px solid #e6e8eb;padding:3px;" +
+               "background:#f6f8fa;color:#666;text-align:center;font-size:11px'>" +
+               tesc(txt) + "</td>";
+        }
+        continue;
+      }
+      if (labelAt[ck]){                                // 靶位编号格
+        h += "<td style='border:1px solid #c8cdd4;padding:2px 4px;background:#f2f4f7;" +
+             "text-align:center;font-size:11px;color:#555;white-space:nowrap'>" +
+             tesc(labelAt[ck]) + "</td>";
+        continue;
+      }
+      var v2 = L.values ? L.values[ck] : "";
+      if (v2){                                         // 其它有字格（标题/编号）
+        h += "<td style='border:1px solid #e6e8eb;padding:2px 4px;background:#f6f8fa;" +
+             "color:#666;text-align:center;font-size:11px'>" + tesc(v2) + "</td>";
+      } else {                                         // 空格
+        h += "<td style='border:1px solid #eef0f2;background:#fbfcfd'></td>";
+      }
+    }
+    h += "</tr>";
+  }
+  h += "</table>";
+  document.getElementById("tmapList").innerHTML = h;
+}
+/* 无版面数据时的兜底：平铺网格 */
+function renderTmapFlat(j){
   var keys = Object.keys(j.map || {});
   if (!keys.length){
     document.getElementById("tmapList").innerHTML =
@@ -1491,28 +1609,27 @@ function renderTmap(j){
       h += "<td style='border:1px solid #e6e8eb;padding:2px'>" +
            "<div style='font-size:10px;color:" + (manual ? "#d35400" : "#bbb") +
            ";line-height:1.1'>" + pos + (manual ? " ✎" : "") + "</div>" +
-           "<input class='tm' data-p='" + pos + "' value='" +
+           "<input class='tm' data-positions='" + pos + "' value='" +
            String(j.map[pos] || "").replace(/'/g,"&#39;") +
            "' placeholder='靶类型' onfocus='this.select()' " +
-           "onchange='saveTmap(this)'></td>";
+           "onchange='saveTmapBlock(this)'></td>";
     });
     h += "</tr>";
   });
   h += "</table>";
   document.getElementById("tmapList").innerHTML = h;
 }
-function saveTmap(inp){
-  var pos = inp.getAttribute("data-p");
+function saveTmapBlock(inp){
+  var positions = (inp.getAttribute("data-positions") || "").split(",");
   fetch("/api/targetmap", {method:"POST", cache:"no-store",
     headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({pos: pos, type: inp.value.trim()})})
+    body: JSON.stringify({positions: positions, type: inp.value.trim()})})
   .then(function(r){ return r.json(); })
   .then(function(j){
     if (!j.ok){ toast(j.error || "保存失败"); openTmap(); return; }
-    inp.parentNode.querySelector("div").style.color = "#d35400";
-    inp.parentNode.querySelector("div").textContent =
-      pos + (j.type && j.type !== "" ? " ✎" : "");
-    toast("靶类型已保存：" + pos + " = " + (j.effective || "（空）"));
+    toast("靶类型已保存：" + positions.length + " 个靶位 = " +
+          (j.effective || "（恢复自动）"));
+    openTmap();      // 重渲染，✎ 标记同步
     refresh(); LASTJSON = "";
   })
   .catch(function(){ toast("保存失败（网络错误）"); });
@@ -1780,7 +1897,9 @@ class Handler(BaseHTTPRequestHandler):
         elif urlparse(self.path).path == "/api/targetmap":
             self._send(200, json.dumps(
                 {"ok": True, "map": effective_target_map(),
-                 "overrides": _ttm_overrides()}, ensure_ascii=False))
+                 "overrides": _ttm_overrides(),
+                 "layout": get_target_type_layout()},
+                ensure_ascii=False))
         elif urlparse(self.path).path == "/export.xlsx":
             with _state_lock:
                 shots = [dict(s) for s in STATE["shots"]]
@@ -1855,7 +1974,8 @@ class Handler(BaseHTTPRequestHandler):
         elif urlparse(self.path).path == "/api/targetmap":
             p = self._json_body()
             self._send(200, json.dumps(
-                api_targetmap_set(p.get("pos"), p.get("type")),
+                api_targetmap_set(p.get("pos"), p.get("type"),
+                                  p.get("positions")),
                 ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
