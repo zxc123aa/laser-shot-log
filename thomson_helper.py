@@ -150,6 +150,14 @@ def get_target_type_map(force=False):
             layout = d.get("layout")
         except Exception:
             pass
+        mb = _ttm_manual_base()      # 已固化：页面上的表就是基表
+        if mb and mb.get("map") and not _xls_newer_than(mb["solidified_at"]):
+            m = mb["map"]
+        elif mb and _xls_newer_than(mb["solidified_at"]):
+            global _TTM_BASE_YIELD_LOGGED
+            if not _TTM_BASE_YIELD_LOGGED:
+                _TTM_BASE_YIELD_LOGGED = True
+                log("检测到更新的 shotlist xls，固化基表已让位（新装盘日自动换新表）")
         TTM_STATE["map"] = m
         TTM_STATE["layout"] = layout
         return m
@@ -169,6 +177,41 @@ TTM_OVERRIDES_PATH = os.path.join(BASE, "target_type_overrides.json")
 _TTM_OVR = {"mtime": None, "data": {}}
 
 TTM_TITLE_PATH = os.path.join(BASE, "target_type_title.json")   # 映射表标题（可改日期）
+
+# 固化基表：页面上"以当前表为准"后，生效映射整体存这里，xls 不再参与
+TTM_BASE_MANUAL_PATH = os.path.join(BASE, "target_type_base_manual.json")
+_TTM_BASE_MANUAL = {"mtime": None, "data": None}
+_TTM_BASE_YIELD_LOGGED = False
+
+
+def _ttm_manual_base():
+    """固化的基表 {"solidified_at": epoch, "map": {...}}；无则 None（mtime 缓存）"""
+    try:
+        mt = os.path.getmtime(TTM_BASE_MANUAL_PATH)
+    except OSError:
+        _TTM_BASE_MANUAL["data"] = None
+        _TTM_BASE_MANUAL["mtime"] = None
+        return None
+    if mt != _TTM_BASE_MANUAL["mtime"]:
+        try:
+            d = json.load(open(TTM_BASE_MANUAL_PATH, encoding="utf-8"))
+            _TTM_BASE_MANUAL["data"] = {
+                "solidified_at": float(d.get("solidified_at") or 0),
+                "map": dict(d.get("map") or {})}
+        except Exception as e:
+            log("固化基表读取失败（忽略）: %r" % e)
+            _TTM_BASE_MANUAL["data"] = None
+        _TTM_BASE_MANUAL["mtime"] = mt
+    return _TTM_BASE_MANUAL["data"]
+
+
+def _xls_newer_than(ts):
+    """当前选中的 shotlist xls 是否比固化时间新（新装盘日 → xls 重新接管基表）"""
+    xls = _ttm_pick_xls(_ttm_cfg()[0])
+    try:
+        return bool(xls) and os.path.exists(xls) and os.path.getmtime(xls) > ts
+    except OSError:
+        return False
 
 
 def _ttm_title():
@@ -617,6 +660,32 @@ def api_targetmap_set(pos, ttype, positions=None):
                ttype or "（恢复自动）", len(pos_ok)))
     return {"ok": ok, "type": ttype, "positions": pos_ok,
             "effective": lookup_target_type(pos_ok[0])}
+
+
+def api_targetmap_solidify():
+    """以当前生效映射表为准，整体固化为基表（"页面上的表就是映射本体"）。
+    固化后：xls 旧表不再参与映射（除非出现比固化时间更新的 shotlist xls，
+    新装盘日自动让位）；页面上继续手改的格子仍然即时生效。"""
+    with TTM_STATE["lock"]:
+        merged = dict(get_target_type_map())
+        merged.update(_ttm_overrides())
+        data = {"solidified_at": time.time(),
+                "solidified_str": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "title": _ttm_title(),
+                "map": merged}
+        try:
+            json.dump(data, open(TTM_BASE_MANUAL_PATH, "w", encoding="utf-8"),
+                      ensure_ascii=False, indent=1)
+        except Exception as e:
+            log("固化基表写入失败: %r" % e)
+            return {"ok": False, "error": str(e)}
+        _TTM_BASE_MANUAL["mtime"] = None    # 强制下次重载
+        TTM_STATE["map"] = merged           # 立即生效（不等 60s 节流）
+        TTM_STATE["next_check"] = 0
+    bump_ver()
+    log("靶类型映射已固化为基表：%d 个靶位（来源=页面当前表，xls 不再参与）"
+        % len(merged))
+    return {"ok": True, "count": len(merged)}
 
 
 def api_trash_act(p):
@@ -1637,8 +1706,11 @@ function renderTmap(j){
 
   var h = "<div style='font-size:11px;color:#888;margin-bottom:6px'>版面复刻自 " +
           tesc(L.sheet) + "：蓝格＝靶类型（合并大格＝同一靶块，改一处整块生效），" +
-          "白格＝靶位编号/待填，橙格＝手动覆盖过，清空＝恢复 xls 自动值；" +
-          "大标题（含日期）可直接点击修改</div>" +
+          "白格＝靶位编号/待填，橙格＝手动覆盖过，清空＝恢复基表值；" +
+          "大标题（含日期）可直接点击修改" +
+          "<button onclick='solidifyTmap(this)' style='float:right;" +
+          "font-size:11px;padding:2px 8px;cursor:pointer'>" +
+          "以当前表为准（固化基表）</button></div>" +
           "<table style='border-collapse:collapse;font-size:12px;table-layout:fixed'>";
   if (L.ncols > 1){
     h += "<colgroup><col style='width:34px'>";
@@ -1764,6 +1836,19 @@ function saveTmapBlock(inp){
     refresh(); LASTJSON = "";
   })
   .catch(function(){ toast("保存失败（网络错误）"); });
+}
+function solidifyTmap(btn){
+  if (btn){ btn.disabled = true; btn.textContent = "固化中…"; }
+  fetch("/api/targetmap_solidify", {method:"POST", cache:"no-store"})
+  .then(function(r){ return r.json(); })
+  .then(function(j){
+    if (!j.ok){ toast(j.error || "固化失败"); if(btn){btn.disabled=false;
+      btn.textContent = "以当前表为准（固化基表）";} return; }
+    toast("已固化：" + j.count + " 个靶位。此后页面这张表就是映射本体，旧 xls 不再参与");
+    openTmap();
+  })
+  .catch(function(){ toast("固化失败（网络错误）"); if(btn){btn.disabled=false;
+    btn.textContent = "以当前表为准（固化基表）";} });
 }
 function saveTmapTitle(inp){
   fetch("/api/targetmap_title", {method:"POST", cache:"no-store",
@@ -2135,6 +2220,9 @@ class Handler(BaseHTTPRequestHandler):
                 api_targetmap_set(p.get("pos"), p.get("type"),
                                   p.get("positions")),
                 ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/targetmap_solidify":
+            self._send(200, json.dumps(api_targetmap_solidify(),
+                                       ensure_ascii=False))
         elif urlparse(self.path).path == "/api/targetmap_title":
             p = self._json_body()
             t = str(p.get("title") or "").strip()
