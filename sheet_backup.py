@@ -19,6 +19,16 @@ import urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
+
+def _load_helper_port():
+    """上报系统(8767 靶类型映射页)端口，从 config_helper.json 读，默认 8767"""
+    try:
+        c = json.load(open(os.path.join(BASE, "config_helper.json"),
+                           encoding="utf-8"))
+        return int(c.get("helper_port") or 8767)
+    except Exception:
+        return 8767
+
 def _bypass_proxy_for_lan():
     """实验室内网地址不走系统代理（http_proxy 是会话级动态端口，会把
     10.0.23.x 内网请求拖死）。把 A 机/靶系统主机名加入 NO_PROXY。"""
@@ -59,6 +69,8 @@ OUT_ROOT = os.path.join(BASE, "shotlist")
 INTERVAL_SEC = 30
 FULL_REFRESH_MIN = 30
 STATE_PATH = os.path.join(BASE, "backup_state.json")
+HELPER_PORT = _load_helper_port()
+TTM_HIST_DIR = os.path.join(OUT_ROOT, "靶类型映射_历史")
 
 # 内网直连，绕过系统代理（代理可能拦截内网/返回 502）
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -160,6 +172,65 @@ def try_export(sheet, state, pending):
         return False
 
 
+def backup_target_type(state):
+    """备份上报系统生效的靶类型映射表（xls 基表 + 手动覆盖合并后的最终版，
+    即上报时写进 A 机 target_type 列的那张表）。
+
+    - 每天一份最新快照：<OUT_ROOT>/<今天日期>/靶类型映射.json
+    - 每次内容变更追加一份历史版：<OUT_ROOT>/靶类型映射_历史/YYYYMMDD_HHMMSS.json
+    - 内容没变不重复写；上报页离线只提示一次，不影响表格备份。
+    成功/有变化返回 True（调用方据此落盘 state）。
+    """
+    url = "http://127.0.0.1:%d/api/targetmap" % HELPER_PORT
+    try:
+        with _opener.open(urllib.request.Request(
+                url, headers={"User-Agent": "sheet-backup"}),
+                timeout=10) as r:
+            data = json.load(r)
+    except Exception as e:
+        if not state.get("ttm_down"):
+            log("靶类型映射页(127.0.0.1:%d)不可达: %r（表格备份不受影响）"
+                % (HELPER_PORT, e))
+        state["ttm_down"] = True
+        return False
+    if not data.get("ok"):
+        return False
+    if state.pop("ttm_down", None):
+        log("靶类型映射页已恢复可达")
+    import hashlib
+    snap = {"saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "title": data.get("title"),
+            "map": data.get("map") or {},
+            "overrides": data.get("overrides") or {},
+            "layout": data.get("layout")}
+    h = hashlib.md5(json.dumps(snap, ensure_ascii=False, sort_keys=True,
+                               default=str).encode("utf-8")).hexdigest()
+    today = time.strftime("%Y-%m-%d")
+    force = state.get("ttm_day") != today      # 跨天即使没变也写当天快照
+    if h == state.get("ttm_hash") and not force:
+        return False
+    day_dir = os.path.join(OUT_ROOT, today)
+    os.makedirs(day_dir, exist_ok=True)
+    path = os.path.join(day_dir, "靶类型映射.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(snap, ensure_ascii=False, indent=1))
+    _swap_in(tmp, path)
+    if h != state.get("ttm_hash"):             # 内容真的变了才记历史版
+        os.makedirs(TTM_HIST_DIR, exist_ok=True)
+        hist = os.path.join(TTM_HIST_DIR,
+                            time.strftime("%Y%m%d_%H%M%S") + ".json")
+        with open(hist, "w", encoding="utf-8") as f:
+            f.write(json.dumps(snap, ensure_ascii=False, indent=1))
+        log("靶类型映射有变更，已备份: %s（%d 个靶位，历史版 %s）"
+            % (path, len(snap["map"]), os.path.basename(hist)))
+    else:
+        log("靶类型映射当日快照已更新: %s" % path)
+    state["ttm_hash"] = h
+    state["ttm_day"] = today
+    return True
+
+
 def main():
     log("备份目标: %s" % OUT_ROOT)
     log("A 机地址: %s (每 %ds 检查, 每 %dmin 全量重导)" %
@@ -167,6 +238,7 @@ def main():
     state = load_state()
     last_full = state.get("last_full", 0)
     pending = set(state.get("pending", []))  # 被占用/失败待补写的表 id
+    log("靶类型映射备份源: http://127.0.0.1:%d/api/targetmap" % HELPER_PORT)
     while True:
         try:
             sheets = json.loads(http_get("/api/sheets"))["sheets"]
@@ -195,6 +267,9 @@ def main():
                 changed = True  # 每轮都重试待补写表，状态持续落盘
             elif "pending" in state:
                 del state["pending"]
+                changed = True
+            # 3) 上报系统生效靶类型映射表备份（独立于 A 机，失败不影响上面）
+            if backup_target_type(state):
                 changed = True
             if changed:
                 save_state(state)
