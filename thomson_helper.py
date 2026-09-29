@@ -38,7 +38,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -163,10 +163,17 @@ def get_target_type_map(force=False):
         return m
 
 
-def lookup_target_type(pos):
+def lookup_target_type(pos, day=None):
+    """靶位 → 靶类型。优先读按日期绑定的当天表（target_types/<日期>.json）；
+    日报表机制异常时回退旧系统（手动覆盖 + xls 基表）。"""
     pos = str(pos or "").strip()
     if not pos:
         return ""
+    try:
+        dm = get_daily_target_map(day)
+        return str((dm.get("map") or {}).get(pos) or "")
+    except Exception as e:
+        log("日报表查询异常(回退旧映射): %r" % e)
     o = _ttm_overrides()
     if pos in o:                       # 手动修改优先（含清空 = 置空）
         return str(o[pos] or "")
@@ -282,17 +289,152 @@ def _save_ttm_overrides(o):
         return False
 
 
-def effective_target_map():
-    """自动(xls)映射 + 手动覆盖 合并后的生效映射"""
-    m = dict(get_target_type_map())
-    m.update(_ttm_overrides())
-    return m
+def effective_target_map(day=None):
+    """按日期绑定的当天靶类型表（页面编辑直接写入 target_types/<日期>.json）"""
+    try:
+        return dict(get_daily_target_map(day).get("map") or {})
+    except Exception:
+        m = dict(get_target_type_map())
+        m.update(_ttm_overrides())
+        return m
 
 
 def get_target_type_layout():
     """Sheet 版面（含合并区块），无则 None"""
     get_target_type_map()
     return TTM_STATE.get("layout")
+
+
+# ---------- 按日期绑定的靶类型表（每天一张，与当天日志表同日期） ----------
+# 存储：target_types\YYYY-MM-DD.json  {"date","title","map","seeded_from","updated"}
+# 规则：页面上编辑哪格 → 直接写入当天这份文件；上报时按发次日期读对应日期的表；
+#       当天文件不存在时自动播种（新 xls > 最近日报表 > 旧全局映射），不再回读旧表。
+TTM_DAILY_DIR = os.path.join(BASE, "target_types")
+_TTM_DAILY = {}          # day -> {"mtime":…, "data":…}
+
+
+def _ttm_day_str(day=None):
+    """'2026-09-29' / '20260929' / None(今天) → 'YYYY-MM-DD'"""
+    if not day:
+        return datetime.now().strftime("%Y-%m-%d")
+    s = str(day).strip()[:10].replace("/", "-").replace(".", "-")
+    if re.match(r"^\d{8}$", s):
+        s = "%s-%s-%s" % (s[:4], s[4:6], s[6:8])
+    return s
+
+
+def _ttm_daily_path(day):
+    return os.path.join(TTM_DAILY_DIR, _ttm_day_str(day) + ".json")
+
+
+def _seed_daily_map(day):
+    """当天表不存在时播种：
+    1) 已有历史日报表：配置目录里的 shotlist xls 比它新（新装盘日落盘）→ 用 xls
+       全表；否则沿用最近一天的日报表（靶没换接着用，相对 day 最多回看 14 天）；
+    2) 没有任何历史日报表（首次启用）→ 旧系统页面那张表（固化基表+手动覆盖）
+       原样接管，保证"页面上看到的"和"今天起生效的"是同一张。"""
+    day = _ttm_day_str(day)
+    prev, prev_day, prev_mt = None, None, 0.0
+    try:
+        d0 = datetime.strptime(day, "%Y-%m-%d")
+        for back in range(1, 15):
+            pd = (d0 - timedelta(days=back)).strftime("%Y-%m-%d")
+            p = _ttm_daily_path(pd)
+            if os.path.exists(p):
+                prev = json.load(open(p, encoding="utf-8"))
+                prev_day, prev_mt = pd, os.path.getmtime(p)
+                break
+    except Exception:
+        pass
+    if prev and prev.get("map"):
+        xls = _ttm_pick_xls(_ttm_cfg()[0])
+        xls_mt = 0.0
+        try:
+            if xls and os.path.exists(xls):
+                xls_mt = os.path.getmtime(xls)
+        except OSError:
+            pass
+        if xls_mt and xls_mt > prev_mt:          # 新装盘日的 xls 接管
+            m = dict(get_target_type_map(force=True))
+            if m:
+                return {"date": day,
+                        "title": prev.get("title") or _ttm_title(),
+                        "map": m,
+                        "seeded_from": "xls:" + os.path.basename(xls)}
+        return {"date": day, "title": prev.get("title", ""),
+                "map": dict(prev["map"]), "seeded_from": "daily:" + prev_day}
+    m = dict(get_target_type_map())
+    m.update(_ttm_overrides())
+    return {"date": day, "title": _ttm_title(), "map": m,
+            "seeded_from": "legacy"}
+
+
+def get_daily_target_map(day=None):
+    """取某天的靶类型表 dict（date/title/map/…）；文件不存在则播种并落盘。"""
+    day = _ttm_day_str(day)
+    with TTM_STATE["lock"]:
+        p = _ttm_daily_path(day)
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            mt = None
+        if mt is None:
+            data = _seed_daily_map(day)
+            _save_daily_map(day, data)
+            log("靶类型日报表已建立: %s（播种自 %s，%d 个靶位）"
+                % (day, data.get("seeded_from"), len(data.get("map") or {})))
+            return data
+        c = _TTM_DAILY.get(day)
+        if c and c.get("mtime") == mt and c.get("data") is not None:
+            return c["data"]
+        try:
+            data = json.load(open(p, encoding="utf-8"))
+        except Exception as e:
+            log("靶类型日报表读取失败 %s: %r" % (day, e))
+            data = {"date": day, "title": "", "map": {}}
+        _TTM_DAILY[day] = {"mtime": mt, "data": data}
+        return data
+
+
+def _save_daily_map(day, data):
+    """日报表落盘（JSON）+ 同步导出 CSV（utf-8-sig，Excel 可直接打开）。"""
+    day = _ttm_day_str(day)
+    try:
+        os.makedirs(TTM_DAILY_DIR, exist_ok=True)
+        data = dict(data)
+        data["date"] = day
+        data["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_ttm_daily_path(day), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        _TTM_DAILY.pop(day, None)          # 强制下次重载
+        _export_daily_csv(day, data)
+        return True
+    except Exception as e:
+        log("靶类型日报表保存失败 %s: %r" % (day, e))
+        return False
+
+
+def _export_daily_csv(day, data):
+    """同步导出 shotlist/<日期>/靶类型_<日期>.csv，便于 Excel 查看/存档"""
+    try:
+        outdir = os.path.join(BASE, "shotlist", day)
+        os.makedirs(outdir, exist_ok=True)
+
+        def keyf(k):
+            try:
+                a, b = str(k).split("-")
+                return (int(a), int(b))
+            except Exception:
+                return (9999, 9999)
+        lines = ["靶位,靶类型"]
+        for k in sorted((data.get("map") or {}).keys(), key=keyf):
+            v = str(data["map"].get(k) or "").replace(",", "，")
+            lines.append("%s,%s" % (k, v))
+        name = "靶类型_%s.csv" % day.replace("-", "")
+        with open(os.path.join(outdir, name), "w", encoding="utf-8-sig") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception as e:
+        log("靶类型CSV导出失败(忽略): %r" % e)
 
 
 STATE_PATH = os.path.join(BASE, "state_helper.json")
@@ -625,10 +767,9 @@ def api_shots_clear(mode):
             "left": len(STATE["shots"])}
 
 
-def api_targetmap_set(pos, ttype, positions=None):
-    """手动设置靶位的靶类型（覆盖 xls 自动映射）。
-    positions 为合并块内的全部靶位（一次保存整块）；type 为空或与自动映射
-    相同 → 删除覆盖（恢复自动值）。"""
+def api_targetmap_set(pos, ttype, positions=None, day=None):
+    """编辑靶类型 → 直接写入按日期绑定的当天表（target_types/<日期>.json）。
+    positions 为合并块内的全部靶位（一次保存整块）；type 为空 → 从当天表删除该格。"""
     if positions is None:
         positions = [pos] if pos else []
     if not isinstance(positions, list) or not positions:
@@ -645,47 +786,48 @@ def api_targetmap_set(pos, ttype, positions=None):
             pos_ok.append(p)
     if not pos_ok:
         return {"ok": False, "error": "靶位格式应为 行-列，如 2-2"}
+    day = _ttm_day_str(day)
     with TTM_STATE["lock"]:
-        o = _ttm_overrides()
+        dm = dict(get_daily_target_map(day))
+        m = dict(dm.get("map") or {})
         for p in pos_ok:
-            if not ttype or ttype == TTM_STATE["map"].get(p, ""):
-                o.pop(p, None)             # 恢复自动值
+            if ttype:
+                m[p] = ttype
             else:
-                o[p] = ttype               # 手动覆盖
-        ok = _save_ttm_overrides(o)
+                m.pop(p, None)             # 清空 = 从当天表删除
+        dm["map"] = m
+        ok = _save_daily_map(day, dm)
     if ok:
         bump_ver()                          # SSE 推送 → 页面 ttype 实时刷新
-        log("靶类型覆盖: %s = %s（%d 个靶位）"
-            % (",".join(pos_ok[:5]) + ("…" if len(pos_ok) > 5 else ""),
-               ttype or "（恢复自动）", len(pos_ok)))
-    return {"ok": ok, "type": ttype, "positions": pos_ok,
-            "effective": lookup_target_type(pos_ok[0])}
+        log("靶类型[%s]: %s = %s（%d 个靶位）"
+            % (day,
+               ",".join(pos_ok[:5]) + ("…" if len(pos_ok) > 5 else ""),
+               ttype or "（清空）", len(pos_ok)))
+    return {"ok": ok, "type": ttype, "positions": pos_ok, "date": day,
+            "effective": lookup_target_type(pos_ok[0], day)}
 
 
 def api_targetmap_solidify():
-    """以当前生效映射表为准，整体固化为基表（"页面上的表就是映射本体"）。
-    固化后：xls 旧表不再参与映射（除非出现比固化时间更新的 shotlist xls，
-    新装盘日自动让位）；页面上继续手改的格子仍然即时生效。"""
+    """以页面当前生效内容为准，整体另存为今天的日报表（target_types\今天.json）。
+    新架构下每次编辑都已直接写当天表，此按钮用于把旧系统(xls+覆盖)内容一次性抓进今天。"""
+    day = _ttm_day_str()
     with TTM_STATE["lock"]:
-        merged = dict(get_target_type_map())
-        merged.update(_ttm_overrides())
-        data = {"solidified_at": time.time(),
-                "solidified_str": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "title": _ttm_title(),
-                "map": merged}
+        dm = dict(get_daily_target_map(day))
+        merged = dict(dm.get("map") or {})
+        if not merged:                   # 当天表为空 → 抓旧系统内容兜底
+            merged = dict(get_target_type_map())
+            merged.update(_ttm_overrides())
+        dm["map"] = merged
+        if not dm.get("title"):
+            dm["title"] = _ttm_title()
         try:
-            json.dump(data, open(TTM_BASE_MANUAL_PATH, "w", encoding="utf-8"),
-                      ensure_ascii=False, indent=1)
+            ok = _save_daily_map(day, dm)
         except Exception as e:
-            log("固化基表写入失败: %r" % e)
+            log("日报表固化失败: %r" % e)
             return {"ok": False, "error": str(e)}
-        _TTM_BASE_MANUAL["mtime"] = None    # 强制下次重载
-        TTM_STATE["map"] = merged           # 立即生效（不等 60s 节流）
-        TTM_STATE["next_check"] = 0
     bump_ver()
-    log("靶类型映射已固化为基表：%d 个靶位（来源=页面当前表，xls 不再参与）"
-        % len(merged))
-    return {"ok": True, "count": len(merged)}
+    log("靶类型已固化为 %s 日报表：%d 个靶位" % (day, len(merged)))
+    return {"ok": ok, "count": len(merged), "date": day}
 
 
 def api_trash_act(p):
@@ -847,7 +989,8 @@ def report_shot(shot):
     fields = {"no": shot["no"]} if shot.get("no") is not None else {}
     if shot.get("target"):
         fields["target_pos"] = shot["target"]       # A 机表已有"靶位"列
-        tt = lookup_target_type(shot["target"])     # 靶位 → 靶类型（映射表）
+        tt = lookup_target_type(shot["target"],     # 按发次日期读当天靶类型表
+                                str(shot["shot_time"])[:10])
         if tt:
             fields["target_type"] = tt              # A 机表已有"靶类型"列
     if shot.get("defocus") != "":
@@ -1704,13 +1847,16 @@ function renderTmap(j){
            ? L.header_row : -1;
   var TTLOVR = j.title || "";
 
-  var h = "<div style='font-size:11px;color:#888;margin-bottom:6px'>版面复刻自 " +
-          tesc(L.sheet) + "：蓝格＝靶类型（合并大格＝同一靶块，改一处整块生效），" +
-          "白格＝靶位编号/待填，橙格＝手动覆盖过，清空＝恢复基表值；" +
-          "大标题（含日期）可直接点击修改" +
+  var h = "<div style='font-size:11px;color:#888;margin-bottom:6px'>" +
+          "本表绑定日期：<b style='color:#2c3e50'>" + tesc(j.date || "今天") +
+          "</b>（与当天日志表一致；编辑即存入 target_types\\" +
+          tesc(j.date || "") + ".json）<br>" +
+          "版面复刻自 " + tesc(L.sheet) +
+          "：蓝格＝靶类型（合并大格＝同一靶块，改一处整块生效），" +
+          "白格＝靶位编号/待填；大标题（含日期）可直接点击修改" +
           "<button onclick='solidifyTmap(this)' style='float:right;" +
           "font-size:11px;padding:2px 8px;cursor:pointer'>" +
-          "以当前表为准（固化基表）</button></div>" +
+          "以当前表为准（存为今天）</button></div>" +
           "<table style='border-collapse:collapse;font-size:12px;table-layout:fixed'>";
   if (L.ncols > 1){
     h += "<colgroup><col style='width:34px'>";
@@ -2187,10 +2333,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True, "trash": t},
                                        ensure_ascii=False))
         elif urlparse(self.path).path == "/api/targetmap":
+            day = _ttm_day_str()
+            dm = get_daily_target_map(day)
             self._send(200, json.dumps(
-                {"ok": True, "map": effective_target_map(),
-                 "overrides": _ttm_overrides(),
-                 "title": _ttm_title(),
+                {"ok": True, "date": day,
+                 "map": dm.get("map") or {},
+                 "overrides": {},               # 日报表即最终值，无覆盖层
+                 "title": dm.get("title") or "",
+                 "seeded_from": dm.get("seeded_from", ""),
                  "layout": get_target_type_layout()},
                 ensure_ascii=False))
         elif urlparse(self.path).path == "/export.xlsx":
@@ -2278,8 +2428,13 @@ class Handler(BaseHTTPRequestHandler):
         elif urlparse(self.path).path == "/api/targetmap_title":
             p = self._json_body()
             t = str(p.get("title") or "").strip()
+            day = _ttm_day_str()
+            with TTM_STATE["lock"]:
+                dm = dict(get_daily_target_map(day))
+                dm["title"] = t
+                ok = _save_daily_map(day, dm)
             self._send(200, json.dumps(
-                {"ok": _save_ttm_title(t), "title": t},
+                {"ok": ok, "title": t, "date": day},
                 ensure_ascii=False))
         elif urlparse(self.path).path == "/api/matchwindow":
             p = self._json_body()
