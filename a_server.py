@@ -413,7 +413,7 @@ PAGE = r"""<!DOCTYPE html>
 </div>
 <script>
 var S = {sheets: [], cur: null, page: 1, q: "", f: {}, ftimer: null,
-         sort: "", dir: "asc", timer: null, editing: false, checked: new Set()};
+         sort: "", dir: "desc", timer: null, editing: false, checked: new Set()};
 var COL_OPTS = {};
 /* 少用列默认隐藏（shotlist_cols.json 里 "hide": true 的列），
    工具栏「显示隐藏列」可临时展开；只影响页面显示，导出仍是全列 */
@@ -496,7 +496,7 @@ function renderSheets(){
       (s.exp_date ? " <span class='d'>" + esc(s.exp_date) + "</span>" : "") +
       "</span><span class='cnt'>" + s.count + "</span>";
     d.onclick = function(){ if (S.cur !== s.id){ S.cur = s.id; S.page = 1; S.q = "";
-      document.getElementById("q").value = ""; S.sort = ""; S.dir = "asc"; S.checked.clear();
+      document.getElementById("q").value = ""; S.sort = ""; S.dir = "desc"; S.checked.clear();
       renderSheets(); loadRows(); } };
     el.appendChild(d);
   });
@@ -593,7 +593,7 @@ function renderHead(){
     if (th.dataset.k === S.sort) th.innerHTML += "<span class='arr'>" + (S.dir==="asc"?"▲":"▼") + "</span>";
     th.onclick = function(){
       if (S.sort === th.dataset.k) S.dir = S.dir==="asc" ? "desc" : "asc";
-      else { S.sort = th.dataset.k; S.dir = "asc"; }
+      else { S.sort = th.dataset.k; S.dir = "desc"; }
       S.page = 1; S.checked.clear(); loadRows();
     };
   });
