@@ -1,5 +1,5 @@
 @echo off
-rem B-side data watcher (needs Python 3.8+)
+rem B机（数据机）启动实验数据监视器
 cd /d %~dp0
-py b_watcher.py
+python b_watcher.py
 pause

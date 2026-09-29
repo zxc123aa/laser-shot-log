@@ -366,12 +366,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="logo">打靶日志系统<small>BLAC 实验数据 · 内网</small></div>
   <div id="sheetlist"></div>
   <div class="foot">
-    <button class="fbtn orange" onclick="toggleNewSheet()">＋ 新建表格</button>
-    <div id="newrow" style="display:none;margin:6px 0">
-      <input id="ns_name" placeholder="表格名，如 2026-09-16" style="width:100%;box-sizing:border-box;padding:5px 6px;border:1px solid #d88;border-radius:6px;font-size:12px"
-             onkeydown="if(event.key==='Enter')createSheet()">
-      <button class="fbtn orange" style="width:100%;margin-top:4px" onclick="createSheet()">创建（回车也行）</button>
-    </div>
+    <button class="fbtn orange" onclick="newSheet()">＋ 新建表格</button>
     <button class="fbtn" onclick="openTrash()">回收站</button>
     <a class="fbtn" href="/export.xlsx" id="exportAll">导出全部 (xlsx)</a>
   </div>
@@ -392,8 +387,6 @@ PAGE = r"""<!DOCTYPE html>
     <button class="tbtn" onclick="doExport('xlsx')">导出 Excel</button>
     <button class="tbtn" onclick="doExport('csv')">导出 CSV</button>
     <button class="tbtn" onclick="window.print()" title="打印当前页表格">打印</button>
-    <button class="tbtn" id="hideBtn" onclick="toggleHidden()"
-            title="少用的列默认隐藏，点这里临时展开/收起">-</button>
     <span id="info"></span>
   </div>
   <div class="wrap" id="wrap"></div>
@@ -413,20 +406,8 @@ PAGE = r"""<!DOCTYPE html>
 </div>
 <script>
 var S = {sheets: [], cur: null, page: 1, q: "", f: {}, ftimer: null,
-         sort: "", dir: "desc", timer: null, editing: false, checked: new Set()};
+         sort: "", dir: "asc", timer: null, editing: false, checked: new Set()};
 var COL_OPTS = {};
-/* 少用列默认隐藏（shotlist_cols.json 里 "hide": true 的列），
-   工具栏「显示隐藏列」可临时展开；只影响页面显示，导出仍是全列 */
-var SHOW_ALL = false;
-function vcols(){ return SHOW_ALL ? COLS : COLS.filter(function(c){ return !c.hide; }); }
-function updateHideBtn(){
-  var n = COLS.filter(function(c){ return c.hide; }).length;
-  document.getElementById("hideBtn").textContent =
-    SHOW_ALL ? "收起少用列" : "显示隐藏列 (" + n + ")";
-}
-function toggleHidden(){
-  SHOW_ALL = !SHOW_ALL; updateHideBtn(); renderHead(); loadRows();
-}
 
 function toast(m){
   var t = document.createElement("div"); t.className = "toast"; t.textContent = m;
@@ -496,23 +477,17 @@ function renderSheets(){
       (s.exp_date ? " <span class='d'>" + esc(s.exp_date) + "</span>" : "") +
       "</span><span class='cnt'>" + s.count + "</span>";
     d.onclick = function(){ if (S.cur !== s.id){ S.cur = s.id; S.page = 1; S.q = "";
-      document.getElementById("q").value = ""; S.sort = ""; S.dir = "desc"; S.checked.clear();
+      document.getElementById("q").value = ""; S.sort = ""; S.dir = "asc"; S.checked.clear();
       renderSheets(); loadRows(); } };
     el.appendChild(d);
   });
 }
-function toggleNewSheet(){
-  var r = document.getElementById("newrow");
-  var show = r.style.display === "none";
-  r.style.display = show ? "block" : "none";
-  if (show){ var i = document.getElementById("ns_name"); i.value = todayStr(); i.focus(); i.select(); }
-}
-function createSheet(){
-  var name = document.getElementById("ns_name").value.trim();
-  if (!name){ toast("先填表格名"); return; }
-  api("/api/sheets", {name:name}, function(j){
-    document.getElementById("newrow").style.display = "none";
-    S.cur = j.id; S.checked.clear(); loadSheets(); toast("表格已创建: " + name);
+function newSheet(){
+  var name = prompt("新表格名称（建议用实验日期，如 2026-09-07）：", todayStr());
+  if (!name) return;
+  var note = prompt("备注（可空）：", "") || "";
+  api("/api/sheets", {name:name.trim(), note:note}, function(j){
+    S.cur = j.id; S.checked.clear(); loadSheets(); toast("表格已创建");
   });
 }
 function renameSheet(){
@@ -577,13 +552,12 @@ function loadRows(){
   });
 }
 function renderHead(){
-  var VC = vcols();
   var h = "<table><thead><tr><th class='ck'><input type=checkbox id=ckall></th><th data-k='shot_time'>时间</th>";
-  VC.forEach(function(c){ h += "<th data-k='" + c.key + "'>" + esc(c.name) + "</th>"; });
+  COLS.forEach(function(c){ h += "<th data-k='" + c.key + "'>" + esc(c.name) + "</th>"; });
   h += "<th data-k='machine'>来源</th><th data-k='file_count'>文件数</th><th data-k='first_file'>首个文件</th><th>操作</th></tr>";
   /* 列级筛选行 */
   h += "<tr class='frow'><th class='ck'></th>";
-  ["shot_time"].concat(VC.map(function(c){return c.key;})).concat(["machine","first_file"]).forEach(function(k){
+  ["shot_time"].concat(COLS.map(function(c){return c.key;})).concat(["machine","first_file"]).forEach(function(k){
     h += "<th class='fh'><input class='frin' data-f='" + k + "' placeholder='筛选' value='" +
          esc(S.f[k]||"") + "'></th>";
   });
@@ -593,7 +567,7 @@ function renderHead(){
     if (th.dataset.k === S.sort) th.innerHTML += "<span class='arr'>" + (S.dir==="asc"?"▲":"▼") + "</span>";
     th.onclick = function(){
       if (S.sort === th.dataset.k) S.dir = S.dir==="asc" ? "desc" : "asc";
-      else { S.sort = th.dataset.k; S.dir = "desc"; }
+      else { S.sort = th.dataset.k; S.dir = "asc"; }
       S.page = 1; S.checked.clear(); loadRows();
     };
   });
@@ -621,7 +595,7 @@ function renderHead(){
 }
 function renderRows(rows){
   var tb = document.getElementById("tb");
-  if (!rows.length){ tb.innerHTML = "<tr><td colspan=" + (vcols().length + 6) +
+  if (!rows.length){ tb.innerHTML = "<tr><td colspan=" + (COLS.length + 6) +
     " class='empty'>没有匹配的记录</td></tr>";
     var ck0 = document.getElementById("ckall");
     if (ck0){ ck0.checked = false; ck0.indeterminate = false; }
@@ -630,7 +604,7 @@ function renderRows(rows){
   rows.forEach(function(r){
     h += "<tr data-id='" + r.id + "' data-rev='" + (r.rev||1) + "'><td class='ck'><input type=checkbox></td>";
     h += "<td class='t ed' data-f='shot_time' data-ph='点击填写'>" + esc(r.shot_time) + "</td>";
-    vcols().forEach(function(c){
+    COLS.forEach(function(c){
       h += "<td class='ed' style='min-width:" + c.width + "px' data-f='" + c.key +
            "' data-ph='点击填写'>" + esc(r.fields[c.key] || "") + "</td>";
     });
@@ -670,7 +644,7 @@ function setCell(cell, v){
   else { rowQ[key] = []; task(); }
 }
 function bindEdit(){
-  var pitch = vcols().length + 1;   // 每行可编辑单元格数：时间 + 当前显示列
+  var pitch = COLS.length + 1;   // 每行可编辑单元格数：时间 + 全部列
   document.querySelectorAll("td.ed").forEach(function(td){
     td.addEventListener("click", function(){
       if (S.editing) return;
@@ -824,14 +798,6 @@ function loadAlerts(){
     var a = j.alerts[0];
     b.textContent = "⚠ [" + a.machine + "] " + a.message + "  (" + a.at + ")" +
                     (j.alerts.length > 1 ? "  —— 共 " + j.alerts.length + " 条告警" : "");
-    var btn = document.createElement("span");
-    btn.textContent = "  [清除告警]";
-    btn.style.cssText = "cursor:pointer;text-decoration:underline;margin-left:8px";
-    btn.onclick = function(){
-      if (!confirm("清除全部告警记录？")) return;
-      api("/api/alerts/clear", {}, function(){ toast("告警已清除"); loadAlerts(); });
-    };
-    b.appendChild(btn);
     b.className = a.level === "error" ? "" : "info";
     b.style.display = "block";
   }).catch(function(){});
@@ -873,7 +839,6 @@ connectSSE();
 /* ---------- 启动 ---------- */
 var COLS = __COLS__;
 COLS.forEach(function(c){ if (c.options) COL_OPTS[c.key] = c.options; });
-updateHideBtn();
 loadHash();
 loadSheets();
 loadAlerts();
@@ -964,7 +929,6 @@ class Handler(BaseHTTPRequestHandler):
             "/api/sheets/update": self.api_sheet_update,
             "/api/sheets/delete": self.api_sheet_delete,
             "/api/alert": self.api_alert,
-            "/api/alerts/clear": self.api_alerts_clear,
             "/api/trash/restore": self.api_trash_restore,
             "/api/trash/delete": self.api_trash_delete,
         }
@@ -1426,11 +1390,6 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps(
             {"ok": True, "alerts": Handler._alerts}, ensure_ascii=False),
             "application/json")
-
-    def api_alerts_clear(self):
-        with Handler._alerts_lock:
-            Handler._alerts.clear()
-        self._ok()
 
     # ---------- 导出 ----------
     def _export_rows(self, q):
