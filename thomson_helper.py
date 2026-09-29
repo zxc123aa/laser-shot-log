@@ -1775,6 +1775,56 @@ function renderTmap(j){
     h += "</tr>";
   }
   h += "</table>";
+  /* 版面外靶位：旧 xls 里这些槽位没有可编辑格 → 在此补输入框 */
+  var editablePos = {};
+  Object.keys(regionPos).forEach(function(k){
+    (regionPos[k] || []).forEach(function(p){ editablePos[p] = 1; });
+  });
+  var maxB = 0, maxP = 0;
+  function scanPos(pos){
+    var a = String(pos || "").split("-");
+    var b = parseInt(a[0], 10), p = parseInt(a[1], 10);
+    if (!isNaN(b) && !isNaN(p)){
+      if (b > maxB) maxB = b;
+      if (p > maxP) maxP = p;
+    }
+  }
+  Object.keys(j.map || {}).forEach(scanPos);
+  (L.labels || []).forEach(function(a){ scanPos(a[2]); });
+  if (maxB && maxP){
+    var byB = [], b, p, pos;
+    for (b = 1; b <= maxB; b++){
+      for (p = 1; p <= maxP; p++){
+        pos = b + "-" + p;
+        if (!editablePos[pos]) (byB[b] = byB[b] || []).push(pos);
+      }
+    }
+    var extraRows = "";
+    for (b = 1; b <= maxB; b++){
+      if (!byB[b]) continue;
+      extraRows += "<tr><th style='padding:2px 6px;color:#888;background:#f6f8fa;" +
+                   "border:1px solid #e6e8eb;white-space:nowrap'>" + b + " 块</th>";
+      byB[b].forEach(function(pos2){
+        var man2 = j.overrides && j.overrides.hasOwnProperty(pos2),
+            v3 = String((j.map && j.map[pos2]) || "");
+        extraRows += "<td style='border:1px solid #e6e8eb;padding:2px;" +
+                     "background:" + (man2 ? "#fdf0e4" : "#fff") + "'>" +
+                     "<div style='font-size:10px;color:" + (man2 ? "#d35400" : "#bbb") +
+                     ";line-height:1.1'>" + pos2 + (man2 ? " ✎" : "") + "</div>" +
+                     "<input class='tm' data-positions='" + pos2 + "' value='" +
+                     v3.replace(/'/g,"&#39;") +
+                     "' placeholder='靶类型' onfocus='this.select()' " +
+                     "onchange='saveTmapBlock(this)' style='width:64px'></td>";
+      });
+      extraRows += "</tr>";
+    }
+    if (extraRows){
+      h += "<div style='margin-top:10px;font-size:11px;color:#888'>以下靶位在原 xls 版面中" +
+           "没有格子（旧表这些槽位为空），在此填写同样生效、同样进自动备份：</div>" +
+           "<table style='border-collapse:collapse;font-size:12px;margin-top:4px'>" +
+           extraRows + "</table>";
+    }
+  }
   document.getElementById("tmapList").innerHTML = h;
 }
 /* 无版面数据时的兜底：平铺网格 */
