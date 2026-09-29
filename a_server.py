@@ -336,6 +336,17 @@ PAGE = r"""<!DOCTYPE html>
   .pager button:disabled{color:#bbb;cursor:default}
   .toast{position:fixed;top:18px;left:50%;transform:translateX(-50%);background:#2c3e50;color:#fff;
          padding:8px 22px;border-radius:20px;font-size:13px;z-index:99;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+  .col-panel{position:fixed;top:90px;right:20px;width:260px;max-height:70vh;overflow:auto;
+             background:#fff;border:1px solid #d5d9de;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.2);
+             z-index:60;padding:12px;font-size:13px;display:none}
+  .col-panel h4{margin:0 0 8px;font-size:14px}
+  .col-panel label{display:flex;align-items:center;padding:5px 2px;cursor:pointer;border-radius:4px}
+  .col-panel label:hover{background:#f2f7ff}
+  .col-panel input{margin-right:8px}
+  .col-panel .pbtns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+  .col-panel .pbtns button{flex:1;min-width:48px;padding:5px;border:1px solid #d5d9de;background:#fff;
+                           border-radius:4px;cursor:pointer;font-size:12px}
+  .col-panel .pbtns button.primary{background:#2c3e50;color:#fff;border-color:#2c3e50}
   #banner{background:#c0392b;color:#fff;padding:7px 20px;font-size:13px;display:none;white-space:pre-wrap}
   #banner.info{background:#d48806}
   .mask{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:50;display:none;
@@ -360,6 +371,7 @@ PAGE = r"""<!DOCTYPE html>
     table{width:100%;font-size:11px}
     th{background:#eee !important;color:#000 !important;position:static}
     .frow,th.ck,td.ck,td.op,th:last-child{display:none}
+    th.col-hidden,td.col-hidden{display:none !important}
   }
 </style>
 </head>
@@ -394,9 +406,19 @@ PAGE = r"""<!DOCTYPE html>
     <button class="tbtn" onclick="doExport('xlsx')">导出 Excel</button>
     <button class="tbtn" onclick="doExport('csv')">导出 CSV</button>
     <button class="tbtn" onclick="window.print()" title="打印当前页表格">打印</button>
-    <button class="tbtn" id="hideBtn" onclick="toggleHidden()"
-            title="少用的列默认隐藏，点这里临时展开/收起">-</button>
+    <button class="tbtn" id="hideBtn" onclick="toggleColPanel()"
+            title="选择显示或隐藏哪些列">列显隐</button>
     <span id="info"></span>
+  </div>
+  <div class="col-panel" id="colPanel">
+    <h4>显示/隐藏列</h4>
+    <div id="colList"></div>
+    <div class="pbtns">
+      <button onclick="setAllCols(true)">全选</button>
+      <button onclick="setAllCols(false)">全不选</button>
+      <button onclick="resetCols()">默认</button>
+      <button class="primary" onclick="toggleColPanel()">关闭</button>
+    </div>
   </div>
   <div class="wrap" id="wrap"></div>
   <div class="pager">
@@ -417,17 +439,74 @@ PAGE = r"""<!DOCTYPE html>
 var S = {sheets: [], cur: null, page: 1, q: "", f: {}, ftimer: null,
          sort: "", dir: "desc", timer: null, editing: false, checked: new Set()};
 var COL_OPTS = {};
-/* 少用列默认隐藏（shotlist_cols.json 里 "hide": true 的列），
-   工具栏「显示隐藏列」可临时展开；只影响页面显示，导出仍是全列 */
-var SHOW_ALL = false;
-function vcols(){ return SHOW_ALL ? COLS : COLS.filter(function(c){ return !c.hide; }); }
-function updateHideBtn(){
-  var n = COLS.filter(function(c){ return c.hide; }).length;
-  document.getElementById("hideBtn").textContent =
-    SHOW_ALL ? "收起少用列" : "显示隐藏列 (" + n + ")";
+/* 列显隐：用户可勾选显示/隐藏任意数据列；默认隐藏 shotlist_cols.json 里 "hide": true 的列。
+   状态保存在 localStorage 和 URL hash 里，刷新/分享链接都有效。只影响页面显示/打印，导出仍是全列。 */
+var HIDDEN = new Set();
+function dataCols(){
+  return [{key:"shot_time", name:"时间"}].concat(COLS).concat([
+    {key:"machine", name:"来源"},
+    {key:"file_count", name:"文件数"},
+    {key:"first_file", name:"首个文件"}
+  ]);
 }
-function toggleHidden(){
-  SHOW_ALL = !SHOW_ALL; updateHideBtn(); renderHead(); loadRows();
+function visibleCols(){ return dataCols().filter(function(c){ return !HIDDEN.has(c.key); }); }
+function editablePitch(){ return 1 + COLS.filter(function(c){ return !HIDDEN.has(c.key); }).length; }
+function defaultHidden(){
+  var d = new Set();
+  COLS.forEach(function(c){ if(c.hide) d.add(c.key); });
+  return d;
+}
+function loadHidden(){
+  var m = /hide=([^&]*)/.exec(location.hash);
+  if(m && m[1] !== ""){
+    HIDDEN = new Set(decodeURIComponent(m[1]).split(",").filter(Boolean));
+  } else {
+    var s = localStorage.getItem("lsl_hidden_cols");
+    if(s){
+      try{ HIDDEN = new Set(JSON.parse(s)); }catch(_){ HIDDEN = defaultHidden(); }
+    } else { HIDDEN = defaultHidden(); }
+  }
+}
+function saveHidden(){
+  localStorage.setItem("lsl_hidden_cols", JSON.stringify(Array.from(HIDDEN)));
+  saveHash();
+}
+function updateHideBtn(){
+  var n = HIDDEN.size, total = dataCols().length;
+  document.getElementById("hideBtn").textContent = "列显隐 (" + (total - n) + "/" + total + ")";
+}
+function buildColPanel(){
+  var el = document.getElementById("colList"); el.innerHTML = "";
+  dataCols().forEach(function(c){
+    var lb = document.createElement("label");
+    var chk = document.createElement("input");
+    chk.type = "checkbox"; chk.checked = !HIDDEN.has(c.key); chk.dataset.k = c.key;
+    chk.onchange = function(){
+      if(chk.checked) HIDDEN.delete(c.key); else HIDDEN.add(c.key);
+      if(visibleCols().length === 0){ HIDDEN.delete(c.key); chk.checked = true; toast("至少保留一列"); }
+      updateHideBtn(); renderHead(); loadRows(); saveHidden();
+    };
+    lb.appendChild(chk);
+    lb.appendChild(document.createTextNode(" " + c.name));
+    el.appendChild(lb);
+  });
+}
+function toggleColPanel(){
+  var p = document.getElementById("colPanel");
+  var show = p.style.display === "none" || p.style.display === "";
+  p.style.display = show ? "block" : "none";
+  if(show) buildColPanel();
+}
+function setAllCols(show){
+  if(show){ HIDDEN.clear(); }
+  else {
+    HIDDEN = new Set(dataCols().map(function(c){ return c.key; }));
+    var first = dataCols()[0]; if(first) HIDDEN.delete(first.key);
+  }
+  buildColPanel(); updateHideBtn(); renderHead(); loadRows(); saveHidden();
+}
+function resetCols(){
+  HIDDEN = defaultHidden(); buildColPanel(); updateHideBtn(); renderHead(); loadRows(); saveHidden();
 }
 
 function toast(m){
@@ -463,10 +542,12 @@ document.addEventListener("change", function(e){
 /* ---------- 状态持久化（URL hash）：刷新后回到原表格/页码/搜索/排序 ---------- */
 function saveHash(){
   var fkeys = Object.keys(S.f).filter(function(k){return S.f[k];});
+  var hide = Array.from(HIDDEN).join(",");
   var h = "#sheet=" + (S.cur||"") + "&page=" + S.page + "&q=" + encodeURIComponent(S.q) +
           "&sort=" + encodeURIComponent(S.sort) + "&dir=" + S.dir +
           "&f=" + encodeURIComponent(JSON.stringify(
-            fkeys.reduce(function(o,k){o[k]=S.f[k];return o;},{})));
+            fkeys.reduce(function(o,k){o[k]=S.f[k];return o;},{}))) +
+          (hide ? "&hide=" + encodeURIComponent(hide) : "");
   if (location.hash !== h) history.replaceState(null, "", h);
 }
 function loadHash(){
@@ -579,15 +660,15 @@ function loadRows(){
   });
 }
 function renderHead(){
-  var VC = vcols();
-  var h = "<table><thead><tr><th class='ck'><input type=checkbox id=ckall></th><th data-k='shot_time'>时间</th>";
+  var VC = visibleCols();
+  var h = "<table><thead><tr><th class='ck'><input type=checkbox id=ckall></th>";
   VC.forEach(function(c){ h += "<th data-k='" + c.key + "'>" + esc(c.name) + "</th>"; });
-  h += "<th data-k='machine'>来源</th><th data-k='file_count'>文件数</th><th data-k='first_file'>首个文件</th><th>操作</th></tr>";
+  h += "<th>操作</th></tr>";
   /* 列级筛选行 */
   h += "<tr class='frow'><th class='ck'></th>";
-  ["shot_time"].concat(VC.map(function(c){return c.key;})).concat(["machine","first_file"]).forEach(function(k){
-    h += "<th class='fh'><input class='frin' data-f='" + k + "' placeholder='筛选' value='" +
-         esc(S.f[k]||"") + "'></th>";
+  VC.forEach(function(c){
+    h += "<th class='fh'><input class='frin' data-f='" + c.key + "' placeholder='筛选' value='" +
+         esc(S.f[c.key]||"") + "'></th>";
   });
   h += "<th></th></tr></thead><tbody id=tb></tbody></table>";
   document.getElementById("wrap").innerHTML = h;
@@ -622,8 +703,9 @@ function renderHead(){
   };
 }
 function renderRows(rows){
+  var VC = visibleCols();
   var tb = document.getElementById("tb");
-  if (!rows.length){ tb.innerHTML = "<tr><td colspan=" + (vcols().length + 6) +
+  if (!rows.length){ tb.innerHTML = "<tr><td colspan=" + (VC.length + 2) +
     " class='empty'>没有匹配的记录</td></tr>";
     var ck0 = document.getElementById("ckall");
     if (ck0){ ck0.checked = false; ck0.indeterminate = false; }
@@ -631,13 +713,20 @@ function renderRows(rows){
   var h = "";
   rows.forEach(function(r){
     h += "<tr data-id='" + r.id + "' data-rev='" + (r.rev||1) + "'><td class='ck'><input type=checkbox></td>";
-    h += "<td class='t ed' data-f='shot_time' data-ph='点击填写'>" + esc(r.shot_time) + "</td>";
-    vcols().forEach(function(c){
-      h += "<td class='ed' style='min-width:" + c.width + "px' data-f='" + c.key +
-           "' data-ph='点击填写'>" + esc(r.fields[c.key] || "") + "</td>";
+    VC.forEach(function(c){
+      if(c.key === "shot_time"){
+        h += "<td class='t ed' data-f='shot_time' data-ph='点击填写'>" + esc(r.shot_time) + "</td>";
+      } else if(c.key === "machine"){
+        h += "<td>" + esc(r.machine || "-") + "</td>";
+      } else if(c.key === "file_count"){
+        h += "<td>" + (r.file_count||0) + "</td>";
+      } else if(c.key === "first_file"){
+        h += "<td class='t' title='" + esc(r.folder||"") + "'>" + esc(r.first_file || "-") + "</td>";
+      } else {
+        h += "<td class='ed' style='min-width:" + c.width + "px' data-f='" + c.key +
+             "' data-ph='点击填写'>" + esc(r.fields[c.key] || "") + "</td>";
+      }
     });
-    h += "<td>" + esc(r.machine || "-") + "</td><td>" + (r.file_count||0) + "</td>";
-    h += "<td class='t' title='" + esc(r.folder||"") + "'>" + esc(r.first_file || "-") + "</td>";
     h += "<td class='op'><button onclick=delRow(" + r.id + ")>删除</button></td></tr>";
   });
   tb.innerHTML = h;
@@ -672,7 +761,7 @@ function setCell(cell, v){
   else { rowQ[key] = []; task(); }
 }
 function bindEdit(){
-  var pitch = vcols().length + 1;   // 每行可编辑单元格数：时间 + 当前显示列
+  var pitch = editablePitch();   // 每行可编辑单元格数：时间 + 当前显示列
   document.querySelectorAll("td.ed").forEach(function(td){
     td.addEventListener("click", function(){
       if (S.editing) return;
@@ -875,6 +964,7 @@ connectSSE();
 /* ---------- 启动 ---------- */
 var COLS = __COLS__;
 COLS.forEach(function(c){ if (c.options) COL_OPTS[c.key] = c.options; });
+loadHidden();
 updateHideBtn();
 loadHash();
 loadSheets();
@@ -1082,7 +1172,7 @@ class Handler(BaseHTTPRequestHandler):
             if not k.startswith("f_"):
                 continue
             key, v = k[2:], vs[0].strip()
-            if v and (key in COL_KEYS or key in ("shot_time", "machine", "first_file")):
+            if v and (key in COL_KEYS or key in ("shot_time", "machine", "first_file", "file_count")):
                 col_filters.append((key, v))
 
         with _db_lock, db() as conn:
