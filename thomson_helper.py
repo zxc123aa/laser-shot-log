@@ -2305,8 +2305,11 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(energies, dict):
             energies = {}
         legacy = str(p.get("energy", "")).strip()      # 兼容旧客户端单 energy
+        # 外部程序（PyTPS 等）可用 field 指定能量列（tps_h/tps_c6…），
+        # 不带 field 时按旧约定落第一列（fiber_p_energy）
+        fld_in = str(p.get("field") or "").strip()
         if legacy and not str(energies.get(ekey0()) or "").strip():
-            energies[ekey0()] = legacy
+            energies[fld_in if fld_in in efield_keys() else ekey0()] = legacy
         energies = {str(k): str(v).strip() for k, v in energies.items()
                     if str(v).strip() and k in efield_keys()}
         with _state_lock:
@@ -2446,6 +2449,7 @@ class Handler(BaseHTTPRequestHandler):
                  "message": "helper 未找到含 %s 的发次（可能未监视该目录或发次尚未检测到）" % fn},
                 ensure_ascii=False))
         p = {"shot_time": shot["shot_time"], "energy": energy,
+             "field": str(p.get("field") or "").strip() or "tps_h",
              "create": False}
         log("远程能量上报: %s = %s（发次 %s）"
             % (fn, energy, shot.get("no") if shot.get("no") is not None
