@@ -29,6 +29,42 @@ from datetime import datetime
 import target_client
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+def _bypass_proxy_for_lan():
+    """实验室内网地址不走系统代理（http_proxy 是会话级动态端口，会把
+    10.0.23.x 内网请求拖死）。把 A 机/靶系统主机名加入 NO_PROXY。"""
+    from urllib.parse import urlparse as _up
+    hosts = {"127.0.0.1", "localhost"}
+    for cfg in ("config_b.local.json", "config_helper.json"):
+        p = os.path.join(BASE, cfg)
+        if not os.path.exists(p):
+            continue
+        try:
+            c = json.load(open(p, encoding="utf-8"))
+        except Exception:
+            continue
+        for key in ("server_url",):
+            u = c.get(key)
+            if u:
+                h = _up(str(u)).hostname
+                if h:
+                    hosts.add(h)
+        tm = c.get("target_monitor") or {}
+        for key in ("url", "server"):
+            u = tm.get(key)
+            if u:
+                h = _up(str(u)).hostname
+                if h:
+                    hosts.add(h)
+    cur = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    for h in sorted(hosts):
+        if h and h not in cur:
+            cur = (cur + "," + h) if cur else h
+    os.environ["NO_PROXY"] = cur
+    os.environ["no_proxy"] = cur
+
+
+_bypass_proxy_for_lan()
 CONFIG_PATH = os.path.join(BASE, "config_b.json")
 LOCAL_CONFIG_PATH = os.path.join(BASE, "config_b.local.json")  # 本机实际配置（不入库，优先于 config_b.json）
 STATE_PATH = os.path.join(BASE, "state_b.json")
@@ -87,6 +123,16 @@ def send_shot(server_url, payload, timeout=5):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    urllib.request.urlopen(req, timeout=timeout).read()
+
+
+def send_detect(helper_url, payload, timeout=5):
+    """confirm 模式：把检测到的发次送到本机上报系统（8767）"待确认"列表，
+    不直接写 A 机。实验人员在页面上点「确认上报」后才写入。"""
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        helper_url.rstrip("/") + "/api/detect", data=data,
+        headers={"Content-Type": "application/json"}, method="POST")
     urllib.request.urlopen(req, timeout=timeout).read()
 
 
@@ -161,7 +207,9 @@ def scan_once_status(watch_dirs):
 NO_PAT = re.compile(r"(?:shot|shor)[-_ ]?(\d+)", re.IGNORECASE)
 
 
-def make_payload(machine_name, group):
+def make_payload(machine_name, group, sheet_name=""):
+    """sheet_name: ""=A 机默认表(实时打靶); "@date"=按打靶日期自动分表;
+    其他=固定写入该表名的表（不存在 A 机自动创建）"""
     files = [{"name": os.path.basename(p),
               "folder": os.path.dirname(p),
               "mtime": mt} for p, mt in group]
@@ -178,9 +226,15 @@ def make_payload(machine_name, group):
             fields["target_defocus"] = str(d["defocus"])
     except Exception:
         pass  # 靶系统离线时不上靶位字段，不影响打靶上报
-    return {"machine": machine_name, "shot_time": shot_time,
-            "files": files, "fields": fields,
-            "reported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    sn = str(sheet_name or "").strip()
+    if sn == "@date":
+        sn = shot_time[:10]  # 打靶日期 -> 当天日期命名的表
+    payload = {"machine": machine_name, "shot_time": shot_time,
+               "files": files, "fields": fields,
+               "reported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    if sn:
+        payload["sheet_name"] = sn
+    return payload
 
 
 def config_mtime():
@@ -238,6 +292,12 @@ def main():
     machine_name = cfg.get("machine_name", socket.gethostname())
     interval = float(cfg.get("scan_interval_sec", 3))
     window = float(cfg.get("group_window_sec", 8))
+    # 上报目标表：""=默认"实时打靶"；"@date"=按打靶日期自动分表；其他=固定表名
+    sheet_name = str(cfg.get("sheet_name", "") or "").strip()
+    # 上报模式："direct"=检测到打靶直接上报 A 机（旧行为）；
+    # "confirm"=只送到本机 8767 上报系统待确认，人工点「确认上报」才写 A 机
+    report_mode = str(cfg.get("report_mode", "direct") or "direct").strip().lower()
+    helper_url = str(cfg.get("helper_url", "") or "http://127.0.0.1:8767").strip()
 
     seen = load_json(STATE_PATH, {})      # {路径: mtime}
     pend = load_json(PENDING_PATH, [])    # 已见但尚未归组上报的 [[路径, mtime], ...]
@@ -268,12 +328,15 @@ def main():
 
     while True:
         try:
-            # 1) 补发失败队列
+            # 1) 补发失败队列（按 dst 标记路由：helper=上报系统，a=A 机）
             if pending:
                 still = []
                 for pl in pending:
                     try:
-                        send_shot(server_url, pl)
+                        if pl.get("dst") == "helper":
+                            send_detect(helper_url, pl)
+                        else:
+                            send_shot(server_url, pl)
                         log("补发成功: %s" % pl.get("shot_time"))
                     except Exception:
                         still.append(pl)
@@ -302,6 +365,23 @@ def main():
             if mt != cfg_mtime:
                 cfg_mtime = mt
                 nc = load_json(LOCAL_CONFIG_PATH, None) or load_json(CONFIG_PATH, None)
+                if nc:
+                    # 上报目标表热更新
+                    ns = str(nc.get("sheet_name", "") or "").strip()
+                    if ns != sheet_name:
+                        sheet_name = ns
+                        log("配置热重载：上报目标表 -> %s"
+                            % (ns or "实时打靶(默认)"))
+                    # 上报模式热更新
+                    nmode = str(nc.get("report_mode", "direct") or "direct").strip().lower()
+                    if nmode != report_mode:
+                        report_mode = nmode
+                        log("配置热重载：上报模式 -> %s"
+                            % ("确认后上报（8767 页面点「确认上报」）"
+                               if nmode == "confirm" else "直接上报 A 机"))
+                    nhu = str(nc.get("helper_url", "") or "").strip()
+                    if nhu and nhu != helper_url:
+                        helper_url = nhu
                 if nc and nc.get("watch_dirs") and nc["watch_dirs"] != watch_dirs:
                     nd = [os.path.normpath(d) for d in nc["watch_dirs"] if d]
                     added = [d for d in nd if d not in watch_dirs]
@@ -342,15 +422,29 @@ def main():
                     save_json(STATE_PATH, seen)
                     save_json(PENDING_PATH, pend)
                     for g in done_groups:
-                        pl = make_payload(machine_name, g)
-                        try:
-                            send_shot(server_url, pl)
-                            log("已上报 1 次打靶: %s  (%d 个文件, 首=%s)"
-                                % (pl["shot_time"], len(g), g[0][0].split(os.sep)[-1]))
-                        except Exception as e:
-                            log("上报失败(%s)，已暂存队列" % e)
-                            pending.append(pl)
-                            save_json(QUEUE_PATH, pending)
+                        pl = make_payload(machine_name, g, sheet_name)
+                        if report_mode == "confirm":
+                            # 确认模式：不直接写 A 机，先送本机 8767 待确认
+                            pl["dst"] = "helper"
+                            try:
+                                send_detect(helper_url, pl)
+                                log("已送上报系统待确认: %s  (%d 个文件, 首=%s)"
+                                    % (pl["shot_time"], len(g),
+                                       g[0][0].split(os.sep)[-1]))
+                            except Exception as e:
+                                log("上报系统(8767)不可达(%r)，发次暂存队列" % e)
+                                pending.append(pl)
+                                save_json(QUEUE_PATH, pending)
+                        else:
+                            try:
+                                send_shot(server_url, pl)
+                                log("已上报 1 次打靶: %s  (%d 个文件, 首=%s)"
+                                    % (pl["shot_time"], len(g),
+                                       g[0][0].split(os.sep)[-1]))
+                            except Exception as e:
+                                log("上报失败(%s)，已暂存队列" % e)
+                                pending.append(pl)
+                                save_json(QUEUE_PATH, pending)
 
             time.sleep(interval)
         except KeyboardInterrupt:
