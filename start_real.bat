@@ -1,16 +1,18 @@
 @echo off
-rem 真实打靶模式启动：只开打靶监测 + 能量填报页，不开发次模拟器
-rem （模拟器只用于测试/演示，真实打靶时 TPS 谱仪自己往监视目录写图）
-title 打靶日志系统 B机 · 真实打靶模式
+rem Real-shot mode: b_watcher + thomson energy page + sheet auto-backup (no simulator)
+title laser-shot-log B-side - REAL mode
 cd /d %~dp0
 
-echo [1/2] 启动打靶监测 b_watcher...
-start "BWatcher" /min "C:\Users\CLAPA\.workbuddy\binaries\python\versions\3.13.12\python.exe" b_watcher.py
+echo [1/3] Starting b_watcher...
+start "BWatcher" /min py b_watcher.py
 
-echo [2/2] 启动能量填报页 (http://127.0.0.1:8767)...
-start "THelper" /min "C:\Users\CLAPA\.workbuddy\binaries\python\versions\3.13.12\python.exe" thomson_helper.py
+echo [2/3] Starting sheet auto-backup (shotlist\date\*.xlsx)...
+start "SheetBackup" /min py sheet_backup.py
+
+echo [3/3] Starting energy page (http://127.0.0.1:8767)...
+start "THelper" /min py thomson_helper.py
 
 echo.
-echo 已启动（真实打靶模式）：监测中 / 8767 能量页 / 未启动模拟器
-echo (本窗口可以关闭)
+echo Started (real mode): watcher / auto-backup / 8767 energy page
+echo (you can close this window)
 timeout /t 3 >nul

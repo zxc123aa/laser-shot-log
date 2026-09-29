@@ -55,7 +55,7 @@ A 机 a_server.py :8765（JSON API + SQLite）
 ## 部署步骤
 
 ### 只有一台电脑？（单机演示 / 单机部署）
-- **演示**：双击 `one_pc_test.bat`，A 机 + B 机在本机作为两个进程同时启动，
+- **演示**：双击 `test\one_pc_test.bat`，A 机 + B 机在本机作为两个进程同时启动，
   按提示按回车模拟打靶，浏览器自动打开 `http://127.0.0.1:8765/` 看日志实时出现；
 - **真实单机部署**：不跑演示脚本，同时双击 `start_a_server.bat` 和 `start_b_watcher.bat`，
   并把 `config_b.json` 的 `server_url` 写成 `http://127.0.0.1:8765`、
@@ -84,11 +84,12 @@ A 机 a_server.py :8765（JSON API + SQLite）
   被**静默登记**（记入 `state_b.json` 但不上报），只有之后新出现的文件才按打靶上报——
   避免把目录里的历史实验数据当成新打靶灌进日志。
 
-### 打靶模拟器（测试工具）
+### 打靶模拟器（测试工具，位于 `test\` 目录）
 
-`shot_simulator.py`：tkinter GUI，模拟谱仪按 `基础目录\年\日期` 落盘。
+`test\shot_simulator.py`（双击 `test\start_simulator.bat`）：tkinter GUI，模拟谱仪按
+`基础目录\年\日期` 落盘。
 点"打一发"即在当天日期目录生成 `TPS_shot-N_*.png`（发次号自动递增、持久化），
-支持每发多文件、自动连打（15s 间隔）。纯标准库，`python shot_simulator.py` 运行。
+支持每发多文件、自动连打（15s 间隔）。纯标准库运行。
 注意：相邻 ≤8 秒落盘的文件归为同一发，手动连点请间隔 8 秒以上。
 
 ### B 机扩展：汤姆逊谱仪能量上报（thomson_helper.py）
