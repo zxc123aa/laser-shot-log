@@ -276,98 +276,164 @@ PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <title>实验打靶日志系统</title>
 <style>
+  :root{
+    --ink-900:#0b1220; --ink-800:#101a2e;
+    --ink-line:rgba(148,178,255,.14);
+    --paper:#f5f4f0; --card:#ffffff;
+    --line-soft:#e9eaee; --line:#dfe2e7;
+    --text-1:#1a2233; --text-2:#5b6577; --text-3:#98a1b0;
+    --accent:#0e9db8; --accent-strong:#0b8399;
+    --beam-a:#22d3ee; --beam-b:#e879f9;
+    --danger:#d64545;
+    --ring:rgba(14,157,184,.30);
+    --shadow-1:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.08);
+    --shadow-2:0 4px 16px rgba(16,24,40,.10),0 2px 4px rgba(16,24,40,.06);
+    --mono:"Cascadia Code","JetBrains Mono","Sarasa Mono SC",Consolas,monospace;
+  }
   *{box-sizing:border-box}
-  body{font-family:"Microsoft YaHei",sans-serif;margin:0;background:#f0f2f5;color:#222;
-       display:flex;height:100vh;overflow:hidden}
+  body{font-family:"MiSans","HarmonyOS Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+       margin:0;color:var(--text-1);display:flex;height:100vh;overflow:hidden;
+       background:radial-gradient(1100px 480px at 88% -8%,rgba(14,157,184,.07),transparent 62%),var(--paper);
+       -webkit-font-smoothing:antialiased}
   /* ---------- 侧栏：表格列表 ---------- */
-  aside{width:225px;background:#243342;color:#dfe6ee;display:flex;flex-direction:column;flex-shrink:0}
-  .logo{padding:16px 16px 12px;font-size:16px;font-weight:bold;border-bottom:1px solid #31445a}
-  .logo small{display:block;font-weight:normal;color:#8fa4bb;font-size:11px;margin-top:3px}
-  #sheetlist{flex:1;overflow:auto;padding:8px 0}
-  .sitem{padding:9px 16px;cursor:pointer;font-size:13px;display:flex;justify-content:space-between;
-         align-items:center;border-left:3px solid transparent}
-  .sitem:hover{background:#2c3e50}
-  .sitem.on{background:#2c3e50;border-left-color:#e67e22;color:#fff}
-  .sitem .cnt{background:#3a4f66;border-radius:10px;padding:1px 8px;font-size:11px;color:#bcd0e4}
-  .sitem .d{color:#8fa4bb;font-size:11px;margin-left:6px}
-  aside .foot{padding:10px;border-top:1px solid #31445a}
-  .fbtn{display:block;width:100%;background:#2e4a68;color:#fff;border:none;border-radius:5px;
-        padding:8px;font-size:13px;margin-top:6px;cursor:pointer;text-align:center;text-decoration:none}
-  .fbtn:hover{background:#3a5a80}
-  .fbtn.orange{background:#d35400}
-  .fbtn.orange:hover{background:#e67e22}
+  aside{width:232px;background:linear-gradient(180deg,var(--ink-900),var(--ink-800) 55%,#0d1729);
+        color:#dbe4f0;display:flex;flex-direction:column;flex-shrink:0}
+  .logo{padding:20px 18px 14px;font-size:17px;font-weight:700;letter-spacing:.06em}
+  .logo small{display:block;font-weight:normal;color:#7f93b3;font-size:11px;margin-top:4px;letter-spacing:.02em}
+  .logo::after{content:"";display:block;height:2px;margin-top:12px;border-radius:2px;
+    background:linear-gradient(90deg,var(--beam-a),var(--beam-b) 62%,transparent);
+    box-shadow:0 0 10px rgba(34,211,238,.45)}
+  #sheetlist{flex:1;overflow:auto;padding:10px}
+  .sitem{padding:8px 12px;margin:2px 0;cursor:pointer;font-size:13px;border-radius:8px;
+         display:flex;justify-content:space-between;align-items:center;color:#b9c6da;
+         transition:background .12s,color .12s}
+  .sitem:hover{background:rgba(148,178,255,.09);color:#eaf0fa}
+  .sitem.on{color:#fff;box-shadow:inset 2.5px 0 0 var(--beam-a);
+            background:linear-gradient(90deg,rgba(34,211,238,.16),rgba(232,121,249,.06))}
+  .sitem .cnt{background:rgba(148,178,255,.13);border-radius:99px;padding:1px 8px;font-size:11px;color:#aebfd8}
+  .sitem .d{color:#7f93b3;font-size:11px;margin-left:6px}
+  aside .foot{padding:12px;border-top:1px solid var(--ink-line)}
+  .fbtn{display:block;width:100%;background:rgba(148,178,255,.10);color:#dbe4f0;
+        border:1px solid rgba(148,178,255,.16);border-radius:8px;
+        padding:8px;font-size:13px;margin-top:8px;cursor:pointer;text-align:center;text-decoration:none;
+        transition:background .12s,filter .12s}
+  .fbtn:hover{background:rgba(148,178,255,.18)}
+  .fbtn.orange{background:linear-gradient(135deg,#12a5be,#0b8399);border-color:transparent;
+               color:#fff;font-weight:600}
+  .fbtn.orange:hover{filter:brightness(1.1);background:linear-gradient(135deg,#12a5be,#0b8399)}
   /* ---------- 主区 ---------- */
   main{flex:1;display:flex;flex-direction:column;overflow:hidden}
-  #head{background:#fff;padding:12px 20px 10px;border-bottom:1px solid #e2e4e8}
-  #head h1{font-size:18px;margin:0;display:inline-block}
-  #head .meta{color:#888;font-size:12px;margin-left:12px}
-  #head button{background:none;border:1px solid #ccc;border-radius:4px;font-size:12px;
-               padding:2px 10px;cursor:pointer;color:#666;margin-left:8px}
-  .toolbar{background:#fff;padding:9px 20px;border-bottom:1px solid #e2e4e8;display:flex;
+  #head{background:var(--card);padding:14px 22px 12px;border-bottom:1px solid var(--line-soft);
+        box-shadow:var(--shadow-1);position:relative;z-index:4}
+  #head h1{font-size:19px;margin:0;display:inline-block;letter-spacing:.01em}
+  #head .meta{color:var(--text-3);font-size:12px;margin-left:12px;font-variant-numeric:tabular-nums}
+  #head button{background:none;border:1px solid var(--line);border-radius:6px;font-size:12px;
+               padding:3px 12px;cursor:pointer;color:var(--text-2);margin-left:10px;transition:all .12s}
+  #head button:hover{border-color:var(--accent);color:var(--accent-strong)}
+  .toolbar{background:var(--card);padding:10px 22px;border-bottom:1px solid var(--line-soft);display:flex;
            align-items:center;gap:8px;flex-wrap:wrap}
-  .toolbar input{padding:6px 10px;border:1px solid #d5d9de;border-radius:5px;width:230px;font-size:13px}
-  .toolbar select{padding:6px;border:1px solid #d5d9de;border-radius:5px;font-size:13px}
-  .tbtn{background:#2c3e50;color:#fff;border:none;border-radius:5px;padding:7px 14px;
-        font-size:13px;cursor:pointer}
-  .tbtn:hover{background:#3d5875}
-  .tbtn.red{background:#c0392b}
-  .tbtn.red:hover{background:#e74c3c}
-  .tbtn.green{background:#27ae60}
-  .tbtn.green:hover{background:#2ecc71}
-  #info{color:#888;font-size:12px;margin-left:auto}
-  .wrap{flex:1;overflow:auto;background:#fff;margin:0}
+  .toolbar input{padding:7px 12px;border:1px solid var(--line);border-radius:8px;width:240px;font-size:13px;
+                 background:#fbfcfd;transition:border-color .12s,box-shadow .12s}
+  .toolbar input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
+  .toolbar select{padding:7px;border:1px solid var(--line);border-radius:8px;font-size:13px;
+                  background:#fbfcfd;color:var(--text-1)}
+  .tbtn{background:transparent;color:var(--text-2);border:1px solid var(--line);border-radius:8px;
+        padding:7px 14px;font-size:13px;cursor:pointer;line-height:1;transition:all .12s}
+  .tbtn:hover{border-color:var(--accent);color:var(--accent-strong);background:rgba(14,157,184,.06)}
+  .tbtn.red{color:var(--danger);border-color:#f0c9c9}
+  .tbtn.red:hover{background:#fdf1f1;border-color:var(--danger);color:var(--danger)}
+  .tbtn.green{background:linear-gradient(135deg,#12a5be,#0b8399);color:#fff;border-color:transparent;
+              font-weight:600;box-shadow:0 1px 2px rgba(11,131,153,.35)}
+  .tbtn.green:hover{filter:brightness(1.1);color:#fff;background:linear-gradient(135deg,#12a5be,#0b8399)}
+  #info{color:var(--text-3);font-size:12px;margin-left:auto;font-variant-numeric:tabular-nums}
+  .wrap{flex:1;overflow:auto;background:var(--card);margin:14px 18px 0;border-radius:12px 12px 0 0;
+        border:1px solid var(--line-soft);border-bottom:none;box-shadow:var(--shadow-2)}
   table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;font-size:13px}
-  th{background:#2c3e50;color:#fff;padding:8px 10px;text-align:left;font-weight:normal;
-     white-space:nowrap;position:sticky;top:0;z-index:3;cursor:pointer;user-select:none}
-  th:hover{background:#3d5875}
-  th .arr{color:#e67e22;margin-left:3px}
+  th{background:#f2f4f7;color:var(--text-2);padding:9px 12px;text-align:left;font-weight:600;font-size:12px;
+     letter-spacing:.03em;white-space:nowrap;position:sticky;top:0;z-index:3;cursor:pointer;user-select:none;
+     border-bottom:1px solid var(--line)}
+  th:hover{color:var(--text-1);background:#eaeef3}
+  th .arr{color:var(--accent);margin-left:3px}
   th.fh{padding:4px 6px}
-  th.fh input{width:100%;box-sizing:border-box;padding:3px 6px;
-    border:1px solid #5a7a9a;border-radius:3px;font-size:11px;background:#3a5068;color:#fff}
-  th.fh input::placeholder{color:#9db4cc}
-  td{border-bottom:1px solid #eceef1;border-right:1px solid #f2f3f5;padding:6px 10px;
-     white-space:nowrap;vertical-align:middle}
-  tr:hover td{background:#f2f7ff}
-  .t{font-family:Consolas,monospace}
-  td.ed{cursor:text;position:relative;background:#fff}
-  td.ed:hover{background:#eef5ff;box-shadow:inset 0 0 0 1px #9fc3e8;z-index:1}
-  td.ed:empty::before{content:attr(data-ph);color:#c0c4cc}
+  th.fh input{width:100%;box-sizing:border-box;padding:4px 8px;
+    border:1px solid var(--line);border-radius:6px;font-size:11px;background:#fbfcfe;color:var(--text-1)}
+  th.fh input::placeholder{color:var(--text-3)}
+  td{border-bottom:1px solid #f0f1f4;border-right:1px solid #f5f6f8;padding:7px 12px;
+     white-space:nowrap;vertical-align:middle;transition:background .1s}
+  tr:hover td{background:#f2fafc}
+  .t{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12.5px}
+  td.ed{cursor:text;position:relative}
+  td.ed:hover{background:#e9f6f9;box-shadow:inset 0 0 0 1.5px var(--ring);z-index:1;border-radius:2px}
+  td.ed:empty::before{content:attr(data-ph);color:#c3c9d4}
   td.ed input{position:absolute;left:0;top:0;width:100%;height:100%;box-sizing:border-box;
-    border:none;outline:none;font:inherit;background:#fff8dc;padding:6px 10px;margin:0}
+    border:none;outline:none;font:inherit;background:#f2fbff;padding:7px 12px;margin:0;
+    box-shadow:inset 0 0 0 1.5px var(--accent)}
   td.ck{text-align:center;width:34px}
-  td.op button{background:none;border:none;color:#c0392b;cursor:pointer;font-size:12px}
-  .empty{padding:50px;text-align:center;color:#999}
-  .pager{background:#fff;border-top:1px solid #e2e4e8;padding:8px 20px;display:flex;
-         align-items:center;gap:12px;font-size:13px}
-  .pager button{padding:5px 14px;border:1px solid #d5d9de;background:#fff;border-radius:5px;
-                cursor:pointer;font-size:13px}
-  .pager button:disabled{color:#bbb;cursor:default}
-  .toast{position:fixed;top:18px;left:50%;transform:translateX(-50%);background:#2c3e50;color:#fff;
-         padding:8px 22px;border-radius:20px;font-size:13px;z-index:99;box-shadow:0 2px 8px rgba(0,0,0,.25)}
-  #banner{background:#c0392b;color:#fff;padding:7px 20px;font-size:13px;display:none;white-space:pre-wrap}
-  #banner.info{background:#d48806}
-  .mask{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:50;display:none;
-        align-items:center;justify-content:center}
-  .panel{background:#fff;border-radius:8px;width:860px;max-width:92vw;max-height:82vh;
-         display:flex;flex-direction:column;box-shadow:0 8px 30px rgba(0,0,0,.25)}
-  .panel .ph{padding:12px 18px;border-bottom:1px solid #e5e7ea;font-size:15px;display:flex;
+  td.op button{background:none;border:none;color:var(--danger);cursor:pointer;font-size:12px;border-radius:4px;padding:2px 6px}
+  td.op button:hover{background:#fdf1f1}
+  .empty{padding:56px 20px;text-align:center;color:var(--text-3);font-size:13px;letter-spacing:.04em}
+  .pager{padding:10px 22px 16px;display:flex;align-items:center;gap:12px;font-size:13px;color:var(--text-2)}
+  .pager button{padding:6px 16px;border:1px solid var(--line);background:var(--card);border-radius:8px;
+                cursor:pointer;font-size:13px;color:var(--text-2);transition:all .12s}
+  .pager button:hover:not(:disabled){border-color:var(--accent);color:var(--accent-strong)}
+  .pager button:disabled{color:#c3c9d4;cursor:default;opacity:.6}
+  .toast{position:fixed;top:18px;left:50%;transform:translateX(-50%);background:var(--ink-800);color:#eef3fa;
+         padding:9px 24px;border-radius:99px;font-size:13px;z-index:99;box-shadow:var(--shadow-2);
+         border:1px solid rgba(148,178,255,.20);animation:toastIn .18s ease-out}
+  @keyframes toastIn{from{opacity:0;transform:translate(-50%,-8px)}to{opacity:1;transform:translate(-50%,0)}}
+  .col-panel{position:fixed;top:92px;right:22px;width:264px;max-height:70vh;overflow:auto;
+             background:var(--card);border:1px solid var(--line-soft);border-radius:12px;box-shadow:var(--shadow-2);
+             z-index:60;padding:14px;font-size:13px;display:none;animation:toastIn .15s ease-out}
+  .col-panel h4{margin:0 0 8px;font-size:14px;font-weight:600}
+  .col-panel label{display:flex;align-items:center;padding:6px 4px;cursor:pointer;border-radius:6px;transition:background .1s}
+  .col-panel label:hover{background:#f0f8fa}
+  .col-panel input{margin-right:8px;accent-color:var(--accent)}
+  .col-panel .pbtns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+  .col-panel .pbtns button{flex:1;min-width:48px;padding:6px;border:1px solid var(--line);background:var(--card);
+                           border-radius:6px;cursor:pointer;font-size:12px;color:var(--text-2);transition:all .12s}
+  .col-panel .pbtns button:hover{border-color:var(--accent);color:var(--accent-strong)}
+  .col-panel .pbtns button.primary{background:linear-gradient(135deg,#12a5be,#0b8399);color:#fff;
+                                   border-color:transparent;font-weight:600}
+  .col-panel .pbtns button.primary:hover{filter:brightness(1.08);color:#fff}
+  #banner{background:#b3261e;color:#fff;padding:9px 22px;font-size:13px;display:none;white-space:pre-wrap}
+  #banner.info{background:#9a6700}
+  .mask{position:fixed;inset:0;background:rgba(9,14,25,.50);z-index:50;display:none;
+        align-items:center;justify-content:center;backdrop-filter:blur(2px)}
+  .panel{background:var(--card);border-radius:12px;width:860px;max-width:92vw;max-height:82vh;
+         display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(9,14,25,.30)}
+  .panel .ph{padding:14px 20px;border-bottom:1px solid var(--line-soft);font-size:15px;font-weight:600;display:flex;
              align-items:center}
   .panel .ph button{margin-left:auto}
   .panel .pb{overflow:auto;padding:0 0 10px}
   .panel table{border-collapse:collapse;width:100%;font-size:12px}
-  .panel th{background:#f2f4f6;padding:7px 10px;text-align:left;position:static}
-  .panel td{border-bottom:1px solid #eef0f2;padding:6px 10px;white-space:nowrap}
-  .panel .lk{color:#2471a3;cursor:pointer;margin-right:10px}
-  .panel .lk.red{color:#c0392b}
-  .panel .empty{padding:30px;text-align:center;color:#999}
+  .panel th{background:#f2f4f7;color:var(--text-2);padding:8px 12px;text-align:left;position:static;font-weight:600}
+  .panel td{border-bottom:1px solid #f0f1f4;padding:6px 12px;white-space:nowrap}
+  .panel .lk{color:var(--accent-strong);cursor:pointer;margin-right:10px;border-radius:4px}
+  .panel .lk:hover{text-decoration:underline}
+  .panel .lk.red{color:var(--danger)}
+  .panel .empty{padding:30px;text-align:center;color:var(--text-3)}
+  /* 焦点可见性（键盘可达） */
+  button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{
+    outline:2px solid var(--accent);outline-offset:1px}
+  /* 细滚动条 */
+  #sheetlist::-webkit-scrollbar,.wrap::-webkit-scrollbar,.panel .pb::-webkit-scrollbar,
+  .col-panel::-webkit-scrollbar{width:10px;height:10px}
+  #sheetlist::-webkit-scrollbar-thumb{background:rgba(148,178,255,.25);border-radius:8px;
+    border:3px solid transparent;background-clip:content-box}
+  .wrap::-webkit-scrollbar-thumb,.panel .pb::-webkit-scrollbar-thumb,.col-panel::-webkit-scrollbar-thumb{
+    background:rgba(120,140,170,.35);border-radius:8px;border:3px solid transparent;background-clip:content-box}
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none !important;transition:none !important}
+  }
   @media print{
     body{display:block;height:auto;overflow:visible;background:#fff}
-    aside,.toolbar,.pager,#banner,.mask,.toast{display:none !important}
-    #head{border:none;padding:4px 0}
-    .wrap{overflow:visible}
+    aside,.toolbar,.pager,#banner,.mask,.toast,.col-panel{display:none !important}
+    #head{border:none;padding:4px 0;box-shadow:none}
+    .wrap{margin:0;border:none;box-shadow:none;border-radius:0;overflow:visible}
     table{width:100%;font-size:11px}
     th{background:#eee !important;color:#000 !important;position:static}
     .frow,th.ck,td.ck,td.op,th:last-child{display:none}
+    th.col-hidden,td.col-hidden{display:none !important}
   }
 </style>
 </head>
@@ -402,9 +468,19 @@ PAGE = r"""<!DOCTYPE html>
     <button class="tbtn" onclick="doExport('xlsx')">导出 Excel</button>
     <button class="tbtn" onclick="doExport('csv')">导出 CSV</button>
     <button class="tbtn" onclick="window.print()" title="打印当前页表格">打印</button>
-    <button class="tbtn" id="hideBtn" onclick="toggleHidden()"
-            title="少用的列默认隐藏，点这里临时展开/收起">-</button>
+    <button class="tbtn" id="hideBtn" onclick="toggleColPanel()"
+            title="选择显示或隐藏哪些列">列显隐</button>
     <span id="info"></span>
+  </div>
+  <div class="col-panel" id="colPanel">
+    <h4>显示/隐藏列</h4>
+    <div id="colList"></div>
+    <div class="pbtns">
+      <button onclick="setAllCols(true)">全选</button>
+      <button onclick="setAllCols(false)">全不选</button>
+      <button onclick="resetCols()">默认</button>
+      <button class="primary" onclick="toggleColPanel()">关闭</button>
+    </div>
   </div>
   <div class="wrap" id="wrap"></div>
   <div class="pager">
@@ -425,17 +501,74 @@ PAGE = r"""<!DOCTYPE html>
 var S = {sheets: [], cur: null, page: 1, q: "", f: {}, ftimer: null,
          sort: "", dir: "desc", timer: null, editing: false, checked: new Set()};
 var COL_OPTS = {};
-/* 少用列默认隐藏（shotlist_cols.json 里 "hide": true 的列），
-   工具栏「显示隐藏列」可临时展开；只影响页面显示，导出仍是全列 */
-var SHOW_ALL = false;
-function vcols(){ return SHOW_ALL ? COLS : COLS.filter(function(c){ return !c.hide; }); }
-function updateHideBtn(){
-  var n = COLS.filter(function(c){ return c.hide; }).length;
-  document.getElementById("hideBtn").textContent =
-    SHOW_ALL ? "收起少用列" : "显示隐藏列 (" + n + ")";
+/* 列显隐：用户可勾选显示/隐藏任意数据列；默认隐藏 shotlist_cols.json 里 "hide": true 的列。
+   状态保存在 localStorage 和 URL hash 里，刷新/分享链接都有效。只影响页面显示/打印，导出仍是全列。 */
+var HIDDEN = new Set();
+function dataCols(){
+  return [{key:"shot_time", name:"时间"}].concat(COLS).concat([
+    {key:"machine", name:"来源"},
+    {key:"file_count", name:"文件数"},
+    {key:"first_file", name:"首个文件"}
+  ]);
 }
-function toggleHidden(){
-  SHOW_ALL = !SHOW_ALL; updateHideBtn(); renderHead(); loadRows();
+function visibleCols(){ return dataCols().filter(function(c){ return !HIDDEN.has(c.key); }); }
+function editablePitch(){ return 1 + COLS.filter(function(c){ return !HIDDEN.has(c.key); }).length; }
+function defaultHidden(){
+  var d = new Set();
+  COLS.forEach(function(c){ if(c.hide) d.add(c.key); });
+  return d;
+}
+function loadHidden(){
+  var m = /hide=([^&]*)/.exec(location.hash);
+  if(m && m[1] !== ""){
+    HIDDEN = new Set(decodeURIComponent(m[1]).split(",").filter(Boolean));
+  } else {
+    var s = localStorage.getItem("lsl_hidden_cols");
+    if(s){
+      try{ HIDDEN = new Set(JSON.parse(s)); }catch(_){ HIDDEN = defaultHidden(); }
+    } else { HIDDEN = defaultHidden(); }
+  }
+}
+function saveHidden(){
+  localStorage.setItem("lsl_hidden_cols", JSON.stringify(Array.from(HIDDEN)));
+  saveHash();
+}
+function updateHideBtn(){
+  var n = HIDDEN.size, total = dataCols().length;
+  document.getElementById("hideBtn").textContent = "列显隐 (" + (total - n) + "/" + total + ")";
+}
+function buildColPanel(){
+  var el = document.getElementById("colList"); el.innerHTML = "";
+  dataCols().forEach(function(c){
+    var lb = document.createElement("label");
+    var chk = document.createElement("input");
+    chk.type = "checkbox"; chk.checked = !HIDDEN.has(c.key); chk.dataset.k = c.key;
+    chk.onchange = function(){
+      if(chk.checked) HIDDEN.delete(c.key); else HIDDEN.add(c.key);
+      if(visibleCols().length === 0){ HIDDEN.delete(c.key); chk.checked = true; toast("至少保留一列"); }
+      updateHideBtn(); renderHead(); loadRows(); saveHidden();
+    };
+    lb.appendChild(chk);
+    lb.appendChild(document.createTextNode(" " + c.name));
+    el.appendChild(lb);
+  });
+}
+function toggleColPanel(){
+  var p = document.getElementById("colPanel");
+  var show = p.style.display === "none" || p.style.display === "";
+  p.style.display = show ? "block" : "none";
+  if(show) buildColPanel();
+}
+function setAllCols(show){
+  if(show){ HIDDEN.clear(); }
+  else {
+    HIDDEN = new Set(dataCols().map(function(c){ return c.key; }));
+    var first = dataCols()[0]; if(first) HIDDEN.delete(first.key);
+  }
+  buildColPanel(); updateHideBtn(); renderHead(); loadRows(); saveHidden();
+}
+function resetCols(){
+  HIDDEN = defaultHidden(); buildColPanel(); updateHideBtn(); renderHead(); loadRows(); saveHidden();
 }
 
 function toast(m){
@@ -471,10 +604,12 @@ document.addEventListener("change", function(e){
 /* ---------- 状态持久化（URL hash）：刷新后回到原表格/页码/搜索/排序 ---------- */
 function saveHash(){
   var fkeys = Object.keys(S.f).filter(function(k){return S.f[k];});
+  var hide = Array.from(HIDDEN).join(",");
   var h = "#sheet=" + (S.cur||"") + "&page=" + S.page + "&q=" + encodeURIComponent(S.q) +
           "&sort=" + encodeURIComponent(S.sort) + "&dir=" + S.dir +
           "&f=" + encodeURIComponent(JSON.stringify(
-            fkeys.reduce(function(o,k){o[k]=S.f[k];return o;},{})));
+            fkeys.reduce(function(o,k){o[k]=S.f[k];return o;},{}))) +
+          (hide ? "&hide=" + encodeURIComponent(hide) : "");
   if (location.hash !== h) history.replaceState(null, "", h);
 }
 function loadHash(){
@@ -587,15 +722,15 @@ function loadRows(){
   });
 }
 function renderHead(){
-  var VC = vcols();
-  var h = "<table><thead><tr><th class='ck'><input type=checkbox id=ckall></th><th data-k='shot_time'>时间</th>";
+  var VC = visibleCols();
+  var h = "<table><thead><tr><th class='ck'><input type=checkbox id=ckall></th>";
   VC.forEach(function(c){ h += "<th data-k='" + c.key + "'>" + esc(c.name) + "</th>"; });
-  h += "<th data-k='machine'>来源</th><th data-k='file_count'>文件数</th><th data-k='first_file'>首个文件</th><th>操作</th></tr>";
+  h += "<th>操作</th></tr>";
   /* 列级筛选行 */
   h += "<tr class='frow'><th class='ck'></th>";
-  ["shot_time"].concat(VC.map(function(c){return c.key;})).concat(["machine","first_file"]).forEach(function(k){
-    h += "<th class='fh'><input class='frin' data-f='" + k + "' placeholder='筛选' value='" +
-         esc(S.f[k]||"") + "'></th>";
+  VC.forEach(function(c){
+    h += "<th class='fh'><input class='frin' data-f='" + c.key + "' placeholder='筛选' value='" +
+         esc(S.f[c.key]||"") + "'></th>";
   });
   h += "<th></th></tr></thead><tbody id=tb></tbody></table>";
   document.getElementById("wrap").innerHTML = h;
@@ -630,8 +765,9 @@ function renderHead(){
   };
 }
 function renderRows(rows){
+  var VC = visibleCols();
   var tb = document.getElementById("tb");
-  if (!rows.length){ tb.innerHTML = "<tr><td colspan=" + (vcols().length + 6) +
+  if (!rows.length){ tb.innerHTML = "<tr><td colspan=" + (VC.length + 2) +
     " class='empty'>没有匹配的记录</td></tr>";
     var ck0 = document.getElementById("ckall");
     if (ck0){ ck0.checked = false; ck0.indeterminate = false; }
@@ -639,13 +775,20 @@ function renderRows(rows){
   var h = "";
   rows.forEach(function(r){
     h += "<tr data-id='" + r.id + "' data-rev='" + (r.rev||1) + "'><td class='ck'><input type=checkbox></td>";
-    h += "<td class='t ed' data-f='shot_time' data-ph='点击填写'>" + esc(r.shot_time) + "</td>";
-    vcols().forEach(function(c){
-      h += "<td class='ed' style='min-width:" + c.width + "px' data-f='" + c.key +
-           "' data-ph='点击填写'>" + esc(r.fields[c.key] || "") + "</td>";
+    VC.forEach(function(c){
+      if(c.key === "shot_time"){
+        h += "<td class='t ed' data-f='shot_time' data-ph='点击填写'>" + esc(r.shot_time) + "</td>";
+      } else if(c.key === "machine"){
+        h += "<td>" + esc(r.machine || "-") + "</td>";
+      } else if(c.key === "file_count"){
+        h += "<td>" + (r.file_count||0) + "</td>";
+      } else if(c.key === "first_file"){
+        h += "<td class='t' title='" + esc(r.folder||"") + "'>" + esc(r.first_file || "-") + "</td>";
+      } else {
+        h += "<td class='ed' style='min-width:" + c.width + "px' data-f='" + c.key +
+             "' data-ph='点击填写'>" + esc(r.fields[c.key] || "") + "</td>";
+      }
     });
-    h += "<td>" + esc(r.machine || "-") + "</td><td>" + (r.file_count||0) + "</td>";
-    h += "<td class='t' title='" + esc(r.folder||"") + "'>" + esc(r.first_file || "-") + "</td>";
     h += "<td class='op'><button onclick=delRow(" + r.id + ")>删除</button></td></tr>";
   });
   tb.innerHTML = h;
@@ -680,7 +823,7 @@ function setCell(cell, v){
   else { rowQ[key] = []; task(); }
 }
 function bindEdit(){
-  var pitch = vcols().length + 1;   // 每行可编辑单元格数：时间 + 当前显示列
+  var pitch = editablePitch();   // 每行可编辑单元格数：时间 + 当前显示列
   document.querySelectorAll("td.ed").forEach(function(td){
     td.addEventListener("click", function(){
       if (S.editing) return;
@@ -883,6 +1026,7 @@ connectSSE();
 /* ---------- 启动 ---------- */
 var COLS = __COLS__;
 COLS.forEach(function(c){ if (c.options) COL_OPTS[c.key] = c.options; });
+loadHidden();
 updateHideBtn();
 loadHash();
 loadSheets();
