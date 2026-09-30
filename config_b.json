@@ -9,7 +9,11 @@
   "group_window_sec": 8,
   "sheet_name": "@date",
   "watch_exts": [],
+  "report_mode": "direct",
+  "push_tif_timeline_to": "",
   "_watch_exts说明": "只监测这些后缀的文件并产生发次（如 [\".tif\", \".png\"] 只看图片）；留空/删掉此键 = 监测全部文件（旧行为）。改动后无需重启，约 1 秒内热生效。",
+  "_report_mode说明": "direct=检测到打靶直接上报 A 机；confirm=只送本机 8767 待确认，页面点「确认上报」才写 A 机；timeline=C机专用，只把文件时间表推给 B 机、本机永不建行（行由 B 机按 PNG mtime 建，C 机发次号无参考意义）。",
+  "_push_tif_timeline_to说明": "C机必填：B 机 helper 地址（如 http://10.0.23.157:8767）。把本机 tif 的 name+浮点mtime 推给 B 机 /api/tif_timeline，B 机才能用 tif 时间找到最近的 B 机 shot PNG 发次，从而把 PyTPS 的能量（只带文件名不带时间）绑对。留空 = 不推送（B 机自己不需要填）。",
   "_sheet_name说明": "上报写入的表格：\"@date\"=按打靶日期自动分表(如 2026-09-15，不存在自动创建)；填固定表名=永远写那张表；删掉此键=写默认\"实时打靶\"表。",
   "_说明": "本机实际部署请复制为 config_b.local.json（不会被 git 跟踪），watch_dirs 改成谱仪落盘真实目录，server_url 改成 A 机地址 http://<A机IP>:8765。config_b.local.json 存在时优先于本文件。"
 }

@@ -36,6 +36,26 @@ HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT") or 8765)  # 8765 被占用时可用 PORT=8766 启动
 DB_PATH = os.path.join(BASE, "shots.db")
 COLS_PATH = os.path.join(BASE, "shotlist_cols.json")
+
+# A 机侧账本：记录"谁在什么时候报了什么"。
+# 为什么 A 机也要记：PyTPS 可能**直发 A 机 /api/energy**（09-30 实测：B 机 helper
+# 零调用，但 A 机表有 77 条 tps_h）——这种情况下 A 机是唯一的记账点。
+# 与 B 机账本分目录（ledger_a/），B 机可通过 GET /api/ledger 拉回去对账。
+os.environ.setdefault("LSL_LEDGER_DIR", os.path.join(BASE, "ledger_a"))
+try:
+    import ledger as _ledger
+except Exception:
+    _ledger = None
+
+
+def aled(ev, day=None):
+    """写一条 A 机账本事件（静默失败，绝不影响入库主流程）。"""
+    if _ledger is None:
+        return
+    try:
+        _ledger.append(ev, day=day)
+    except Exception:
+        pass
 LIVE_SHEET = "实时打靶"          # B 机上报默认写入的表
 SHOT_MERGE_SEC = 15             # 同发次合并窗口：不同机器上报时间差在此内的视为同一发次，
                                 # 并入已有行（不新建），能量按"时间最近"才能命中正确行
@@ -1095,6 +1115,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.sse_events()
             elif url.path == "/api/trash":
                 self.api_trash()
+            elif url.path == "/api/ledger":
+                self.api_ledger(q)
+            elif url.path == "/api/ledger_stats":
+                self.api_ledger_stats(q)
             elif url.path == "/export.csv":
                 self.export_csv(q)
             elif url.path == "/export.xlsx":
@@ -1424,6 +1448,7 @@ class Handler(BaseHTTPRequestHandler):
         files_sorted = sorted(files, key=lambda f: f.get("mtime", 0))
         first = files_sorted[0] if files_sorted else {}
         first_name = first.get("name", "")
+        new_id, drev = None, None   # 建行/去重两条路径共用，供末尾统一返回
         with _db_lock, db() as conn:
             if p.get("sheet_id"):
                 sh = conn.execute("SELECT id FROM sheets WHERE id=?",
@@ -1467,14 +1492,30 @@ class Handler(BaseHTTPRequestHandler):
                           if v not in ("", None) and not flds.get(k)}
                 if merged:
                     flds.update(merged)
-                conn.execute(
+                nrow = conn.execute(
                     "UPDATE shots SET fields=?, file_count=file_count+?, "
                     "rev=COALESCE(rev,1)+1 WHERE id=?",
                     (json.dumps(flds, ensure_ascii=False), len(files), near["id"]))
-                self._ok(merged_into=near["id"], sheet_id=near["sheet_id"])
+                mrev = conn.execute("SELECT rev FROM shots WHERE id=?",
+                                    (near["id"],)).fetchone()
+                aled({"ev": "a_shot", "action": "merged",
+                      "id": near["id"],
+                      "rev": (mrev["rev"] if mrev else None),
+                      "merged_into": near["id"],
+                      "machine": machine, "shot_time": shot_time,
+                      "first_file": first_name, "file_count": len(files),
+                      "sheet_id": near["sheet_id"],
+                      "merged_fields": sorted(merged.keys()),
+                      "client_ip": self.client_address[0]},
+                     day=shot_time[:10] or None)
+                # id 一并返回：B 机要把它回写进 shot["row_id"] 和账本，
+                # 否则事后无法知道"这一发对应 A 机哪一行"（09-30 的坑）
+                self._ok(merged_into=near["id"], id=near["id"],
+                         rev=(mrev["rev"] if mrev else None),
+                         sheet_id=near["sheet_id"])
                 return
             if not dup:
-                conn.execute("""
+                cur = conn.execute("""
                     INSERT INTO shots
                     (shot_time, machine, file_count, first_file, folder,
                      fields, reported_at, created_at, sheet_id)
@@ -1484,6 +1525,16 @@ class Handler(BaseHTTPRequestHandler):
                      json.dumps(p.get("fields", {}), ensure_ascii=False),
                      p.get("reported_at", ""),
                      datetime.now().strftime("%Y-%m-%d %H:%M:%S"), sh["id"]))
+                new_id = cur.lastrowid
+                aled({"ev": "a_shot", "action": "insert", "id": new_id, "rev": 1,
+                      "machine": machine, "shot_time": shot_time,
+                      "first_file": first_name, "folder": first.get("folder", ""),
+                      "file_count": len(files), "sheet_id": sh["id"],
+                      "sheet_name": p.get("sheet_name", ""),
+                      "fields": p.get("fields", {}),
+                      "reported_at": p.get("reported_at", ""),
+                      "client_ip": self.client_address[0]},
+                     day=shot_time[:10] or None)
             else:
                 # 重复上报：字段合并——已存在的行里"空/缺失"的字段用新值补上
                 # （helper 与 b_watcher 都会上报同一次打靶，谁先到谁建行；
@@ -1500,7 +1551,19 @@ class Handler(BaseHTTPRequestHandler):
                         "UPDATE shots SET fields=?, rev=COALESCE(rev,1)+1 "
                         "WHERE id=?",
                         (json.dumps(flds, ensure_ascii=False), dup["id"]))
-        self._ok(duplicate=bool(dup))
+                drev = conn.execute("SELECT rev FROM shots WHERE id=?",
+                                    (dup["id"],)).fetchone()
+                new_id = dup["id"]
+                aled({"ev": "a_shot", "action": "duplicate", "id": dup["id"],
+                      "rev": (drev["rev"] if drev else None),
+                      "machine": machine, "shot_time": shot_time,
+                      "first_file": first_name, "file_count": len(files),
+                      "sheet_id": sh["id"],
+                      "merged_fields": sorted(merged.keys()),
+                      "client_ip": self.client_address[0]},
+                     day=shot_time[:10] or None)
+        self._ok(duplicate=bool(dup), id=new_id,
+                 rev=(drev["rev"] if (dup and drev) else 1))
 
     def api_energy(self):
         """汤姆逊谱仪能量上报绑定。
@@ -1514,6 +1577,14 @@ class Handler(BaseHTTPRequestHandler):
         p = self._json_body()
         st = norm_shot_time(p.get("shot_time"))
         energy = str(p.get("energy", "")).strip()
+        # ---- A 机账本：能量到达（原始 payload + 来源 IP）----
+        # PyTPS 若直发 A 机（09-30 实测即如此），这里是唯一的记账点：
+        # 没有这条记录，事后就无法回答"这个能量是谁、什么时候、报给哪一行的"。
+        aled({"ev": "a_energy_in", "payload": p,
+              "client_ip": self.client_address[0],
+              "shot_time": st, "energy": energy,
+              "field": p.get("field") or "fiber_p_energy"},
+             day=str(st)[:10] or None)
         if not energy:
             return self._err("能量值不能为空")
         field = p.get("field") or "fiber_p_energy"
@@ -1549,10 +1620,27 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "时间最近行 No.%s 与上报 No.%d 不一致，"
                                    "已按行写入能量、未改动行号"
                                    % (flds.get("no"), shot_no)}
+                rrow = conn.execute("SELECT rev, machine, first_file, file_count "
+                                    "FROM shots WHERE id=?", (best["id"],)).fetchone()
+                newrev = rrow["rev"] if rrow else None
+                # ---- A 机账本：能量绑定结果（命中哪行、差几秒、按时间还是按No.）----
+                aled({"ev": "a_energy_bind", "row_id": best["id"],
+                      "rev": newrev, "field": field, "energy": energy,
+                      "matched_time": best["shot_time"],
+                      "diff_sec": round(abs(d.total_seconds()), 3),
+                      "by_no": by_no, "shot_no_sent": shot_no,
+                      "row_no": flds.get("no"),
+                      "row_machine": (rrow["machine"] if rrow else ""),
+                      "row_first_file": (rrow["first_file"] if rrow else ""),
+                      "row_file_count": (rrow["file_count"] if rrow else None),
+                      "no_mismatch": bool(extra.get("no_mismatch")),
+                      "window_sec": window,
+                      "client_ip": self.client_address[0]},
+                     day=str(best["shot_time"])[:10] or None)
                 return self._ok(matched=best["id"],
                                 matched_time=best["shot_time"],
                                 diff_sec=abs(d.total_seconds()),
-                                sheet_id=best["sheet_id"],
+                                sheet_id=best["sheet_id"], rev=newrev,
                                 field=field, energy=energy, **extra)
 
             # 1) 时间窗内最近行（TPS No 可能断号错位，时间是最可靠锚点）
@@ -1581,6 +1669,13 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT id, shot_time, machine FROM shots "
                 "ORDER BY ABS(julianday(shot_time) - julianday(?)) LIMIT 1",
                 (st,)).fetchone()
+            # ---- A 机账本：能量未命中（这条能量没绑上任何行，必须留痕）----
+            aled({"ev": "a_energy_nomatch", "shot_time": st, "energy": energy,
+                  "field": field, "shot_no_sent": shot_no,
+                  "window_sec": window,
+                  "nearest": dict(near) if near else None,
+                  "client_ip": self.client_address[0]},
+                 day=str(st)[:10] or None)
             return self._send(200, json.dumps(
                 {"ok": False, "error": "no_match", "window_sec": window,
                  "nearest": dict(near) if near else None,
@@ -1611,6 +1706,51 @@ class Handler(BaseHTTPRequestHandler):
         with Handler._alerts_lock:
             Handler._alerts.clear()
         self._ok()
+
+    # ---------- A 机账本（供 B 机拉取回灌对账） ----------
+    def api_ledger(self, q):
+        """GET /api/ledger?day=YYYY-MM-DD&ev=a_energy_in&since=...&limit=N
+
+        把 A 机侧账本吐给 B 机。为什么需要：PyTPS 可能直发 A 机 /api/energy，
+        B 机根本不知道这条能量存在过（09-30 的 77 条 tps_h 就是这么"凭空"出现的）。
+        B 机定期拉这个接口，就能把 A 机收到的能量回灌进自己的账本，
+        重建时两边才对得齐。只读，不改任何数据。"""
+        if _ledger is None:
+            return self._send(200, json.dumps(
+                {"ok": False, "error": "ledger 模块不可用"},
+                ensure_ascii=False), "application/json")
+        day = (q.get("day") or [datetime.now().strftime("%Y-%m-%d")])[0]
+        want_ev = {e for e in (q.get("ev") or [""])[0].split(",") if e}
+        since = (q.get("since") or [""])[0].strip()
+        try:
+            limit = int((q.get("limit") or ["20000"])[0])
+        except (TypeError, ValueError):
+            limit = 20000
+        evs, bad = _ledger.read_day(day)
+        out = []
+        for e in evs:
+            if want_ev and str(e.get("ev", "")) not in want_ev:
+                continue
+            if since and str(e.get("iso", "")) < since:
+                continue
+            out.append(e)
+            if len(out) >= limit:
+                break
+        self._send(200, json.dumps(
+            {"ok": True, "day": day, "count": len(out), "bad_lines": bad,
+             "host": os.environ.get("LSL_LEDGER_DIR", ""), "lines": out},
+            ensure_ascii=False), "application/json")
+
+    def api_ledger_stats(self, q):
+        """GET /api/ledger_stats?day=... —— A 机账本体检（只读）。"""
+        if _ledger is None:
+            return self._send(200, json.dumps(
+                {"ok": False, "error": "ledger 模块不可用"},
+                ensure_ascii=False), "application/json")
+        day = (q.get("day") or [datetime.now().strftime("%Y-%m-%d")])[0]
+        self._send(200, json.dumps(
+            dict(_ledger.stats(day), ok=True, days=_ledger.iter_days()),
+            ensure_ascii=False), "application/json")
 
     # ---------- 导出 ----------
     def _export_rows(self, q):

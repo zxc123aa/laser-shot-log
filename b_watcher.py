@@ -28,6 +28,22 @@ from datetime import datetime
 
 import target_client
 
+try:
+    import ledger          # 本地账本（灾后重建的唯一真源），见 ledger.py
+except Exception:          # 账本模块缺失/损坏也绝不能影响打靶主流程
+    ledger = None
+
+
+def led(ev, day=None):
+    """写一条账本事件（静默失败）。所有埋点统一走这里。"""
+    if ledger is None:
+        return
+    try:
+        ledger.append(ev, day=day)
+    except Exception:
+        pass
+
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 def _bypass_proxy_for_lan():
@@ -90,6 +106,12 @@ def save_json(path, data):
 
 def log(msg):
     print("[%s] %s" % (datetime.now().strftime("%H:%M:%S"), msg), flush=True)
+    # 落盘（原来只 print，关窗即失）→ logs/b_watcher_日期.log
+    if ledger is not None:
+        try:
+            ledger.log_line("b_watcher", msg)
+        except Exception:
+            pass
 
 
 def group_into_shots(entries, window):
@@ -167,6 +189,48 @@ def send_alert(server_url, machine_name, level, message, timeout=5):
         urllib.request.urlopen(req, timeout=timeout).read()
     except Exception:
         pass  # 告警通道失败不阻塞扫描
+
+
+def send_tif_timeline(b_helper_url, machine_name, payload, timeout=4):
+    """C 机角色：把本组 tif 的时间表（name + 浮点 mtime + folder）推给 B 机 helper。
+
+    为什么必须有这一步：PyTPS 报能量时只给 {"filename":"shor_79.tif","energy":"19.23"}，
+    **不带任何时间戳**；而 B 机监视的是 shotNN.PNG，两边文件名对不上。
+    B 机只有拿到 tif 的 mtime，才能用"哪个 B机 PNG 发次时间最近"来定位这一发
+    （唯一时间基准 = B机 PNG mtime）。
+
+    失败只记日志、绝不抛出——推时间表失败不能拖垮 C 机自己的扫描/上报。"""
+    try:
+        files = [{"name": f.get("name", ""),
+                  "folder": f.get("folder", ""),
+                  "mtime": f.get("mtime", 0)}
+                 for f in (payload.get("files") or [])]
+        if not files:
+            return False
+        body = {"machine": machine_name,
+                "day": str(payload.get("shot_time", ""))[:10],
+                "files": files}
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            b_helper_url.rstrip("/") + "/api/tif_timeline", data=data,
+            headers={"Content-Type": "application/json"}, method="POST")
+        r = json.loads(urllib.request.urlopen(req, timeout=timeout)
+                       .read().decode("utf-8"))
+        led({"ev": "tif_push", "to": b_helper_url, "machine": machine_name,
+             "day": body["day"], "count": len(files), "files": files,
+             "ok": bool(r.get("ok")), "bound_now": r.get("bound_now"),
+             "resp": r}, day=body["day"] or None)
+        log("已推 tif 时间表给 B 机: %d 条（%s）%s"
+            % (len(files), body["day"],
+               "，顺带补绑 %s 条暂存能量" % r.get("bound_now")
+               if r.get("bound_now") else ""))
+        return True
+    except Exception as e:
+        log("推 tif 时间表失败(%r)——不影响本机扫描，B 机将只能按 A 机时间窗匹配" % e)
+        led({"ev": "tif_push", "to": b_helper_url, "machine": machine_name,
+             "ok": False, "err": repr(e)},
+            day=str(payload.get("shot_time", ""))[:10] or None)
+        return False
 
 
 # 目录扫描缓存（与 thomson_helper 同款）：{目录: (目录mtime, [(文件路径, mtime), ...], [子目录路径, ...])}
@@ -386,6 +450,12 @@ def make_payload(machine_name, group, sheet_name=""):
                "reported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     if sn:
         payload["sheet_name"] = sn
+    # ---- 账本：b_watcher 侧发次（带 folder + 浮点 mtime，这是 helper 侧丢掉的明细）----
+    led({"ev": "shot_group_w", "shot_time": shot_time, "machine": machine_name,
+         "no": fields.get("no"), "target_pos": fields.get("target_pos", ""),
+         "target_defocus": fields.get("target_defocus", ""),
+         "sheet_name": sn, "file_count": len(files), "files": files},
+        day=shot_time[:10] or None)
     return payload
 
 
@@ -448,8 +518,12 @@ def main():
     sheet_name = str(cfg.get("sheet_name", "") or "").strip()
     # 上报模式："direct"=检测到打靶直接上报 A 机（旧行为）；
     # "confirm"=只送到本机 8767 上报系统待确认，人工点「确认上报」才写 A 机
+    # "timeline"=**C机专用**：只把文件时间表推给 B 机，本机永不向 A 机建行
+    #            （行由 B 机按 PNG mtime 建；C 机发次号无参考意义）
     report_mode = str(cfg.get("report_mode", "direct") or "direct").strip().lower()
     helper_url = str(cfg.get("helper_url", "") or "http://127.0.0.1:8767").strip()
+    # C机把 tif 时间表推给哪台 B 机 helper（空 = 不推，保持旧行为）
+    tif_push_url = str(cfg.get("push_tif_timeline_to", "") or "").strip()
     # 靶类型映射 → A 机日志 自动对账周期（秒），0 = 关闭
     recon_sec = float(cfg.get("map_reconcile_sec", 90) or 0)
     # 只监测的文件后缀（如 [".tif", ".png"]）；为空 = 全部文件（旧行为）
@@ -466,6 +540,11 @@ def main():
     log("监测文件类型: %s"
         % (", ".join(sorted(_SCAN_EXTS)) if _SCAN_EXTS else "全部文件"))
     log("上报地址: %s  (本机名: %s)" % (server_url, machine_name))
+    log("上报模式: %s%s" % (
+        {"confirm": "确认后上报（8767 页面点「确认上报」）",
+         "timeline": "timeline（C机：只推时间表给 B 机，不建行）"}.get(
+            report_mode, "直接上报 A 机"),
+        "；tif 时间表推送 -> %s" % tif_push_url if tif_push_url else ""))
 
     first_run = not os.path.exists(STATE_PATH)
 
@@ -541,6 +620,12 @@ def main():
                     nhu = str(nc.get("helper_url", "") or "").strip()
                     if nhu and nhu != helper_url:
                         helper_url = nhu
+                    # C机 tif 时间表推送目标热更新（置空 = 关闭推送）
+                    ntp = str(nc.get("push_tif_timeline_to", "") or "").strip()
+                    if ntp != tif_push_url:
+                        tif_push_url = ntp
+                        log("配置热重载：tif 时间表推送 -> %s"
+                            % (ntp or "关闭"))
                     # 监测文件类型热更新
                     n_exts = {str(e).strip().lower()
                               for e in (nc.get("watch_exts") or [])
@@ -600,7 +685,17 @@ def main():
                     save_json(PENDING_PATH, pend)
                     for g in done_groups:
                         pl = make_payload(machine_name, g, sheet_name)
-                        if report_mode == "confirm":
+                        # ---- C机角色：把本组 tif 时间表推给 B 机（集中匹配）----
+                        # PyTPS 的能量只带 tif 文件名不带时间；B 机拿到 tif 的
+                        # 浮点 mtime 后才能"找时间最近的 B机 shot PNG 发次"。
+                        # 失败只记日志，绝不阻塞上报主流程。
+                        if tif_push_url:
+                            send_tif_timeline(tif_push_url, machine_name, pl)
+                        if report_mode == "timeline":
+                            # C机专用：时间表已推，本机不向 A 机建行、不送待确认
+                            log("timeline 模式：只推时间表，不建行: %s (%d 个文件)"
+                                % (pl["shot_time"], len(g)))
+                        elif report_mode == "confirm":
                             # 确认模式：不直接写 A 机，先送本机 8767 待确认
                             pl["dst"] = "helper"
                             try:
@@ -608,20 +703,42 @@ def main():
                                 log("已送上报系统待确认: %s  (%d 个文件, 首=%s)"
                                     % (pl["shot_time"], len(g),
                                        g[0][0].split(os.sep)[-1]))
+                                led({"ev": "report_send", "dst": "helper",
+                                     "shot_time": pl["shot_time"],
+                                     "first_file": (pl.get("files") or [{}])[0].get("name"),
+                                     "file_count": len(g), "ok": True, "err": ""},
+                                    day=pl["shot_time"][:10] or None)
                             except Exception as e:
                                 log("上报系统(8767)不可达(%r)，发次暂存队列" % e)
                                 pending.append(pl)
                                 save_json(QUEUE_PATH, pending)
+                                led({"ev": "report_send", "dst": "helper",
+                                     "shot_time": pl["shot_time"],
+                                     "first_file": (pl.get("files") or [{}])[0].get("name"),
+                                     "file_count": len(g), "ok": False,
+                                     "err": repr(e), "queued": True},
+                                    day=pl["shot_time"][:10] or None)
                         else:
                             try:
                                 send_shot(server_url, pl)
                                 log("已上报 1 次打靶: %s  (%d 个文件, 首=%s)"
                                     % (pl["shot_time"], len(g),
                                        g[0][0].split(os.sep)[-1]))
+                                led({"ev": "report_send", "dst": "a",
+                                     "shot_time": pl["shot_time"],
+                                     "first_file": (pl.get("files") or [{}])[0].get("name"),
+                                     "file_count": len(g), "ok": True, "err": ""},
+                                    day=pl["shot_time"][:10] or None)
                             except Exception as e:
                                 log("上报失败(%s)，已暂存队列" % e)
                                 pending.append(pl)
                                 save_json(QUEUE_PATH, pending)
+                                led({"ev": "report_send", "dst": "a",
+                                     "shot_time": pl["shot_time"],
+                                     "first_file": (pl.get("files") or [{}])[0].get("name"),
+                                     "file_count": len(g), "ok": False,
+                                     "err": repr(e), "queued": True},
+                                    day=pl["shot_time"][:10] or None)
 
             time.sleep(interval)
         except KeyboardInterrupt:

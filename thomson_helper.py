@@ -44,6 +44,22 @@ from urllib.parse import urlparse, parse_qs
 
 import target_client
 
+try:
+    import ledger          # 本地账本（灾后重建的唯一真源），见 ledger.py
+except Exception:          # 账本模块缺失/损坏也绝不能影响打靶主流程
+    ledger = None
+
+
+def led(ev, day=None):
+    """写一条账本事件（静默失败）。所有埋点统一走这里。"""
+    if ledger is None:
+        return
+    try:
+        ledger.append(ev, day=day)
+    except Exception:
+        pass
+
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config_helper.json")
 
@@ -475,7 +491,8 @@ B_LOCAL_CONFIG_PATH = os.path.join(BASE, "config_b.local.json")  # b_watcher 本
 # RLock：save_state() 在调用方已持锁时也会被调用，必须可重入
 _state_lock = threading.RLock()
 STATE = {"seen": {}, "pend": [], "shots": [], "queue": [], "no_seq": {},
-         "forming_shot": None, "trash": []}
+         "forming_shot": None, "trash": [], "unmatched": []}
+# "unmatched"：PyTPS 报来但当时找不到对应发次的能量（暂存待补绑，绝不丢弃）
 STATE_VER = 0          # 页面 SSE 推送用的状态版本号：shots/queue 一变就 +1
 
 # 重频靶系统实时状态（后台线程每 5s 刷新；靶位/离焦随 SSE 推到页面）
@@ -484,6 +501,197 @@ TARGET = dict(target_client.EMPTY)
 # 挂靶位时取最接近打靶时刻的历史样本，而不是"当前值"（靶可能已被移走）
 TARGET_HIST = []
 TARGET_HIST_MAX = 240        # 5s 一次 × 240 = 20 分钟历史
+
+# ---------------- C 机 tif 时间线 + 未命中能量暂存 ----------------
+# 为什么需要：PyTPS 只发 {filename: "shor_79.tif", energy: "19.23"}，**不带时间戳**；
+# 而 C 机的 tif 不在 B 机的监视目录里，B 机按文件名根本找不到对应发次
+# （09-30 实测：B 机 /api/energy_remote 零调用，77 条 tps_h 全靠 A 机时间窗猜）。
+# 解法（用户定调）：C 机把 tif 时间表（name + 浮点 mtime）推给 B 机，
+# B 机用 tif 时间去找**时间最近的 B 机 shot PNG 发次** —— 唯一时间基准 = PNG mtime。
+TIF_TIMELINE = {}          # {day: {tif名小写: {"name","folder","mtime","machine"}}}
+TIF_LOCK = threading.Lock()
+
+
+def _epoch(s):
+    """'YYYY-MM-DD HH:MM:SS' → 浮点 epoch；失败返回 None"""
+    try:
+        return datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+    except Exception:
+        return None
+
+
+def tif_add(day, files, machine=""):
+    """登记 C 机推来的 tif 时间表（同名覆盖为最新 mtime）。返回新增条数。"""
+    n = 0
+    with TIF_LOCK:
+        d = TIF_TIMELINE.setdefault(str(day), {})
+        for f in files or []:
+            if not isinstance(f, dict):
+                continue
+            nm = str(f.get("name", "")).strip()
+            if not nm:
+                continue
+            d[nm.lower()] = {"name": nm,
+                             "folder": str(f.get("folder", "")),
+                             "mtime": float(f.get("mtime") or 0),
+                             "machine": str(machine or f.get("machine", ""))}
+            n += 1
+    return n
+
+
+def tif_lookup(fn):
+    """按 tif 文件名查时间线 → {"name","folder","mtime","machine"} 或 None"""
+    key = os.path.basename(str(fn or "")).strip().lower()
+    if not key:
+        return None
+    with TIF_LOCK:
+        for day in sorted(TIF_TIMELINE.keys(), reverse=True):
+            hit = TIF_TIMELINE[day].get(key)
+            if hit:
+                return dict(hit, day=day)
+    return None
+
+
+def nearest_shot_by_ts(ts, window=None):
+    """给定浮点时间戳，找 B 机发次里时间最近的一发（基准 = PNG mtime 推出的
+    shot_time）。超出 window（默认 MATCH_WINDOW）视为未命中，返回 None。"""
+    w = MATCH_WINDOW if window is None else float(window)
+    best, bd = None, None
+    with _state_lock:
+        cands = list(STATE.get("shots") or [])
+    for s in cands:
+        e = _epoch(s.get("shot_time"))
+        if e is None:
+            continue
+        d = abs(e - ts)
+        if bd is None or d < bd:
+            best, bd = s, d
+    if best is not None and bd is not None and bd <= w:
+        return best, bd
+    return None, bd
+
+
+def _nearest_tif(shot_time):
+    """给定发次时间，从 C 机 tif 时间线里找最近的一张（账本 energy_match 的佐证：
+    证明"这一发对应哪个 tif"，而不是只靠 A 机时间窗猜）。"""
+    e = _epoch(shot_time)
+    if e is None:
+        return None
+    day = str(shot_time)[:10]
+    best, bd = None, None
+    with TIF_LOCK:
+        pool = list((TIF_TIMELINE.get(day) or {}).values())
+    for t in pool:
+        mt = float(t.get("mtime") or 0)
+        if not mt:
+            continue
+        d = abs(mt - e)
+        if bd is None or d < bd:
+            best, bd = t, d
+    if best is None:
+        return None
+    return {"name": best.get("name"), "mtime": best.get("mtime"),
+            "machine": best.get("machine"),
+            "diff_sec": round(bd, 3) if bd is not None else None}
+
+
+def _stash_unmatched_energy(fn, energy, field, source):
+    """能量到达但当前找不到对应发次 → 暂存（绝不丢弃）。
+    存进 STATE["unmatched"]（随 state_helper.json 落盘，重启不丢），
+    同时写账本 unmatched_energy。返回 energy_id。
+
+    归档日期 = **到达当天**（此刻还不知道该能量属于哪一发，没有归属日可用）。
+    补绑成功后 flush_unmatched_energy 会把结果同时写进这个到达日，
+    跨零点打靶时两边都能查到完整闭环。"""
+    eid = "e-%d-%s" % (int(time.time() * 1000),
+                       os.path.basename(str(fn or "")).lower()[:24])
+    rec = {"id": eid, "filename": str(fn or ""), "energy": str(energy),
+           "field": str(field or "tps_h"), "source": str(source or ""),
+           "stored_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+           "stored_ts": time.time(),
+           "stored_day": datetime.now().strftime("%Y-%m-%d")}
+    with _state_lock:
+        STATE.setdefault("unmatched", []).append(rec)
+        bump_ver()
+        save_state()
+    led({"ev": "unmatched_energy", "energy_id": eid, "filename": rec["filename"],
+         "energy": rec["energy"], "field": rec["field"], "source": rec["source"],
+         "stored_at": rec["stored_at"]}, day=rec["stored_day"])
+    log("能量暂存待补绑: %s = %s（%s，未找到对应发次）"
+        % (rec["filename"], rec["energy"], rec["field"]))
+    return eid
+
+
+def flush_unmatched_energy():
+    """把暂存的未命中能量补绑：用 C 机 tif 时间表把 tif 名解析成时间，
+    再找时间最近的 B 机 PNG 发次（唯一基准），直接 POST A 机 /api/energy。
+    在新发次转正后、以及收到 tif 时间表后各调一次。返回补绑成功条数。"""
+    with _state_lock:
+        pending = list(STATE.get("unmatched") or [])
+    if not pending:
+        return 0
+    done, bound = [], 0
+    for rec in pending:
+        t = tif_lookup(rec.get("filename"))
+        if not t or not t.get("mtime"):
+            continue                       # tif 时间表还没到，下次再试
+        shot, diff = nearest_shot_by_ts(float(t["mtime"]))
+        if shot is None:
+            continue                       # B 机还没建这一发的组，下次再试
+        st = shot.get("shot_time")
+        payload = {"shot_time": st, "energy": rec.get("energy"),
+                   "field": rec.get("field") or "tps_h",
+                   "machine": BW_MACHINE or MACHINE,
+                   "window_sec": MATCH_WINDOW,
+                   "shot_no": shot.get("no") or 0, "create": False}
+        try:
+            j = http_post_json(SERVER_URL.rstrip("/") + "/api/energy", payload)
+        except Exception as e:
+            led({"ev": "unmatched_retry_fail", "energy_id": rec.get("id"),
+                 "filename": rec.get("filename"), "err": repr(e)},
+                day=str(st)[:10] or None)
+            continue
+        ok = bool(j.get("ok")) and (j.get("matched") is not None
+                                    or j.get("created") is not None)
+        if not ok:
+            continue
+        bound += 1
+        done.append(rec.get("id"))
+        with _state_lock:
+            e = norm_energies(shot)
+            e[rec.get("field") or "tps_h"] = rec.get("energy")
+            shot["energies"] = e
+            shot["status"] = "sent"
+            if j.get("matched") is not None:
+                shot["row_id"] = j.get("matched")
+            shot["info"] = "能量补绑（%s → %s，tif %s 差%.1fs）" % (
+                rec.get("filename"), st, t.get("name"), diff or 0)
+        save_state()
+        _bound_rec = {"ev": "unmatched_bound", "energy_id": rec.get("id"),
+                      "filename": rec.get("filename"), "energy": rec.get("energy"),
+                      "field": rec.get("field"), "shot_time": st,
+                      "shot_no": shot.get("no"),
+                      "row_id": j.get("matched") if j.get("matched") is not None else j.get("created"),
+                      "tif_name": t.get("name"), "tif_mtime": t.get("mtime"),
+                      "diff_sec": round(diff, 3) if diff is not None else None,
+                      "waited_sec": round(time.time() - float(rec.get("stored_ts") or 0), 1),
+                      "a_resp": j}
+        # 写进发次归属日（数据属于哪天，重建就读哪天）
+        led(dict(_bound_rec), day=str(st)[:10] or None)
+        # 跨零点打靶时，暂存记在"到达日"、补绑记在"归属日"会分家 →
+        # 两个日期不同时，到达日也补一份，保证任一天单独看都有完整闭环
+        _sday = str(rec.get("stored_day") or "")
+        if _sday and _sday != str(st)[:10]:
+            led(dict(_bound_rec, cross_day_from=_sday), day=_sday)
+        log("能量补绑成功: %s = %s → %s（tif %s）"
+            % (rec.get("filename"), rec.get("energy"), st, t.get("name")))
+    if done:
+        with _state_lock:
+            STATE["unmatched"] = [r for r in STATE.get("unmatched", [])
+                                  if r.get("id") not in done]
+            bump_ver()
+            save_state()
+    return bound
 
 
 def target_poll_loop(interval=5.0):
@@ -607,11 +815,30 @@ def save_json(path, data):
 
 def save_state():
     with _state_lock:
-        save_json(STATE_PATH, STATE)
+        # _files（文件明细 name/folder/path/浮点mtime）只活在内存里给账本用，
+        # 不落盘：state_helper.json 已 1.7MB，再塞 289 发 × 明细会翻几倍，
+        # 而账本 ledger/<day>.jsonl 才是这份明细的持久归宿（追加、不可变）。
+        slim = dict(STATE)
+        for key in ("shots", "trash"):
+            if isinstance(slim.get(key), list):
+                slim[key] = [{k: v for k, v in s.items() if k != "_files"}
+                             if isinstance(s, dict) else s for s in slim[key]]
+        fm = slim.get("forming_shot")
+        if isinstance(fm, dict):
+            slim["forming_shot"] = {k: v for k, v in fm.items()
+                                    if k != "_files"}
+        save_json(STATE_PATH, slim)
 
 
 def log(msg):
     print("[%s] %s" % (datetime.now().strftime("%H:%M:%S"), msg), flush=True)
+    # 落盘：原来只 print，能量绑定/上报失败的痕迹关窗即失
+    # （09-30 的 tps_h=19.23 归属查不清就是这么来的）→ logs/thomson_helper_日期.log
+    if ledger is not None:
+        try:
+            ledger.log_line("thomson_helper", msg)
+        except Exception:
+            pass
 
 
 def http_post_json(url, payload, timeout=6):
@@ -742,11 +969,19 @@ def make_shot(group):
     names = [os.path.basename(p) for p, _mt in sorted(group, key=lambda x: x[1])]
     st = datetime.fromtimestamp(min(mt for _p, mt in group)).strftime(
         "%Y-%m-%d %H:%M:%S")
+    # _files：完整文件明细（name + folder + **浮点** mtime）。
+    # 为什么必须留浮点 mtime：A 机表的 shot_time 只有秒级，同秒内多发无法排序；
+    # 而 files 上报时原本被写成 mtime:0（见 report_shot），信息全丢。
+    # 账本靠这个明细才能在事后精确重建"哪个文件属于哪一发、先后顺序如何"。
+    detail = [{"name": os.path.basename(p),
+               "folder": os.path.dirname(p),
+               "path": p,
+               "mtime": mt} for p, mt in sorted(group, key=lambda x: x[1])]
     return {"shot_time": st, "files": names, "file_count": len(group),
             "no": parse_shot_no(names),
             "target": "", "defocus": "",
             "energy": "", "energies": {}, "status": "pending", "info": "",
-            "row_id": None, "reported": False}
+            "row_id": None, "reported": False, "_files": detail}
 
 
 def attach_target(shot):
@@ -1137,6 +1372,12 @@ def ingest_detect(payload):
         return {"ok": True, "merged": False, "ignored": True}
     names = [(f.get("name", "") if isinstance(f, dict) else str(f))
              for f in files]
+    # 保留 b_watcher 送来的完整明细（name + folder + 浮点 mtime）。
+    # 原来这里只取 names 就把 folder/mtime 全丢了 → 账本无从重建文件时间线。
+    detail = [{"name": (f.get("name", "") if isinstance(f, dict) else str(f)),
+               "folder": (f.get("folder", "") if isinstance(f, dict) else ""),
+               "mtime": (f.get("mtime", 0) if isinstance(f, dict) else 0)}
+              for f in files]
     flds = payload.get("fields") or {}
     with _state_lock:
         shot = next((s for s in STATE["shots"]
@@ -1146,11 +1387,13 @@ def ingest_detect(payload):
             shot = {"shot_time": st, "files": names, "file_count": len(files),
                     "no": None, "target": "", "defocus": "", "energy": "",
                     "energies": {}, "status": "pending", "info": "",
-                    "row_id": None, "reported": False}
+                    "row_id": None, "reported": False, "_files": detail}
             STATE["shots"].insert(0, shot)
         if len(names) > shot.get("file_count", 0):
             shot["files"] = names
             shot["file_count"] = len(files)
+        if detail and not shot.get("_files"):
+            shot["_files"] = detail
         if flds.get("no") is not None:
             shot["no"] = flds["no"]
         if flds.get("target_pos") and not shot.get("target"):
@@ -1162,6 +1405,12 @@ def ingest_detect(payload):
         save_state()
     log("收到待确认发次: %s (%d 个文件%s)"
         % (st, len(files), "，已合并同名发次" if merged else ""))
+    # ---- 账本：b_watcher 送来的原始发次（含 folder/mtime 明细）----
+    led({"ev": "detect_in", "shot_time": st, "no": flds.get("no"),
+         "merged": merged, "file_count": len(files), "files": detail,
+         "fields": flds,
+         "src_machine": str(payload.get("machine", ""))},
+        day=st[:10] or None)
     return {"ok": True, "merged": merged}
 
 
@@ -1178,8 +1427,22 @@ def _report_day(shot_time):
 def report_shot(shot):
     """把发次上报给 A 机（人工点「确认上报」后才会走到这里）。
     machine 用 b_watcher 的机名：A 机按 machine+时间+首文件去重，
-    与 b_watcher 旧直报记录对齐后不会产生重复行。已填的各能量一并写入该行。"""
-    files = [{"name": n, "mtime": 0} for n in shot["files"]]
+    与 b_watcher 旧直报记录对齐后不会产生重复行。已填的各能量一并写入该行。
+
+    **返回 A 机的完整响应 dict**（不再是 bool）：调用方要拿 id/rev 回写
+    shot["row_id"]/shot["reported"]，账本也要记 row_id 才能事后核对。
+    历史坑：这里只 return bool(j.get("ok"))，导致 auto_report 直报成功后
+    无法回写，09-30 的 128 发有 127 条一直显示 pending / row_id=null。"""
+    # 文件明细：优先用 _files 里的**真实浮点 mtime + folder**，
+    # 退回旧行为（mtime:0）时 A 机行的 folder 是空的、同秒多发无法排序。
+    detail = shot.get("_files") or []
+    by_name = {str(d.get("name", "")): d for d in detail}
+    files = []
+    for n in shot["files"]:
+        d = by_name.get(str(n)) or {}
+        files.append({"name": n,
+                      "folder": d.get("folder", ""),
+                      "mtime": d.get("mtime", 0)})
     fields = {"no": shot["no"]} if shot.get("no") is not None else {}
     if shot.get("target"):
         fields["target_pos"] = shot["target"]       # A 机表已有"靶位"列
@@ -1203,8 +1466,30 @@ def report_shot(shot):
         sn = str(shot["shot_time"])[:10]
     if sn:
         payload["sheet_name"] = sn
-    j = http_post_json(SERVER_URL.rstrip("/") + "/api/shot", payload)
-    return bool(j.get("ok"))
+    day = str(shot["shot_time"])[:10] or None
+    try:
+        j = http_post_json(SERVER_URL.rstrip("/") + "/api/shot", payload)
+    except Exception as ex:
+        # 上报失败也要落账：否则"这一发到底报没报出去"事后无从判断
+        led({"ev": "report_fail", "shot_time": shot["shot_time"],
+             "no": shot.get("no"), "machine": payload["machine"],
+             "sheet_name": payload.get("sheet_name", ""),
+             "file_count": shot.get("file_count"),
+             "files": detail or files,
+             "fields": fields, "err": repr(ex)}, day=day)
+        raise
+    led({"ev": "report_ok", "shot_time": shot["shot_time"],
+         "no": shot.get("no"), "machine": payload["machine"],
+         "sheet_name": payload.get("sheet_name", ""),
+         "file_count": shot.get("file_count"),
+         "files": detail or files, "fields": fields,
+         "reported_at": payload["reported_at"],
+         "ok": bool(j.get("ok")),
+         "row_id": j.get("id"), "rev": j.get("rev"),
+         "duplicate": j.get("duplicate"),
+         "merged_into": j.get("merged_into"),
+         "a_resp": j}, day=day)
+    return j
 
 
 def retry_queue():
@@ -1214,10 +1499,18 @@ def retry_queue():
     still = []
     for pl in STATE["queue"]:
         try:
-            http_post_json(SERVER_URL.rstrip("/") + "/api/shot", pl)
+            j = http_post_json(SERVER_URL.rstrip("/") + "/api/shot", pl)
             log("补发成功: %s" % pl.get("shot_time"))
-        except Exception:
+            led({"ev": "report_retry", "shot_time": pl.get("shot_time"),
+                 "ok": bool(j.get("ok")), "row_id": j.get("id"),
+                 "duplicate": j.get("duplicate"),
+                 "merged_into": j.get("merged_into"), "err": ""},
+                day=str(pl.get("shot_time", ""))[:10] or None)
+        except Exception as ex:
             still.append(pl)
+            led({"ev": "report_retry", "shot_time": pl.get("shot_time"),
+                 "ok": False, "err": repr(ex)},
+                day=str(pl.get("shot_time", ""))[:10] or None)
     if len(still) != len(STATE["queue"]):
         with _state_lock:
             STATE["queue"] = still
@@ -1484,6 +1777,9 @@ def monitor_loop(interval, window):
                             if shot.get("file_count", 0) > dup.get("file_count", 0):
                                 dup["files"] = shot["files"]
                                 dup["file_count"] = shot["file_count"]
+                                dup["_files"] = shot.get("_files") or dup.get("_files")
+                            elif not dup.get("_files") and shot.get("_files"):
+                                dup["_files"] = shot["_files"]   # 保留明细（b_watcher 那条没带）
                             if shot.get("target") and not dup.get("target"):
                                 dup["target"] = shot["target"]
                             if shot.get("defocus", "") != "" and \
@@ -1498,20 +1794,68 @@ def monitor_loop(interval, window):
                         save_state()
                     log("检测到发次: %s (%d 个文件)" %
                         (shot["shot_time"], shot["file_count"]))
+                    # ---- 账本：发次落盘（唯一时间基准 = PNG 浮点 mtime）----
+                    # 记下完整明细：no/靶位/靶类型/离焦/目标表/files(name+folder+浮点mtime)。
+                    # 表格再乱，靠这一条就能重建"这一发是什么、什么时候、哪些文件"。
+                    _tt = ""
+                    if shot.get("target"):
+                        try:
+                            _tt = lookup_target_type(shot["target"], day) or ""
+                        except Exception:
+                            _tt = ""
+                    led({"ev": "shot_group", "shot_time": shot["shot_time"],
+                         "no": shot.get("no"),
+                         "target_pos": shot.get("target", ""),
+                         "target_type": _tt,
+                         "target_defocus": shot.get("defocus", ""),
+                         "sheet_name": day,
+                         "file_count": shot.get("file_count"),
+                         "files": shot.get("_files") or []}, day=day)
                     if AUTO_REPORT:
                         try:
-                            report_shot(shot)
+                            j = report_shot(shot)
                             log("已上报日志系统: %s" % shot["shot_time"])
+                            # 回写 row_id/reported：否则页面永远显示"待确认"，
+                            # 且 helper 自己的 shots 无法与 A 机行交叉核对（09-30 的坑）
+                            if isinstance(j, dict) and j.get("ok"):
+                                rid = j.get("id") or j.get("merged_into")
+                                with _state_lock:
+                                    tgt = dup if dup is not None else shot
+                                    tgt["reported"] = True
+                                    if rid is not None:
+                                        tgt["row_id"] = rid
+                                    if tgt.get("status") == "pending":
+                                        tgt["status"] = "sent"
+                                    bump_ver()
+                                    save_state()
                         except Exception as e:
                             with _state_lock:
+                                # 补发队列也带真实明细（原来 mtime:0、无 folder，
+                                # 补发出的行 folder 为空、同秒多发无法排序）
+                                _fd = shot.get("_files") or []
+                                _by = {str(d.get("name", "")): d for d in _fd}
                                 STATE["queue"].append({
                                     "machine": MACHINE,
                                     "shot_time": shot["shot_time"],
-                                    "files": [{"name": n, "mtime": 0}
+                                    "fields": {"no": shot["no"]}
+                                              if shot.get("no") is not None else {},
+                                    "sheet_name": day,
+                                    "reported_at": datetime.now().strftime(
+                                        "%Y-%m-%d %H:%M:%S"),
+                                    "files": [{"name": n,
+                                               "folder": (_by.get(str(n)) or {}).get("folder", ""),
+                                               "mtime": (_by.get(str(n)) or {}).get("mtime", 0)}
                                               for n in shot["files"]]})
                                 bump_ver()
                                 save_state()
                             log("发次上报失败(%r)，已入补发队列" % e)
+            # 新发次转正后，尝试补绑之前暂存的未命中能量
+            # （PyTPS 的能量可能比 B 机建组先到 → 先暂存，等这一刻对上号）
+            if done:
+                try:
+                    flush_unmatched_energy()
+                except Exception as e:
+                    log("补绑暂存能量异常: %r" % e)
             # forming 行有变化（新出现/文件数增加/转正）就推送
             with _state_lock:
                 prev = STATE.get("forming_shot")
@@ -2606,12 +2950,14 @@ class Handler(BaseHTTPRequestHandler):
             shots = []
             for s in STATE["shots"]:
                 d = dict(s)
+                d.pop("_files", None)   # 文件明细只给账本用，别撑大 /api/local(已1.6MB)
                 if not d.get("ttype"):
                     d["ttype"] = ttm.get(str(d.get("target") or "").strip(), "")
                 shots.append(d)
             fm = STATE.get("forming_shot")
             if fm:
                 fm = dict(fm)
+                fm.pop("_files", None)
                 fm["ttype"] = ttm.get(str(fm.get("target") or "").strip(), "")
             dirs = list(WATCH_DIRS)     # 随快照下发：目录变更所有页面实时同步
             tgt = dict(TARGET)          # 靶位/离焦实时状态
@@ -2626,6 +2972,8 @@ class Handler(BaseHTTPRequestHandler):
             self._page()
         elif urlparse(self.path).path == "/api/local":
             self._send(200, self._snapshot())
+        elif urlparse(self.path).path == "/api/ledger_stats":
+            self.api_ledger_stats()
         elif urlparse(self.path).path == "/api/events":
             self.sse_events()
         elif urlparse(self.path).path == "/api/watchdirs":
@@ -2701,6 +3049,8 @@ class Handler(BaseHTTPRequestHandler):
             self.api_bind()
         elif urlparse(self.path).path == "/api/energy_remote":
             self.api_energy_remote()
+        elif urlparse(self.path).path == "/api/tif_timeline":
+            self.api_tif_timeline()
         elif urlparse(self.path).path == "/api/detect":
             p = self._json_body()
             self._send(200, json.dumps(ingest_detect(p), ensure_ascii=False))
@@ -2861,6 +3211,23 @@ class Handler(BaseHTTPRequestHandler):
             lab = next((f["label"] for f in ENERGY_FIELDS
                         if f["key"] == key), key)
             results.append((lab, j))
+            # ---- 账本：每列能量绑定结果（含 A 机命中到哪一行、时间差、匹配依据）----
+            # 09-30 查不清 19.23 属于哪一发，就是因为这一步没留痕。
+            led({"ev": "energy_bind", "shot_time": st, "field": key,
+                 "energy": v, "shot_no": payload.get("shot_no"),
+                 "window_sec": MATCH_WINDOW,
+                 "result": ("matched" if (j.get("ok") and j.get("matched") is not None)
+                            else "created" if (j.get("ok") and j.get("created") is not None)
+                            else "no_match" if j.get("error") == "no_match"
+                            else "error"),
+                 "row_id": j.get("matched") if j.get("matched") is not None else j.get("created"),
+                 "rev": j.get("rev"),
+                 "matched_time": j.get("matched_time"),
+                 "diff_sec": j.get("diff_sec"),
+                 "by_no": j.get("by_no"),
+                 "no_mismatch": j.get("no_mismatch"),
+                 "nearest": (j.get("nearest") or {}).get("shot_time"),
+                 "a_resp": j}, day=st[:10] or None)
         # 汇总各能量列结果 → 单一状态
         oks, nms, infos, first_id = [], [], [], None
         for lab, j in results:
@@ -2893,6 +3260,18 @@ class Handler(BaseHTTPRequestHandler):
         save_state()
         log("能量绑定[%s]: %s %s → %s" %
             (shot["status"], st, energy_cell(shot), shot["info"]))
+        # ---- 账本：能量匹配总览（哪个发次、命中行、时间差、依据；附 C机tif 佐证）----
+        if results:
+            _tif = _nearest_tif(st)      # 用 C 机推来的 tif 时间线找最近的一张
+            led({"ev": "energy_match", "shot_time": st,
+                 "shot_no": shot.get("no"),
+                 "matched_row_id": first_id,
+                 "status": shot.get("status"),
+                 "energies": dict(norm_energies(shot)),
+                 "basis": ("tif" if _tif else "time_window"),
+                 "tif_name": (_tif or {}).get("name"),
+                 "tif_diff_sec": (_tif or {}).get("diff_sec"),
+                 "info": shot["info"]}, day=st[:10] or None)
         # 页面提示用第一个能量列的原始返回（完整字段），逐列细节见表格"状态"列
         self._send(200, json.dumps(results[0][1] if results else
                                    {"ok": True, "confirmed": True},
@@ -2900,16 +3279,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_energy_remote(self):
         """外部程序（PyTPS 等）按文件名报能量：
-        {"filename": "Shot36.tif", "energy": "50.16"}
-        找到含该文件的发次行后，走 api_bind 同一条链路上报 A 机。"""
+        {"filename": "shor_79.tif", "energy": "19.23"}
+
+        匹配三级（唯一时间基准 = B机 shot PNG 的 mtime）：
+          1) 本机发次里就有这个文件名（C机自己跑 helper 时的旧行为）；
+          2) **C机推来的 tif 时间表**：用 tif 的 mtime 找时间最近的 B机 PNG 发次
+             —— 这才是 B 机能对上 C 机 tif 的唯一途径（B 机发次里只有 shotNN.PNG，
+                按文件名精确匹配永远失败，09-30 的能量就是这么丢的）；
+          3) 都没有 → **暂存不丢**，等 tif 时间表到达或发次建组后自动补绑。
+        """
         p = self._json_body()
         fn = str(p.get("filename", "")).strip()
         energy = str(p.get("energy", "")).strip()
+        field = str(p.get("field") or "").strip() or "tps_h"
         if not fn or not energy:
             return self._send(200, json.dumps(
                 {"ok": False, "error": "filename/energy 不能为空"},
                 ensure_ascii=False))
         fn_low = os.path.basename(fn).lower()
+        basis, tdiff = "", None
         with _state_lock:
             shot = next((s for s in STATE["shots"]
                          if any(str(f).lower() == fn_low
@@ -2919,18 +3307,89 @@ class Handler(BaseHTTPRequestHandler):
                 if fm and any(str(f).lower() == fn_low
                               for f in (fm.get("files") or [])):
                     shot = fm
+        if shot is not None:
+            basis = "filename"
+        else:
+            # 第 2 级：靠 C 机推来的 tif 时间表，用 tif mtime 找最近的 PNG 发次
+            t = tif_lookup(fn)
+            if t and t.get("mtime"):
+                shot, tdiff = nearest_shot_by_ts(float(t["mtime"]))
+                if shot is not None:
+                    basis = "tif"
+        # ---- 账本：能量到达（进函数就记，命中与否都记；附来源与匹配依据）----
+        led({"ev": "energy_in", "source": "energy_remote", "filename": fn,
+             "energy": energy, "field": field, "raw": p,
+             "basis": basis or ("tif_time_out_of_window" if tif_lookup(fn) else ""),
+             "tif_mtime": (tif_lookup(fn) or {}).get("mtime"),
+             "tif_shot_diff_sec": round(tdiff, 3) if tdiff is not None else None,
+             "matched_shot": (shot or {}).get("shot_time"),
+             "matched_no": (shot or {}).get("no")},
+            day=str((shot or {}).get("shot_time", ""))[:10] or None)
         if shot is None:
+            # 未命中：暂存，稍后补绑（不丢）
+            eid = _stash_unmatched_energy(fn, energy, field, "energy_remote")
             return self._send(200, json.dumps(
-                {"ok": False, "error": "shot_not_found",
-                 "message": "helper 未找到含 %s 的发次（可能未监视该目录或发次尚未检测到）" % fn},
+                {"ok": False, "error": "shot_not_found", "stashed": eid,
+                 "message": "helper 未找到含 %s 的发次（tif 时间表未到或发次尚未建组），已暂存待补绑" % fn},
                 ensure_ascii=False))
         p = {"shot_time": shot["shot_time"], "energy": energy,
-             "field": str(p.get("field") or "").strip() or "tps_h",
-             "create": False}
-        log("远程能量上报: %s = %s（发次 %s）"
+             "field": field, "create": False}
+        log("远程能量上报: %s = %s（发次 %s，依据 %s%s）"
             % (fn, energy, shot.get("no") if shot.get("no") is not None
-               else "?"))
+               else "?", basis,
+               ("差%.1fs" % tdiff) if tdiff is not None else ""))
         self.api_bind(p)
+
+    def api_tif_timeline(self):
+        """C 机把本地 shor_N.tif 的时间表推过来（b_watcher 的 push_tif_timeline_to）。
+        B 机据此把"tif 名"翻译成"时间"，再找时间最近的 B 机 PNG 发次——
+        唯一时间基准始终是 B 机 PNG 的 mtime，C 机发次号不参与匹配。
+        body: {"machine":"C机-DAQ-01","day":"2026-09-30",
+               "files":[{"name":"shor_12.tif","folder":"D:\\data117\\TPS\\...","mtime":1790000000.1}]}
+        收到后立刻尝试补绑之前暂存的未命中能量。"""
+        p = self._json_body()
+        machine = str(p.get("machine", "")).strip()
+        files = p.get("files") or []
+        if not isinstance(files, list):
+            files = []
+        # day 缺省按 tif mtime 推；跨零点的发次由调用方显式给
+        day = str(p.get("day", "")).strip()
+        if not day and files:
+            try:
+                day = datetime.fromtimestamp(
+                    float(files[0].get("mtime") or 0)).strftime("%Y-%m-%d")
+            except Exception:
+                day = datetime.now().strftime("%Y-%m-%d")
+        n = tif_add(day, files, machine)
+        led({"ev": "tif_timeline", "machine": machine, "day": day, "count": n,
+             "files": files}, day=day)
+        log("收到 C机 tif 时间表: %s %d 条（%s）" % (machine or "?", n, day))
+        # tif 时间表一到，之前暂存的能量可能就能对上号了 → 立刻补绑
+        bound = 0
+        try:
+            bound = flush_unmatched_energy()
+        except Exception as e:
+            log("补绑暂存能量异常: %r" % e)
+        with TIF_LOCK:
+            total = sum(len(v) for v in TIF_TIMELINE.values())
+        self._send(200, json.dumps(
+            {"ok": True, "n": n, "day": day, "total": total,
+             "bound_now": bound}, ensure_ascii=False))
+
+    def api_ledger_stats(self):
+        """GET /api/ledger_stats?day=YYYY-MM-DD —— 体检本机账本（只读）。"""
+        q = parse_qs(urlparse(self.path).query)
+        day = (q.get("day") or [datetime.now().strftime("%Y-%m-%d")])[0]
+        out = {"ok": True}
+        if ledger is None:
+            out.update(error="ledger 模块不可用")
+        else:
+            out.update(ledger.stats(day))
+            with _state_lock:
+                out["unmatched_pending"] = len(STATE.get("unmatched") or [])
+            with TIF_LOCK:
+                out["tif_days"] = {d: len(v) for d, v in TIF_TIMELINE.items()}
+        self._send(200, json.dumps(out, ensure_ascii=False))
 
 
 CFG = {}
@@ -2996,6 +3455,7 @@ def main():
             STATE.update(st)
             STATE["forming_shot"] = None   # 上次运行残留的"检测中"行不恢复
             STATE.setdefault("trash", [])  # 旧状态文件没有回收站字段
+            STATE.setdefault("unmatched", [])  # 旧状态文件没有暂存能量字段
             for s in STATE["shots"]:       # 旧单 energy 字符串 → energies 字典
                 norm_energies(s)
             for s in STATE.get("trash", []):

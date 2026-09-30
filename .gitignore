@@ -35,3 +35,10 @@ __pycache__/
 .playwright-cli/
 home.yaml
 *.log
+_ledger_selftest/
+
+# 本地账本（灾后重建的唯一真源，按日追加，永不入库）
+# B/C 机 -> ledger/，A 机 -> ledger_a/（LSL_LEDGER_DIR 区分）
+ledger/
+ledger_a/
+logs/
