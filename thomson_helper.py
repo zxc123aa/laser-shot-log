@@ -163,6 +163,15 @@ def get_target_type_map(force=False):
         return m
 
 
+def _clean_type_val(v):
+    """靶类型垃圾值防护：xls 空单元格常被读成 'Nan'/'nan'（float 转 str），
+    'None'/'null'/'0' 同理，一律视为未填（空字符串）。"""
+    s = str(v or "").strip()
+    if s.lower() in ("nan", "none", "null", "0", "0.0"):
+        return ""
+    return s
+
+
 def lookup_target_type(pos, day=None):
     """靶位 → 靶类型。优先读按日期绑定的当天表（target_types/<日期>.json）；
     日报表机制异常时回退旧系统（手动覆盖 + xls 基表）。"""
@@ -171,13 +180,13 @@ def lookup_target_type(pos, day=None):
         return ""
     try:
         dm = get_daily_target_map(day)
-        return str((dm.get("map") or {}).get(pos) or "")
+        return _clean_type_val((dm.get("map") or {}).get(pos))
     except Exception as e:
         log("日报表查询异常(回退旧映射): %r" % e)
     o = _ttm_overrides()
     if pos in o:                       # 手动修改优先（含清空 = 置空）
-        return str(o[pos] or "")
-    return get_target_type_map().get(pos, "")
+        return _clean_type_val(o[pos])
+    return _clean_type_val(get_target_type_map().get(pos, ""))
 
 
 TTM_OVERRIDES_PATH = os.path.join(BASE, "target_type_overrides.json")
@@ -323,6 +332,25 @@ def _ttm_day_str(day=None):
     return s
 
 
+def _bound_day():
+    """靶类型表跟随「上报表格绑定」：绑定到具体日期表（含 9-31 这类测试
+    日期）时，对话框编辑的就是那张日期表；绑定 "@date"/默认 → 编辑今天的表。"""
+    sn = str((CFG or {}).get("sheet_name", "") or "").strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", sn):
+        return sn
+    return _ttm_day_str()
+
+
+def _is_test_or_future_date(s):
+    """日期型绑定是否允许：今天/未来/日历上不存在的日期(如 09-31, 测试用) → 允许；
+    真实历史日期 → 不允许（历史表仅供查看）。"""
+    try:
+        d = datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return True                       # 日历上不存在的日期 → 测试日期
+    return d >= datetime.now().date()
+
+
 def _ttm_daily_path(day):
     return os.path.join(TTM_DAILY_DIR, _ttm_day_str(day) + ".json")
 
@@ -380,6 +408,9 @@ def get_daily_target_map(day=None):
             mt = None
         if mt is None:
             data = _seed_daily_map(day)
+            data["map"] = {k: _clean_type_val(v)
+                           for k, v in (data.get("map") or {}).items()
+                           if _clean_type_val(v)}
             _save_daily_map(day, data)
             log("靶类型日报表已建立: %s（播种自 %s，%d 个靶位）"
                 % (day, data.get("seeded_from"), len(data.get("map") or {})))
@@ -392,6 +423,10 @@ def get_daily_target_map(day=None):
         except Exception as e:
             log("靶类型日报表读取失败 %s: %r" % (day, e))
             data = {"date": day, "title": "", "map": {}}
+        # 读盘即清洗：历史文件里的 'Nan' 等垃圾值一律清掉（自动愈合）
+        data["map"] = {k: _clean_type_val(v)
+                       for k, v in (data.get("map") or {}).items()
+                       if _clean_type_val(v)}
         _TTM_DAILY[day] = {"mtime": mt, "data": data}
         return data
 
@@ -642,6 +677,16 @@ def _scan_dir(d, out):
         _scan_dir(sub, out)
 
 
+# 非发次文件（谱仪目录里的记录/日志类文件）：不参与发次检测，防止刷假发次
+# 规则：① 名为"发次记录*"的文件；② 所有 .txt/.log/.ini/.tmp/.csv/.xls/.xlsx/.json
+_META_FILE_RE = re.compile(
+    r"发次记录[^/\\]*$|\.(txt|log|ini|tmp|csv|xls|xlsx|json)$", re.IGNORECASE)
+
+
+def is_meta_file(path):
+    return bool(_META_FILE_RE.search(os.path.basename(str(path))))
+
+
 def group_into_shots(entries, window):
     """相邻间隔 <= window 的文件归为一次发次。
     返回 (已完成组, 最后一组——需安静超过 window 才算到齐)"""
@@ -656,7 +701,7 @@ def group_into_shots(entries, window):
             groups.append(cur)
             cur = [(p, mt)]
     if time.time() - cur[-1][1] >= window:
-        return groups + [cur], []
+        return _split_groups_by_no(groups + [cur]), []
     return groups, cur
 
 
@@ -672,6 +717,27 @@ def parse_shot_no(names):
         if m:
             nums.append(int(m.group(1)))
     return min(nums) if nums else None
+
+
+def _split_groups_by_no(groups):
+    """连拍拆分：相机缓冲常把连着的几发集中落盘，整批挤进同一个安静窗口，
+    按旧逻辑会被并成一行。这里按文件名编号把不同发的文件拆回各自的组；
+    解析不出编号的文件挂到时间最近的编号组（避免自动补号抢号）。"""
+    out = []
+    for g in groups:
+        by = {}
+        for p, mt in g:
+            m = NO_PAT.search(os.path.basename(p))
+            by.setdefault(int(m.group(1)) if m else None, []).append((p, mt))
+        if len(by) <= 1:
+            out.append(g)
+            continue
+        anon = by.pop(None, None)
+        keys = sorted(by)
+        if anon:
+            by[keys[0]] = by[keys[0]] + anon
+        out.extend(by[k] for k in keys)
+    return out
 
 
 def make_shot(group):
@@ -767,16 +833,111 @@ def api_shots_clear(mode):
             "left": len(STATE["shots"])}
 
 
+def _ttm_pan_label_set():
+    """版面里的全部靶盘号标签集合（如 {"1-1","6-2","8-4",...}，65 个）。
+    注意：版面 X-Y 标签是靶盘号，不是靶位！"""
+    lay = TTM_STATE.get("layout")
+    if not lay:
+        return set()
+    return {a[2] for a in (lay.get("labels") or []) if len(a) >= 3}
+
+
+def _ttm_pan_expand(pos):
+    """靶盘号 → 覆盖的 8 个靶位（盘行 b → 行 2b-1、2b；槽 p → 列 4p-3 ~ 4p）。
+    不是盘号标签则原样返回 [pos]。"""
+    if pos not in _ttm_pan_label_set():
+        return [pos]
+    a = pos.split("-")
+    b, p = int(a[0]), int(a[1])
+    return ["%d-%d" % (r, c)
+            for r in (2 * b - 1, 2 * b)
+            for c in (4 * p - 3, 4 * p - 2, 4 * p - 1, 4 * p)]
+
+
+_A_SYNC_SHEET = {"day": None, "id": None}     # A 机日期表 id 缓存
+
+
+def _a_sheet_id(day, server):
+    """A 机上以日期命名的表 id（当天日志表）"""
+    if _A_SYNC_SHEET["day"] == day and _A_SYNC_SHEET["id"]:
+        return _A_SYNC_SHEET["id"]
+    try:
+        j = json.loads(urllib.request.urlopen(
+            server.rstrip("/") + "/api/sheets", timeout=6).read()
+            .decode("utf-8"))
+        sheets = (j.get("sheets") if isinstance(j, dict) else None) \
+            or (j.get("rows") if isinstance(j, dict) else None) \
+            or (j if isinstance(j, list) else [])
+        for s in sheets:
+            if str(s.get("name", "")) == day:
+                _A_SYNC_SHEET.update(day=day, id=s.get("id"))
+                return _A_SYNC_SHEET["id"]
+    except Exception as e:
+        log("靶类型同步：取 A 机表列表失败 %r" % e)
+    return None
+
+
+def _sync_types_to_a(day, changed):
+    """后台线程：把 {靶位: 新类型} 同步到 A 机当天日志行。
+    新类型非空 → 覆盖该靶位所有日志行的 target_type；
+    新类型为空 → 只清 'nan' 类垃圾值，不动人工填过的类型。"""
+    if not changed:
+        return
+    server = SERVER_URL or "http://10.0.23.155:8765"
+    try:
+        sid = _a_sheet_id(day, server)
+        if not sid:
+            log("靶类型同步：A 机没有 %s 表，跳过" % day)
+            return
+        url_rows = (server.rstrip("/")
+                    + "/api/rows?sheet_id=%s&page=1&page_size=2000" % sid)
+        for attempt in (0, 1):
+            rows = json.loads(urllib.request.urlopen(url_rows, timeout=8)
+                              .read().decode("utf-8")).get("rows") or []
+            pending = []
+            for r in rows:
+                f = r.get("fields") or {}
+                pos = str(f.get("target_pos") or "").strip()
+                if pos not in changed:
+                    continue
+                new_t = changed[pos]
+                cur_t = str(f.get("target_type") or "").strip()
+                if new_t:
+                    if cur_t != new_t:          # 覆盖为映射值
+                        pending.append((r, new_t))
+                elif cur_t.lower() in ("nan", "none", "null"):
+                    pending.append((r, ""))     # 只清垃圾值
+            if not pending:
+                return
+            ok_all = True
+            for r, val in pending:
+                try:
+                    j = http_post_json(server.rstrip("/") + "/api/field",
+                                       {"id": r["id"], "field": "target_type",
+                                        "value": val, "rev": r.get("rev")},
+                                       timeout=6)
+                    if not j.get("ok"):
+                        ok_all = False          # rev 冲突等 → 重取行再试
+                except Exception:
+                    ok_all = False
+            if ok_all:
+                log("靶类型已自动同步到 A 机日志 %d 行（%s）"
+                    % (len(pending), day))
+                return
+        log("靶类型同步 A 机：重试后仍有冲突，%d 处未落" % len(pending))
+    except Exception as e:
+        log("靶类型同步 A 机异常: %r" % e)
+
+
 def api_targetmap_set(pos, ttype, positions=None, day=None):
     """编辑靶类型 → 直接写入按日期绑定的当天表（target_types/<日期>.json）。
-    positions 为合并块内的全部靶位（一次保存整块）；type 为空 → 从当天表删除该格。"""
+    positions 为合并块内的全部靶位（一次保存整块）；type 为空 → 从当天表删除该格。
+    旧页面只发一个靶盘号（如 12-2）→ 自动展开为覆盖的 8 个靶位（批量映射）。"""
     if positions is None:
         positions = [pos] if pos else []
     if not isinstance(positions, list) or not positions:
         return {"ok": False, "error": "缺少靶位"}
-    ttype = str(ttype or "").strip()
-    if ttype in ("0", "0.0"):          # '0' 视为未填类型，防止垃圾覆盖入库
-        ttype = ""
+    ttype = _clean_type_val(ttype)     # '0'/'Nan' 等垃圾值一律视为未填，防止覆盖入库
     if len(ttype) > 60:
         return {"ok": False, "error": "靶类型太长（≤60 字符）"}
     pos_ok = []
@@ -786,19 +947,35 @@ def api_targetmap_set(pos, ttype, positions=None, day=None):
             pos_ok.append(p)
     if not pos_ok:
         return {"ok": False, "error": "靶位格式应为 行-列，如 2-2"}
+    # 靶盘号批量展开：单个盘号（旧页面只发标签）→ 8 个靶位
+    pan_key = None
+    if len(pos_ok) == 1 and pos_ok[0] in _ttm_pan_label_set() \
+            and len(pos_ok[0].split("-")) == 2:
+        pan_key = pos_ok[0]
+        pos_ok = _ttm_pan_expand(pan_key)
     day = _ttm_day_str(day)
     with TTM_STATE["lock"]:
         dm = dict(get_daily_target_map(day))
         m = dict(dm.get("map") or {})
+        old = {p: (m.get(p) or "") for p in pos_ok}   # 同步用：改动前的值
         for p in pos_ok:
             if ttype:
                 m[p] = ttype
             else:
                 m.pop(p, None)             # 清空 = 从当天表删除
+        if pan_key:                        # 盘号键同步写/删（兼容旧页面显示）
+            if ttype:
+                m[pan_key] = ttype
+            else:
+                m.pop(pan_key, None)
         dm["map"] = m
         ok = _save_daily_map(day, dm)
     if ok:
         bump_ver()                          # SSE 推送 → 页面 ttype 实时刷新
+        changed = {p: ttype for p in pos_ok if old.get(p, "") != ttype}
+        if changed:                         # 后台把改动同步到 A 机日志行
+            threading.Thread(target=_sync_types_to_a, args=(day, changed),
+                             daemon=True).start()
         log("靶类型[%s]: %s = %s（%d 个靶位）"
             % (day,
                ",".join(pos_ok[:5]) + ("…" if len(pos_ok) > 5 else ""),
@@ -808,9 +985,9 @@ def api_targetmap_set(pos, ttype, positions=None, day=None):
 
 
 def api_targetmap_solidify():
-    """以页面当前生效内容为准，整体另存为今天的日报表（target_types\今天.json）。
-    新架构下每次编辑都已直接写当天表，此按钮用于把旧系统(xls+覆盖)内容一次性抓进今天。"""
-    day = _ttm_day_str()
+    """以页面当前生效内容为准，整体另存为绑定日期的日报表（target_types/<日期>.json）。
+    新架构下每次编辑都已直接写当天表，此按钮用于把旧系统(xls+覆盖)内容一次性抓进来。"""
+    day = _bound_day()
     with TTM_STATE["lock"]:
         dm = dict(get_daily_target_map(day))
         merged = dict(dm.get("map") or {})
@@ -950,7 +1127,13 @@ def ingest_detect(payload):
     st = str(payload.get("shot_time", "")).strip()
     if not st:
         return {"ok": False, "error": "shot_time 为空"}
-    files = payload.get("files") or []
+    # 过滤非发次文件（发次记录.txt 等）：b_watcher 分组前没过滤也在这里兜底
+    raw_files = payload.get("files") or []
+    files = [f for f in raw_files
+             if not is_meta_file(f.get("name", "") if isinstance(f, dict)
+                                 else str(f))]
+    if not files:
+        return {"ok": True, "merged": False, "ignored": True}
     names = [(f.get("name", "") if isinstance(f, dict) else str(f))
              for f in files]
     flds = payload.get("fields") or {}
@@ -981,6 +1164,16 @@ def ingest_detect(payload):
     return {"ok": True, "merged": merged}
 
 
+def _report_day(shot_time):
+    """发次写哪张表，靶类型就读哪天的表（表与映射必须同日期）：
+    绑定固定日期表（含 09-31 这类测试日期）→ 该日期；
+    "@date" / 默认"实时打靶" → 按发次日期。"""
+    sn = str((CFG or {}).get("sheet_name", "") or "").strip()
+    if sn and sn != "@date" and re.match(r"^\d{4}-\d{2}-\d{2}$", sn):
+        return sn
+    return str(shot_time)[:10]
+
+
 def report_shot(shot):
     """把发次上报给 A 机（人工点「确认上报」后才会走到这里）。
     machine 用 b_watcher 的机名：A 机按 machine+时间+首文件去重，
@@ -989,8 +1182,8 @@ def report_shot(shot):
     fields = {"no": shot["no"]} if shot.get("no") is not None else {}
     if shot.get("target"):
         fields["target_pos"] = shot["target"]       # A 机表已有"靶位"列
-        tt = lookup_target_type(shot["target"],     # 按发次日期读当天靶类型表
-                                str(shot["shot_time"])[:10])
+        tt = lookup_target_type(shot["target"],     # 读行所写表对应日期的映射
+                                _report_day(shot["shot_time"]))
         if tt:
             fields["target_type"] = tt              # A 机表已有"靶类型"列
     if shot.get("defocus") != "":
@@ -1203,10 +1396,12 @@ def set_sheet_binding(name):
     sn = str(name or "").strip()
     if sn not in ("", "@date") and re.search(r'[\\/:*?"<>|]', sn):
         return {"ok": False, "error": "表名含非法字符 \\ / : * ? \" < > |"}
-    if sn not in ("", "@date") and re.match(r"^\d{4}-\d{2}-\d{2}$", sn):
+    if sn not in ("", "@date") and re.match(r"^\d{4}-\d{2}-\d{2}$", sn) \
+            and not _is_test_or_future_date(sn):
         return {"ok": False,
                 "error": "历史日期表仅供查看：绑定「按打靶日期自动分表」即可，"
-                         "每天自动写入当天日期命名的表"}
+                         "每天自动写入当天日期命名的表"
+                         "（今天/未来/测试日期可绑定）"}
     with _state_lock:
         CFG["sheet_name"] = sn
         save_json(CONFIG_PATH, CFG)
@@ -1251,7 +1446,7 @@ def monitor_loop(interval, window):
                     del missing_seen[d]
                     log("目录已恢复: %s" % d)
             new_entries = [(p, mt) for p, mt in entries
-                           if p not in STATE["seen"]]
+                           if p not in STATE["seen"] and not is_meta_file(p)]
             if new_entries:
                 # 关键：发现新文件立刻实时取靶位（不是等转正后的"当前值"）
                 live_fetch_target()
@@ -1431,9 +1626,11 @@ HELP_PAGE = r"""<!DOCTYPE html>
   <div class="brow">
     <span class="chip">上报表格：<b id="sheetName" style="cursor:pointer;border-bottom:1px dotted #888"
           onclick="openSheet()" title="点击选择打靶上报写入的表格">-</b></span>
-    <span class="chip">查看日期：<input type="date" id="viewDate"
-          onchange="VDATE=this.value || todayStr(); render(); LASTJSON=''"
-          style="padding:1px 4px;border:1px solid #d5d8dc;border-radius:5px;
+    <span class="chip">查看日期：<input type="text" id="viewDate" placeholder="YYYY-MM-DD"
+          onchange="setVDate(this.value)"
+          onkeydown="if(event.key==='Enter'){setVDate(this.value);this.blur();}"
+          title="支持测试日期，如 2026-09-31；清空回车 = 今天"
+          style="width:86px;padding:1px 4px;border:1px solid #d5d8dc;border-radius:5px;
           font-family:inherit;font-size:12px"></span>
     <span class="chip">本日 <b id="nday">0</b> 发｜未上报 <b id="npending"
           style="color:#c0392b">0</b> 发</span>
@@ -1580,6 +1777,21 @@ function todayStr(){
          "-" + ("0"+d.getDate()).slice(-2);
 }
 var VDATE = "";
+function setVDate(v){
+  /* 文本框替代原生 date 控件：原生控件存不了 2026-09-31 这类测试日期 */
+  v = (v || "").trim();
+  if (v === ""){
+    VDATE = todayStr();
+  } else if (!/^\d{4}-\d{2}-\d{2}$/.test(v)){
+    toast("日期格式应为 YYYY-MM-DD（测试日期如 2026-09-31 也可以）");
+    document.getElementById("viewDate").value = VDATE;
+    return;
+  } else {
+    VDATE = v;
+  }
+  document.getElementById("viewDate").value = VDATE;
+  render(); LASTJSON = "";
+}
 function viewIdx(){   // 当前查看日期对应的 SHOTS 下标（本地留痕，按发次时间过滤）
   if (!VDATE) return SHOTS.map(function(_, i){ return i; });
   return SHOTS.map(function(_, i){ return i; })
@@ -1792,12 +2004,19 @@ function openTmap(){
   document.getElementById("tmapList").innerHTML =
     "<div style='color:#999;font-size:13px'>加载中…</div>";
   fetch("/api/targetmap", {cache:"no-store"}).then(function(r){ return r.json(); })
-  .then(renderTmap).catch(function(){
+  .then(function(j){ TMAP_DIRTY = {}; TMAP_DATE = j.date || TMAP_DATE; tmRefreshBtn();
+    renderTmap(j); })
+  .catch(function(){
     document.getElementById("tmapList").innerHTML =
       "<div style='color:#c0392b;font-size:13px'>加载失败，请稍后重试</div>";
   });
 }
-function closeTmap(){ document.getElementById("tmapMask").style.display = "none"; }
+function closeTmap(){
+  var n = (typeof tmCount === "function") ? tmCount() : 0;
+  if (n && !confirm("有 " + n + " 处靶类型修改尚未保存，确定关闭？")) return;
+  TMAP_DIRTY = {};
+  document.getElementById("tmapMask").style.display = "none";
+}
 function renderTmap(j){
   if (!j.ok){
     document.getElementById("tmapList").innerHTML =
@@ -1807,12 +2026,20 @@ function renderTmap(j){
   var L = j.layout;
   if (!L || !L.labels || !L.labels.length){ renderTmapFlat(j); return; }
 
-  /* 区块索引：key "r1,c1,r2,c2" -> 覆盖的靶位列表（labels: [r,c,pos,r1,c1,r2,c2]）*/
+  /* 区块索引：key "r1,c1,r2,c2" -> 覆盖的靶位列表（labels: [r,c,pos,r1,c1,r2,c2]）
+     标签 X-Y 是靶盘号！盘行 b → 行 2b-1、2b；槽 p → 列 4p-3 ~ 4p，共 8 个靶位 */
   var regionPos = {};
   L.labels.forEach(function(a){
     if (a.length >= 7){
       var k = a[3] + "," + a[4] + "," + a[5] + "," + a[6];
-      (regionPos[k] = regionPos[k] || []).push(a[2]);
+      var ab = String(a[2]).split("-"), b = parseInt(ab[0], 10),
+          pp = parseInt(ab[1], 10), poss = [];
+      if (!isNaN(b) && !isNaN(pp) && pp <= 5 && b <= 13){
+        for (var rr = 2*b - 1; rr <= 2*b; rr++)
+          for (var cc = 4*pp - 3; cc <= 4*pp; cc++)
+            poss.push(rr + "-" + cc);
+      } else poss = [String(a[2])];
+      regionPos[k] = (regionPos[k] || []).concat(poss);
     }
   });
   var covered = {}, region = {};
@@ -1828,12 +2055,14 @@ function renderTmap(j){
     addRegion(m.join(","));
   });
 
+  function tclean(s){ var t = String(s||"").trim();     // nan/none/null/0 = 未填（空）
+    return /^(nan|none|null|0|0\.0)$/i.test(t) ? "" : t; }
   function effType(poss){                              // 区块生效类型：手动优先
     for (var i = 0; i < poss.length; i++)
       if (j.overrides && j.overrides.hasOwnProperty(poss[i]))
-        return String(j.overrides[poss[i]]);
+        return tclean(j.overrides[poss[i]]);
     for (var i2 = 0; i2 < poss.length; i2++)
-      if (j.map[poss[i2]]) return String(j.map[poss[i2]]);
+      if (tclean(j.map[poss[i2]])) return tclean(j.map[poss[i2]]);
     return "";
   }
   function anyManual(poss){
@@ -1849,14 +2078,18 @@ function renderTmap(j){
 
   var h = "<div style='font-size:11px;color:#888;margin-bottom:6px'>" +
           "本表绑定日期：<b style='color:#2c3e50'>" + tesc(j.date || "今天") +
-          "</b>（与当天日志表一致；编辑即存入 target_types\\" +
+          "</b>（与当天日志表一致；点「保存全部修改」一次存入 target_types\\" +
           tesc(j.date || "") + ".json）<br>" +
           "版面复刻自 " + tesc(L.sheet) +
           "：蓝格＝靶类型（合并大格＝同一靶块，改一处整块生效），" +
           "白格＝靶位编号/待填；大标题（含日期）可直接点击修改" +
-          "<button onclick='solidifyTmap(this)' style='float:right;" +
-          "font-size:11px;padding:2px 8px;cursor:pointer'>" +
-          "以当前表为准（存为今天）</button></div>" +
+          "<span style='float:right'>" +
+          "<button id='tmapSaveBtn' onclick='saveTmapAll(this)' " +
+          "style='font-size:11px;padding:2px 10px;cursor:pointer;margin-right:6px;" +
+          "background:#eee;color:#333;border:1px solid #ccc'>保存全部修改</button>" +
+          "<button onclick='solidifyTmap(this)' " +
+          "style='font-size:11px;padding:2px 8px;cursor:pointer'>" +
+          "以当前表为准（存为今天）</button></span></div>" +
           "<table style='border-collapse:collapse;font-size:12px;table-layout:fixed'>";
   if (L.ncols > 1){
     h += "<colgroup><col style='width:34px'>";
@@ -1883,9 +2116,10 @@ function renderTmap(j){
                "<input class='tm' style='width:94%;min-height:24px;" +
                "background:transparent;border:none;outline:none;" +
                "text-align:center;font-size:12px;color:#111' data-positions='" +
-               poss.join(",") + "' value='" + v.replace(/'/g,"&#39;") +
+               poss.join(",") + "' data-origin='" + v.replace(/'/g,"&#39;") +
+               "' value='" + v.replace(/'/g,"&#39;") +
                "' placeholder=' ' onfocus='this.select()' " +
-               "onchange='saveTmapBlock(this)'></td>";
+               "onchange='tmMark(this)'></td>";
         } else {                                       // 标题 / 靶位编号块
           var txt = (L.merge_text && L.merge_text[k]) ||
                     (L.values && L.values[ck]) || "";
@@ -1957,10 +2191,11 @@ function renderTmap(j){
                      "background:" + (man2 ? "#fdf0e4" : "#fff") + "'>" +
                      "<div style='font-size:10px;color:" + (man2 ? "#d35400" : "#bbb") +
                      ";line-height:1.1'>" + pos2 + (man2 ? " ✎" : "") + "</div>" +
-                     "<input class='tm' data-positions='" + pos2 + "' value='" +
-                     v3.replace(/'/g,"&#39;") +
+                     "<input class='tm' data-positions='" + pos2 +
+                     "' data-origin='" + v3.replace(/'/g,"&#39;") +
+                     "' value='" + v3.replace(/'/g,"&#39;") +
                      "' placeholder='靶类型' onfocus='this.select()' " +
-                     "onchange='saveTmapBlock(this)' style='width:64px'></td>";
+                     "onchange='tmMark(this)' style='width:64px'></td>";
       });
       extraRows += "</tr>";
     }
@@ -2008,28 +2243,87 @@ function renderTmapFlat(j){
       h += "<td style='border:1px solid #e6e8eb;padding:2px'>" +
            "<div style='font-size:10px;color:" + (manual ? "#d35400" : "#bbb") +
            ";line-height:1.1'>" + pos + (manual ? " ✎" : "") + "</div>" +
-           "<input class='tm' data-positions='" + pos + "' value='" +
+           "<input class='tm' data-positions='" + pos + "' data-origin='" +
            String(j.map[pos] || "").replace(/'/g,"&#39;") +
+           "' value='" + String(j.map[pos] || "").replace(/'/g,"&#39;") +
            "' placeholder='靶类型' onfocus='this.select()' " +
-           "onchange='saveTmapBlock(this)'></td>";
+           "onchange='tmMark(this)'></td>";
     });
     h += "</tr>";
   });
   h += "</table>";
   document.getElementById("tmapList").innerHTML = h;
 }
-function saveTmapBlock(inp){
-  var positions = (inp.getAttribute("data-positions") || "").split(",");
+/* ---- 靶类型批量保存（在线表格式：改完点「保存全部修改」一次落盘） ---- */
+var TMAP_DIRTY = {};          // data-positions -> input 元素
+var TMAP_DATE = "";           // 对话框当前编辑的日期（跟随上报表格绑定）
+function tmCount(){ return Object.keys(TMAP_DIRTY).length; }
+function tmRefreshBtn(){
+  var b = document.getElementById("tmapSaveBtn");
+  if (!b) return;
+  var n = tmCount();
+  b.textContent = n ? ("保存全部修改（" + n + " 处未保存）") : "保存全部修改";
+  b.style.background = n ? "#e67e22" : "#eee";
+  b.style.color = n ? "#fff" : "#333";
+  b.style.border = "1px solid " + (n ? "#d35400" : "#ccc");
+}
+function tmMark(inp){
+  var k = inp.getAttribute("data-positions") || "";
+  if (!k) return;
+  var origin = (inp.getAttribute("data-origin") || "").replace(/\s+/g, "");
+  if ((inp.value || "").replace(/\s+/g, "") === origin){
+    delete TMAP_DIRTY[k];
+    inp.style.boxShadow = "";
+  } else {
+    TMAP_DIRTY[k] = inp;
+    inp.style.boxShadow = "inset 0 0 0 2px #e67e22";   // 橙描边 = 未保存
+  }
+  tmRefreshBtn();
+}
+function saveTmapAll(btn){
+  var items = Object.keys(TMAP_DIRTY).map(function(k){ return TMAP_DIRTY[k]; });
+  if (!items.length){ toast("没有未保存的修改"); return; }
+  if (btn) btn.disabled = true;
+  var i = 0, fails = 0, saved = 0;
+  function next(){
+    if (i >= items.length){
+      if (btn) btn.disabled = false;
+      if (!fails){
+        toast("已保存 " + saved + " 处修改 → target_types（当日表）");
+        TMAP_DIRTY = {};
+        openTmap();              // 重渲染（脏标记清零、✎ 同步）
+      } else {
+        toast(fails + " 处保存失败，请重试；" + saved + " 处已保存");
+        tmRefreshBtn();
+      }
+      return;
+    }
+    var inp = items[i];
+    fetch("/api/targetmap", {method:"POST", cache:"no-store",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({
+        positions: (inp.getAttribute("data-positions") || "").split(","),
+        type: inp.value.trim(), day: TMAP_DATE})})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if (!j.ok){ fails++; toast(j.error || "保存失败"); }
+      else { saved++; delete TMAP_DIRTY[inp.getAttribute("data-positions")]; }
+      i++; next();
+    })
+    .catch(function(){ fails++; i++; next(); });
+  }
+  next();
+}
+function saveTmapBlock(inp){     // 兼容旧入口：单格即时保存
   fetch("/api/targetmap", {method:"POST", cache:"no-store",
     headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({positions: positions, type: inp.value.trim()})})
+    body: JSON.stringify({positions: (inp.getAttribute("data-positions") || "").split(","),
+                          type: inp.value.trim(), day: TMAP_DATE})})
   .then(function(r){ return r.json(); })
   .then(function(j){
     if (!j.ok){ toast(j.error || "保存失败"); openTmap(); return; }
-    toast("靶类型已保存：" + positions.length + " 个靶位 = " +
-          (j.effective || "（恢复自动）"));
-    openTmap();      // 重渲染，✎ 标记同步
-    refresh(); LASTJSON = "";
+    toast("靶类型已保存");
+    openTmap(); refresh(); LASTJSON = "";
   })
   .catch(function(){ toast("保存失败（网络错误）"); });
 }
@@ -2056,17 +2350,31 @@ function saveTmapTitle(inp){
   })
   .catch(function(){ toast("标题保存失败（网络错误）"); });
 }
+function histSheetRO(name){
+  /* 日期命名的表：真实历史日期（早于今天）= 只读；
+     今天/未来/日历上不存在的测试日期（如 2026-09-31）= 可点选绑定，与后端一致 */
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(name || "");
+  if (!m) return false;
+  var d = new Date(+m[1], +m[2]-1, +m[3]);
+  if (d.getFullYear() !== +m[1] || d.getMonth() !== +m[2]-1 ||
+      d.getDate() !== +m[3]) return false;      // 09-31 这类测试日期 → 可绑定
+  var t = new Date(); t.setHours(0,0,0,0);
+  return d < t;
+}
 function renderSheet(sheets){
   var h = "<div style='font-size:11px;color:#888;background:#f6f8fa;border-radius:6px;" +
-          "padding:6px 10px;margin-bottom:8px'>上报目标默认「按打靶日期自动分表」：每天自动写入当天日期命名的表，一天一张、与日志一一对应。历史日期表仅供查看，不能选为上报目标。</div>";
+          "padding:6px 10px;margin-bottom:8px'>上报目标默认「按打靶日期自动分表」：每天自动写入当天日期命名的表，一天一张、与日志一一对应。历史日期表仅供查看；今天/未来/测试日期（如 2026-09-31）可点选为上报目标（测完记得切回来）。</div>";
   h += sheetRow("@date", "按打靶日期自动分表", "每天打靶自动写入当天日期命名的表（如 2026-09-15），不存在自动创建");
   h += sheetRow("", "实时打靶（默认表）", "所有打靶集中写这一张固定表");
   if (sheets.length){
     h += "<div style='font-size:11px;color:#999;margin:10px 0 6px'>—— A 机已有表格（点「查看 →」打开）——</div>";
     sheets.forEach(function(s, i){
-      var ro = /^\d{4}-\d{2}-\d{2}$/.test(s.name);   // 日期命名的表 = 历史表，只读
+      var ro = histSheetRO(s.name);   // 只有真实历史日期表才只读
       h += sheetRow(s.name, s.name,
-                    ro ? (s.count + " 条记录 ｜ 历史表，仅供查看") : (s.count + " 条记录"),
+                    ro ? (s.count + " 条记录 ｜ 历史表，仅供查看")
+                       : (s.count + " 条记录 ｜ " +
+                          (/^\d{4}-/.test(s.name) ? "今天/测试日期表，可绑定"
+                                                   : "可选为上报目标")),
                     "@dateornull_" + i, s.view_url, ro);
     });
   } else {
@@ -2252,7 +2560,7 @@ document.getElementById("srv").textContent = CFG_SERVER;
 document.getElementById("dirs").textContent = CFG_DIRS;
 document.getElementById("efields").textContent =
   CFG_EFIELDS.map(function(f){ return f.label; }).join(" / ");
-refresh(); connectSSE(); setInterval(refresh, 15000);   // SSE 实时推送，15s 轮询仅作兜底
+refresh(); connectSSE(); setInterval(refresh, 1000);   // SSE 实时推送，1s 轮询仅作兜底
 loadSheetBinding();
 VDATE = todayStr();
 document.getElementById("viewDate").value = VDATE;
@@ -2292,7 +2600,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, html, "text/html; charset=utf-8")
 
     def _snapshot(self):
-        ttm = effective_target_map()   # 自动(xls) + 手动覆盖
+        ttm = effective_target_map(_bound_day())   # 绑定到哪张表就显示哪天的映射
         with _state_lock:
             shots = []
             for s in STATE["shots"]:
@@ -2333,7 +2641,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True, "trash": t},
                                        ensure_ascii=False))
         elif urlparse(self.path).path == "/api/targetmap":
-            day = _ttm_day_str()
+            day = _bound_day()            # 跟随「上报表格绑定」的日期
             dm = get_daily_target_map(day)
             self._send(200, json.dumps(
                 {"ok": True, "date": day,
@@ -2420,7 +2728,7 @@ class Handler(BaseHTTPRequestHandler):
             p = self._json_body()
             self._send(200, json.dumps(
                 api_targetmap_set(p.get("pos"), p.get("type"),
-                                  p.get("positions")),
+                                  p.get("positions"), p.get("day")),
                 ensure_ascii=False))
         elif urlparse(self.path).path == "/api/targetmap_solidify":
             self._send(200, json.dumps(api_targetmap_solidify(),
@@ -2428,7 +2736,7 @@ class Handler(BaseHTTPRequestHandler):
         elif urlparse(self.path).path == "/api/targetmap_title":
             p = self._json_body()
             t = str(p.get("title") or "").strip()
-            day = _ttm_day_str()
+            day = p.get("day") or _bound_day()
             with TTM_STATE["lock"]:
                 dm = dict(get_daily_target_map(day))
                 dm["title"] = t

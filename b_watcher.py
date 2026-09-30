@@ -111,8 +111,28 @@ def group_into_shots(entries, window):
     # 才认为这次打靶的数据到齐了，可以上报
     now = time.time()
     if now - cur[-1][1] >= window:
-        return groups + [cur], []
+        return _split_groups_by_no(groups + [cur]), []
     return groups, cur
+
+
+def _split_groups_by_no(groups):
+    """连拍拆分：相机缓冲集中落盘时，连着的几发会挤进同一个安静窗口被并成
+    一组。按文件名编号拆回各自发次；解析不出编号的文件挂到时间最近的编号组。"""
+    out = []
+    for g in groups:
+        by = {}
+        for p, mt in g:
+            m = NO_PAT.search(os.path.basename(p))
+            by.setdefault(int(m.group(1)) if m else None, []).append((p, mt))
+        if len(by) <= 1:
+            out.append(g)
+            continue
+        anon = by.pop(None, None)
+        keys = sorted(by)
+        if anon:
+            by[keys[0]] = by[keys[0]] + anon
+        out.extend(by[k] for k in keys)
+    return out
 
 
 def send_shot(server_url, payload, timeout=5):
@@ -152,6 +172,115 @@ def send_alert(server_url, machine_name, level, message, timeout=5):
 # 目录扫描缓存（与 thomson_helper 同款）：{目录: (目录mtime, [(文件路径, mtime), ...], [子目录路径, ...])}
 # 逐层校验目录 mtime，没变的层直接用缓存，热扫描从 ~0.4s 降到 ~0.01s
 _DIR_CACHE = {}
+
+
+# ---------------- 靶类型映射 → A 机日志 自动对账 ----------------
+# 8767 保存映射时有即时单次同步；本函数是兜底的周期对账：
+# A 机保存瞬间掉线 / 日志行先于映射产生 / 历史遗漏，都会在下一轮自动补上。
+
+_GARBAGE_TYPES = ("nan", "none", "null", "0", "0.0")   # 一律视为"未填"
+_SHEET_ID_CACHE = {}      # {日期: sheet_id}，A 机不会重建同一天的表，可缓存
+_recon_state = {"last": 0.0, "err_logged": 0.0}   # 节流
+
+
+def _recon_get_json(url, timeout=6):
+    return json.loads(urllib.request.urlopen(url, timeout=timeout)
+                      .read().decode("utf-8"))
+
+
+def _recon_post_field(server_url, rid, field, value, rev, timeout=6):
+    data = json.dumps({"id": rid, "field": field, "value": value,
+                       "rev": rev}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        server_url.rstrip("/") + "/api/field", data=data,
+        headers={"Content-Type": "application/json"}, method="POST")
+    return json.loads(urllib.request.urlopen(req, timeout=timeout)
+                      .read().decode("utf-8"))
+
+
+def _recon_sheet_id(server_url, day):
+    """日期 → A 机日志表 id（按表名精确匹配，带缓存）"""
+    if day in _SHEET_ID_CACHE:
+        return _SHEET_ID_CACHE[day]
+    j = _recon_get_json(server_url.rstrip("/") + "/api/sheets", timeout=8)
+    sheets = j.get("sheets") if isinstance(j, dict) else j
+    sheets = sheets or (j if isinstance(j, list) else [])
+    for s in sheets:
+        if str(s.get("name", "")) == day:
+            _SHEET_ID_CACHE[day] = s.get("id")
+            return _SHEET_ID_CACHE[day]
+    return None
+
+
+def reconcile_target_map(server_url, helper_url):
+    """对账一轮（覆盖模式）：A 机当天日志行的 target_type 与映射表不一致的
+    → 一律改成映射值（含补空、纠正之前映射错误的行）。
+    映射表里没有该靶位时：只清 'nan' 等垃圾值，不动真实类型。
+    返回补写行数；helper/A 机不可达返回 -1。"""
+    try:
+        j = _recon_get_json(helper_url.rstrip("/") + "/api/targetmap")
+    except Exception:
+        return -1
+    mapping = {str(k).strip(): str(v).strip()
+               for k, v in (j.get("map") or {}).items()
+               if str(v or "").strip()
+               and str(v).strip().lower() not in _GARBAGE_TYPES}
+    day = str(j.get("date") or "").strip() or \
+        datetime.now().strftime("%Y-%m-%d")
+    server = server_url.rstrip("/")
+    try:
+        sid = _recon_sheet_id(server, day)
+        if not sid:
+            return 0                     # A 机还没有当天的表，无需对账
+        url_rows = server + "/api/rows?sheet_id=%s&page=1&page_size=2000" % sid
+        for attempt in (0, 1):           # 第 2 轮 = rev 冲突后重取整表重试
+            rows = _recon_get_json(url_rows, timeout=8).get("rows") or []
+            todo = []
+            for r in rows:
+                f = r.get("fields") or {}
+                pos = str(f.get("target_pos") or "").strip()
+                cur = str(f.get("target_type") or "").strip()
+                if not pos:
+                    continue
+                t = mapping.get(pos)
+                if t is not None:
+                    if cur != t:         # 覆盖：不一致就改成映射值
+                        todo.append((r, t))
+                elif cur.lower() in ("nan", "none", "null"):
+                    todo.append((r, ""))  # 映射也没有 → 只清垃圾值
+            if not todo:
+                return 0
+            done = 0
+            for r, t in todo:
+                try:
+                    res = _recon_post_field(server, r["id"], "target_type",
+                                            t, r.get("rev"))
+                    if res.get("ok"):
+                        done += 1
+                except Exception:
+                    pass
+            if done == len(todo):
+                return done
+            if attempt == 0 and done < len(todo):
+                continue                 # 有冲突 → 重取行再补剩下的
+            return done
+    except Exception:
+        return -1
+    return 0
+
+
+def maybe_reconcile(server_url, helper_url, interval_sec):
+    """主循环里调用：节流到 interval_sec 一次；异常静默（只做低频日志）"""
+    now = time.time()
+    if now - _recon_state["last"] < interval_sec:
+        return
+    _recon_state["last"] = now
+    n = reconcile_target_map(server_url, helper_url)
+    if n > 0:
+        log("靶类型对账：已自动补写 A 机日志 %d 行" % n)
+    elif n == -1 and now - _recon_state["err_logged"] >= 600:
+        _recon_state["err_logged"] = now   # 10 分钟最多提示一次不可达
+        log("靶类型对账：helper/A 机暂不可达，下轮重试")
 
 
 def scan_once(watch_dirs):
@@ -205,6 +334,16 @@ def scan_once_status(watch_dirs):
 
 # 发次号解析：文件名里的编号（shot-3.png / shor_12.tif…），与 thomson_helper 同款
 NO_PAT = re.compile(r"(?:shot|shor)[-_ ]?(\d+)", re.IGNORECASE)
+
+# 非发次文件（谱仪目录里的记录/日志类文件）：不参与发次分组，防止刷假发次
+# 规则：① 名为"发次记录*"的文件；② 所有 .txt/.log/.ini/.tmp/.csv/.xls/.xlsx/.json
+_META_FILE_RE = re.compile(
+    r"发次记录[^/\\]*$|\.(txt|log|ini|tmp|csv|xls|xlsx|json)$", re.IGNORECASE)
+
+
+def _is_meta_file(path):
+    import os as _os
+    return bool(_META_FILE_RE.search(_os.path.basename(str(path))))
 
 
 def make_payload(machine_name, group, sheet_name=""):
@@ -298,6 +437,8 @@ def main():
     # "confirm"=只送到本机 8767 上报系统待确认，人工点「确认上报」才写 A 机
     report_mode = str(cfg.get("report_mode", "direct") or "direct").strip().lower()
     helper_url = str(cfg.get("helper_url", "") or "http://127.0.0.1:8767").strip()
+    # 靶类型映射 → A 机日志 自动对账周期（秒），0 = 关闭
+    recon_sec = float(cfg.get("map_reconcile_sec", 90) or 0)
 
     seen = load_json(STATE_PATH, {})      # {路径: mtime}
     pend = load_json(PENDING_PATH, [])    # 已见但尚未归组上报的 [[路径, mtime], ...]
@@ -398,6 +539,11 @@ def main():
                     log("配置热重载：新增 %s，移除 %s（静默登记 %d 个文件）"
                         % (added or "无", gone or "无", c))
 
+            # 1.9) 靶类型映射 → A 机日志 周期对账：日志行靶类型与映射
+            #      不一致的自动覆盖/补齐（纠正历史错误映射 + 补空）
+            if recon_sec > 0:
+                maybe_reconcile(server_url, helper_url, recon_sec)
+
             # 2) 扫描
             entries = scan_once(watch_dirs)
 
@@ -408,9 +554,11 @@ def main():
                 first_run = False
                 log("首次运行：登记已有文件 %d 个（不上报）" % len(seen))
             else:
-                new_entries = [(p, mt) for p, mt in entries if p not in seen]
+                new_entries = [(p, mt) for p, mt in entries
+                               if p not in seen and not _is_meta_file(p)]
                 # pending（上次还没归组的文件）+ 本轮新文件，合并后统一重新分组
-                all_new = [tuple(x) for x in pend] + new_entries
+                all_new = [tuple(x) for x in pend if not _is_meta_file(x[0])] \
+                    + new_entries
                 if all_new:
                     log("本轮待处理文件 %d 个（含缓冲 %d）"
                         % (len(all_new), len(pend)))
