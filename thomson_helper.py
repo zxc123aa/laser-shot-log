@@ -410,6 +410,7 @@ def energy_cell(s):
             parts.append("%s:%s" % (f["label"].replace("能量", ""), v))
     return "  ".join(parts)
 AUTO_REPORT = True
+REPORT_SHOTS = True   # false=C机模式：只发能量，永不向 A 机建行
 BW_MACHINE = ""   # b_watcher 的机名（读 config_b.local.json）：确认上报时与
                   # b_watcher 旧直报记录对齐，A 机去重才不会产生重复行
 # 展示/绑定状态：pending 待确认 | sent 已绑定 | no_match 无匹配 | error 发送失败
@@ -2336,25 +2337,37 @@ class Handler(BaseHTTPRequestHandler):
 
         # 第 1 步：确认上报——打靶行写入 A 机（带靶位/离焦/No.，含能量如有）
         if not shot.get("reported"):
-            try:
-                report_shot(shot)
-            except Exception as e:
-                shot["status"], shot["info"] = "error", "上报日志系统失败"
+            if not REPORT_SHOTS:
+                # C机模式：行由 B 机上报，本机只发能量（第 2 步继续）
+                shot["reported"] = True
+                shot["info"] = "C机模式：不建行，仅能量绑定"
                 save_state()
-                log("确认上报失败: %s %r" % (st, e))
-                return self._send(200, json.dumps(
-                    {"ok": False, "error": "connect_failed", "message": repr(e)},
-                    ensure_ascii=False))
-            shot["reported"] = True
-            shot["info"] = ("打靶行已上报（含能量）" if energies
-                            else "打靶行已上报，能量待填")
-            save_state()
-            log("确认上报: %s%s" % (st, ("（" + energy_cell(shot) + "）")
-                                     if energies else ""))
-            if not energies:
-                bump_ver()
-                return self._send(200, json.dumps(
-                    {"ok": True, "confirmed": True}, ensure_ascii=False))
+                log("C机模式：跳过建行 %s（行由 B 机上报）" % st)
+                if not energies:
+                    return self._send(200, json.dumps(
+                        {"ok": True, "c_mode": True,
+                         "message": "C机不建行（B机负责）；填入能量后即按时间最近绑定"},
+                        ensure_ascii=False))
+            else:
+                try:
+                    report_shot(shot)
+                except Exception as e:
+                    shot["status"], shot["info"] = "error", "上报日志系统失败"
+                    save_state()
+                    log("确认上报失败: %s %r" % (st, e))
+                    return self._send(200, json.dumps(
+                        {"ok": False, "error": "connect_failed", "message": repr(e)},
+                        ensure_ascii=False))
+                shot["reported"] = True
+                shot["info"] = ("打靶行已上报（含能量）" if energies
+                                else "打靶行已上报，能量待填")
+                save_state()
+                log("确认上报: %s%s" % (st, ("（" + energy_cell(shot) + "）")
+                                         if energies else ""))
+                if not energies:
+                    bump_ver()
+                    return self._send(200, json.dumps(
+                        {"ok": True, "confirmed": True}, ensure_ascii=False))
 
         # 第 2 步：能量绑定（每个能量列独立调 /api/energy，窗口内命中，
         # 重发可覆盖修正；带 create 时第一列会补录独立记录，后续列
@@ -2461,7 +2474,7 @@ CFG = {}
 
 
 def main():
-    global SERVER_URL, MACHINE, WATCH_DIRS, ENERGY_FIELDS, MATCH_WINDOW, AUTO_REPORT, BW_MACHINE, CFG
+    global SERVER_URL, MACHINE, WATCH_DIRS, ENERGY_FIELDS, MATCH_WINDOW, AUTO_REPORT, BW_MACHINE, CFG, REPORT_SHOTS
     CFG = load_json(CONFIG_PATH, None)
     if CFG is None:
         save_json(CONFIG_PATH, {
@@ -2503,6 +2516,9 @@ def main():
             ENERGY_FIELDS = fl
     ENERGY_FIELD = ekey0()   # 兼容旧展示
     AUTO_REPORT = bool(CFG.get("auto_report", True))
+    # C机模式：report_shots=false → 本机永不向 A 机建行（行由 B 机上报），
+    # 只做能量绑定（/api/energy 按时间最近匹配已有行）
+    REPORT_SHOTS = bool(CFG.get("report_shots", True))
     port = int(CFG.get("helper_port", 8767))
     # b_watcher 机名：确认上报的行用它做 machine，与 b_watcher 去重键对齐
     try:
