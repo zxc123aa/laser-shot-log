@@ -57,8 +57,36 @@ def aled(ev, day=None):
     except Exception:
         pass
 LIVE_SHEET = "实时打靶"          # B 机上报默认写入的表
-SHOT_MERGE_SEC = 15             # 同发次合并窗口：不同机器上报时间差在此内的视为同一发次，
-                                # 并入已有行（不新建），能量按"时间最近"才能命中正确行
+
+# ---- 跨机合并：默认关闭（09-30 的 shot79/80 被吃就是它干的）----
+# 曾经的语义：不同机器上报、时间差 <= SHOT_MERGE_SEC 的两次上报并入同一行，
+# 并把 file_count 累加。它的前提是"C 机会自己建行"，而现行口径是
+# **C 机永不建行**（report_mode=timeline，只推 tif 时间表给 B 机做能量匹配）。
+# 前提没了，合并逻辑只剩坏处：连发被吃、file_count 失真、能量归属查不清。
+# 因此默认 0 = 关闭。除非明确知道自己在做什么，不要打开。
+try:
+    with open(os.path.join(BASE, "config_a.json"), "r", encoding="utf-8") as _f:
+        _CFG_A = json.load(_f)
+except Exception:
+    _CFG_A = {}
+SHOT_MERGE_SEC = float(_CFG_A.get("shot_merge_sec", 0) or 0)
+
+# ---- 建行的文件必须匹配发次命名（第二道防线）----
+# 现场出现过：新建的 txt / 其他相机的 PNG 被当成发次上报进来，抢走编号、
+# 污染整表。B 机侧已改白名单；A 机再挡一次，防止某台机 config 配错。
+# 可用 config_a.json 的 shot_file_patterns 覆盖；enforce_shot_file=false 可关。
+_DEFAULT_SHOT_PATTERNS = [
+    r"^(shot|shor)[-_ ]?\d+\.(png|tif|tiff|dat|raw|jpg|jpeg|bmp)$",
+]
+_pats = _CFG_A.get("shot_file_patterns") or _DEFAULT_SHOT_PATTERNS
+if not isinstance(_pats, (list, tuple)) or not _pats:
+    _pats = _DEFAULT_SHOT_PATTERNS
+try:
+    SHOT_FILE_RE = re.compile("|".join(_pats), re.IGNORECASE)
+except re.error:
+    SHOT_FILE_RE = re.compile(_DEFAULT_SHOT_PATTERNS[0], re.IGNORECASE)
+ENFORCE_SHOT_FILE = bool(_CFG_A.get("enforce_shot_file", True))
+
 SORTABLE_SQL = {"shot_time", "machine", "file_count", "first_file", "id"}
 
 DEFAULT_COLS = [{"key": "target_type", "name": "靶类型", "width": 110},
@@ -71,12 +99,8 @@ except Exception:
     COLS = DEFAULT_COLS
 COL_KEYS = {c["key"] for c in COLS}
 
-# 访问白名单（config_a.json）：空 = 不限制；非空 = 只允许列表里的 IP/网段前缀
-try:
-    with open(os.path.join(BASE, "config_a.json"), "r", encoding="utf-8") as f:
-        _CFG_A = json.load(f)
-except Exception:
-    _CFG_A = {}
+# 访问白名单（config_a.json，_CFG_A 已在上方读取）：
+# 空 = 不限制；非空 = 只允许列表里的 IP/网段前缀
 ALLOW_IPS = [str(x) for x in _CFG_A.get("allow_ips", [])]
 
 _db_lock = threading.Lock()
@@ -290,771 +314,27 @@ def to_number(v):
 
 # ---------------- 前端页面（单页应用外壳） ----------------
 
-PAGE = r"""<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<meta name="ui-ver" content="3-redesign+colpanel">
-<title>实验打靶日志系统</title>
-<style>
-  :root{
-    --ink-900:#0b1220; --ink-800:#101a2e;
-    --ink-line:rgba(148,178,255,.14);
-    --paper:#f5f4f0; --card:#ffffff;
-    --line-soft:#e9eaee; --line:#dfe2e7;
-    --text-1:#1a2233; --text-2:#5b6577; --text-3:#98a1b0;
-    --accent:#0e9db8; --accent-strong:#0b8399;
-    --beam-a:#22d3ee; --beam-b:#e879f9;
-    --danger:#d64545;
-    --ring:rgba(14,157,184,.30);
-    --shadow-1:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.08);
-    --shadow-2:0 4px 16px rgba(16,24,40,.10),0 2px 4px rgba(16,24,40,.06);
-    --mono:"Cascadia Code","JetBrains Mono","Sarasa Mono SC",Consolas,monospace;
-  }
-  *{box-sizing:border-box}
-  body{font-family:"MiSans","HarmonyOS Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
-       margin:0;color:var(--text-1);display:flex;height:100vh;overflow:hidden;
-       background:radial-gradient(1100px 480px at 88% -8%,rgba(14,157,184,.07),transparent 62%),var(--paper);
-       -webkit-font-smoothing:antialiased}
-  /* ---------- 侧栏：表格列表 ---------- */
-  aside{width:232px;background:linear-gradient(180deg,var(--ink-900),var(--ink-800) 55%,#0d1729);
-        color:#dbe4f0;display:flex;flex-direction:column;flex-shrink:0}
-  .logo{padding:20px 18px 14px;font-size:17px;font-weight:700;letter-spacing:.06em}
-  .logo small{display:block;font-weight:normal;color:#7f93b3;font-size:11px;margin-top:4px;letter-spacing:.02em}
-  .logo::after{content:"";display:block;height:2px;margin-top:12px;border-radius:2px;
-    background:linear-gradient(90deg,var(--beam-a),var(--beam-b) 62%,transparent);
-    box-shadow:0 0 10px rgba(34,211,238,.45)}
-  #sheetlist{flex:1;overflow:auto;padding:10px}
-  .sitem{padding:8px 12px;margin:2px 0;cursor:pointer;font-size:13px;border-radius:8px;
-         display:flex;justify-content:space-between;align-items:center;color:#b9c6da;
-         transition:background .12s,color .12s}
-  .sitem:hover{background:rgba(148,178,255,.09);color:#eaf0fa}
-  .sitem.on{color:#fff;box-shadow:inset 2.5px 0 0 var(--beam-a);
-            background:linear-gradient(90deg,rgba(34,211,238,.16),rgba(232,121,249,.06))}
-  .sitem .cnt{background:rgba(148,178,255,.13);border-radius:99px;padding:1px 8px;font-size:11px;color:#aebfd8}
-  .sitem .d{color:#7f93b3;font-size:11px;margin-left:6px}
-  aside .foot{padding:12px;border-top:1px solid var(--ink-line)}
-  .fbtn{display:block;width:100%;background:rgba(148,178,255,.10);color:#dbe4f0;
-        border:1px solid rgba(148,178,255,.16);border-radius:8px;
-        padding:8px;font-size:13px;margin-top:8px;cursor:pointer;text-align:center;text-decoration:none;
-        transition:background .12s,filter .12s}
-  .fbtn:hover{background:rgba(148,178,255,.18)}
-  .fbtn.orange{background:linear-gradient(135deg,#12a5be,#0b8399);border-color:transparent;
-               color:#fff;font-weight:600}
-  .fbtn.orange:hover{filter:brightness(1.1);background:linear-gradient(135deg,#12a5be,#0b8399)}
-  /* ---------- 主区 ---------- */
-  main{flex:1;display:flex;flex-direction:column;overflow:hidden}
-  #head{background:var(--card);padding:14px 22px 12px;border-bottom:1px solid var(--line-soft);
-        box-shadow:var(--shadow-1);position:relative;z-index:4}
-  #head h1{font-size:19px;margin:0;display:inline-block;letter-spacing:.01em}
-  #head .meta{color:var(--text-3);font-size:12px;margin-left:12px;font-variant-numeric:tabular-nums}
-  #head button{background:none;border:1px solid var(--line);border-radius:6px;font-size:12px;
-               padding:3px 12px;cursor:pointer;color:var(--text-2);margin-left:10px;transition:all .12s}
-  #head button:hover{border-color:var(--accent);color:var(--accent-strong)}
-  .toolbar{background:var(--card);padding:10px 22px;border-bottom:1px solid var(--line-soft);display:flex;
-           align-items:center;gap:8px;flex-wrap:wrap}
-  .toolbar input{padding:7px 12px;border:1px solid var(--line);border-radius:8px;width:240px;font-size:13px;
-                 background:#fbfcfd;transition:border-color .12s,box-shadow .12s}
-  .toolbar input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
-  .toolbar select{padding:7px;border:1px solid var(--line);border-radius:8px;font-size:13px;
-                  background:#fbfcfd;color:var(--text-1)}
-  .tbtn{background:transparent;color:var(--text-2);border:1px solid var(--line);border-radius:8px;
-        padding:7px 14px;font-size:13px;cursor:pointer;line-height:1;transition:all .12s}
-  .tbtn:hover{border-color:var(--accent);color:var(--accent-strong);background:rgba(14,157,184,.06)}
-  .tbtn.red{color:var(--danger);border-color:#f0c9c9}
-  .tbtn.red:hover{background:#fdf1f1;border-color:var(--danger);color:var(--danger)}
-  .tbtn.green{background:linear-gradient(135deg,#12a5be,#0b8399);color:#fff;border-color:transparent;
-              font-weight:600;box-shadow:0 1px 2px rgba(11,131,153,.35)}
-  .tbtn.green:hover{filter:brightness(1.1);color:#fff;background:linear-gradient(135deg,#12a5be,#0b8399)}
-  #info{color:var(--text-3);font-size:12px;margin-left:auto;font-variant-numeric:tabular-nums}
-  .wrap{flex:1;overflow:auto;background:var(--card);margin:14px 18px 0;border-radius:12px 12px 0 0;
-        border:1px solid var(--line-soft);border-bottom:none;box-shadow:var(--shadow-2)}
-  table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;font-size:13px}
-  th{background:#f2f4f7;color:var(--text-2);padding:9px 12px;text-align:left;font-weight:600;font-size:12px;
-     letter-spacing:.03em;white-space:nowrap;position:sticky;top:0;z-index:3;cursor:pointer;user-select:none;
-     border-bottom:1px solid var(--line)}
-  th:hover{color:var(--text-1);background:#eaeef3}
-  th .arr{color:var(--accent);margin-left:3px}
-  th.fh{padding:4px 6px}
-  th.fh input{width:100%;box-sizing:border-box;padding:4px 8px;
-    border:1px solid var(--line);border-radius:6px;font-size:11px;background:#fbfcfe;color:var(--text-1)}
-  th.fh input::placeholder{color:var(--text-3)}
-  td{border-bottom:1px solid #f0f1f4;border-right:1px solid #f5f6f8;padding:7px 12px;
-     white-space:nowrap;vertical-align:middle;transition:background .1s}
-  tr:hover td{background:#f2fafc}
-  .t{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12.5px}
-  td.ed{cursor:text;position:relative}
-  td.ed:hover{background:#e9f6f9;box-shadow:inset 0 0 0 1.5px var(--ring);z-index:1;border-radius:2px}
-  td.ed:empty::before{content:attr(data-ph);color:#c3c9d4}
-  td.ed input{position:absolute;left:0;top:0;width:100%;height:100%;box-sizing:border-box;
-    border:none;outline:none;font:inherit;background:#f2fbff;padding:7px 12px;margin:0;
-    box-shadow:inset 0 0 0 1.5px var(--accent)}
-  td.ck{text-align:center;width:34px}
-  td.op button{background:none;border:none;color:var(--danger);cursor:pointer;font-size:12px;border-radius:4px;padding:2px 6px}
-  td.op button:hover{background:#fdf1f1}
-  .empty{padding:56px 20px;text-align:center;color:var(--text-3);font-size:13px;letter-spacing:.04em}
-  .pager{padding:10px 22px 16px;display:flex;align-items:center;gap:12px;font-size:13px;color:var(--text-2)}
-  .pager button{padding:6px 16px;border:1px solid var(--line);background:var(--card);border-radius:8px;
-                cursor:pointer;font-size:13px;color:var(--text-2);transition:all .12s}
-  .pager button:hover:not(:disabled){border-color:var(--accent);color:var(--accent-strong)}
-  .pager button:disabled{color:#c3c9d4;cursor:default;opacity:.6}
-  .toast{position:fixed;top:18px;left:50%;transform:translateX(-50%);background:var(--ink-800);color:#eef3fa;
-         padding:9px 24px;border-radius:99px;font-size:13px;z-index:99;box-shadow:var(--shadow-2);
-         border:1px solid rgba(148,178,255,.20);animation:toastIn .18s ease-out}
-  @keyframes toastIn{from{opacity:0;transform:translate(-50%,-8px)}to{opacity:1;transform:translate(-50%,0)}}
-  .col-panel{position:fixed;top:92px;right:22px;width:264px;max-height:70vh;overflow:auto;
-             background:var(--card);border:1px solid var(--line-soft);border-radius:12px;box-shadow:var(--shadow-2);
-             z-index:60;padding:14px;font-size:13px;display:none;animation:toastIn .15s ease-out}
-  .col-panel h4{margin:0 0 8px;font-size:14px;font-weight:600}
-  .col-panel label{display:flex;align-items:center;padding:6px 4px;cursor:pointer;border-radius:6px;transition:background .1s}
-  .col-panel label:hover{background:#f0f8fa}
-  .col-panel input{margin-right:8px;accent-color:var(--accent)}
-  .col-panel .pbtns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
-  .col-panel .pbtns button{flex:1;min-width:48px;padding:6px;border:1px solid var(--line);background:var(--card);
-                           border-radius:6px;cursor:pointer;font-size:12px;color:var(--text-2);transition:all .12s}
-  .col-panel .pbtns button:hover{border-color:var(--accent);color:var(--accent-strong)}
-  .col-panel .pbtns button.primary{background:linear-gradient(135deg,#12a5be,#0b8399);color:#fff;
-                                   border-color:transparent;font-weight:600}
-  .col-panel .pbtns button.primary:hover{filter:brightness(1.08);color:#fff}
-  #banner{background:#b3261e;color:#fff;padding:9px 22px;font-size:13px;display:none;white-space:pre-wrap}
-  #banner.info{background:#9a6700}
-  .mask{position:fixed;inset:0;background:rgba(9,14,25,.50);z-index:50;display:none;
-        align-items:center;justify-content:center;backdrop-filter:blur(2px)}
-  .panel{background:var(--card);border-radius:12px;width:860px;max-width:92vw;max-height:82vh;
-         display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(9,14,25,.30)}
-  .panel .ph{padding:14px 20px;border-bottom:1px solid var(--line-soft);font-size:15px;font-weight:600;display:flex;
-             align-items:center}
-  .panel .ph button{margin-left:auto}
-  .panel .pb{overflow:auto;padding:0 0 10px}
-  .panel table{border-collapse:collapse;width:100%;font-size:12px}
-  .panel th{background:#f2f4f7;color:var(--text-2);padding:8px 12px;text-align:left;position:static;font-weight:600}
-  .panel td{border-bottom:1px solid #f0f1f4;padding:6px 12px;white-space:nowrap}
-  .panel .lk{color:var(--accent-strong);cursor:pointer;margin-right:10px;border-radius:4px}
-  .panel .lk:hover{text-decoration:underline}
-  .panel .lk.red{color:var(--danger)}
-  .panel .empty{padding:30px;text-align:center;color:var(--text-3)}
-  /* 焦点可见性（键盘可达） */
-  button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{
-    outline:2px solid var(--accent);outline-offset:1px}
-  /* 细滚动条 */
-  #sheetlist::-webkit-scrollbar,.wrap::-webkit-scrollbar,.panel .pb::-webkit-scrollbar,
-  .col-panel::-webkit-scrollbar{width:10px;height:10px}
-  #sheetlist::-webkit-scrollbar-thumb{background:rgba(148,178,255,.25);border-radius:8px;
-    border:3px solid transparent;background-clip:content-box}
-  .wrap::-webkit-scrollbar-thumb,.panel .pb::-webkit-scrollbar-thumb,.col-panel::-webkit-scrollbar-thumb{
-    background:rgba(120,140,170,.35);border-radius:8px;border:3px solid transparent;background-clip:content-box}
-  @media (prefers-reduced-motion:reduce){
-    *{animation:none !important;transition:none !important}
-  }
-  @media print{
-    body{display:block;height:auto;overflow:visible;background:#fff}
-    aside,.toolbar,.pager,#banner,.mask,.toast,.col-panel{display:none !important}
-    #head{border:none;padding:4px 0;box-shadow:none}
-    .wrap{margin:0;border:none;box-shadow:none;border-radius:0;overflow:visible}
-    table{width:100%;font-size:11px}
-    th{background:#eee !important;color:#000 !important;position:static}
-    .frow,th.ck,td.ck,td.op,th:last-child{display:none}
-    th.col-hidden,td.col-hidden{display:none !important}
-  }
-</style>
-</head>
-<body>
-<aside>
-  <div class="logo">打靶日志系统<small>BLAC 实验数据 · 内网</small></div>
-  <div id="sheetlist"></div>
-  <div class="foot">
-    <button class="fbtn orange" onclick="toggleNewSheet()">＋ 新建表格</button>
-    <div id="newrow" style="display:none;margin:6px 0">
-      <input id="ns_name" placeholder="表格名，如 2026-09-16" style="width:100%;box-sizing:border-box;padding:5px 6px;border:1px solid #d88;border-radius:6px;font-size:12px"
-             onkeydown="if(event.key==='Enter')createSheet()">
-      <button class="fbtn orange" style="width:100%;margin-top:4px" onclick="createSheet()">创建（回车也行）</button>
-    </div>
-    <button class="fbtn" onclick="openTrash()">回收站</button>
-    <a class="fbtn" href="/export.xlsx" id="exportAll">导出全部 (xlsx)</a>
-  </div>
-</aside>
-<main>
-  <div id="banner"></div>
-  <div id="head">
-    <h1 id="sheetName">-</h1><span class="meta" id="sheetMeta"></span>
-    <button onclick="renameSheet()">重命名</button>
-  </div>
-  <div class="toolbar">
-    <input id="q" placeholder="搜索：时间 / 靶类型 / 任意列内容…" oninput="qChange()">
-    <select id="psize" onchange="psizeChange()">
-      <option>50</option><option>100</option><option>200</option><option>500</option>
-    </select>
-    <button class="tbtn green" onclick="addRow()">＋ 新增行</button>
-    <button class="tbtn red" onclick="delSelected()">删除选中</button>
-    <button class="tbtn" onclick="doExport('xlsx')">导出 Excel</button>
-    <button class="tbtn" onclick="doExport('csv')">导出 CSV</button>
-    <button class="tbtn" onclick="window.print()" title="打印当前页表格">打印</button>
-    <button class="tbtn" id="hideBtn" onclick="toggleColPanel()"
-            title="选择显示或隐藏哪些列">列显隐</button>
-    <span id="info"></span>
-  </div>
-  <div class="col-panel" id="colPanel">
-    <h4>显示/隐藏列</h4>
-    <div id="colList"></div>
-    <div class="pbtns">
-      <button onclick="setAllCols(true)">全选</button>
-      <button onclick="setAllCols(false)">全不选</button>
-      <button onclick="resetCols()">默认</button>
-      <button class="primary" onclick="toggleColPanel()">关闭</button>
-    </div>
-  </div>
-  <div class="wrap" id="wrap"></div>
-  <div class="pager">
-    <button id="prev" onclick="pageMove(-1)">‹ 上一页</button>
-    <span id="pginfo"></span>
-    <button id="next" onclick="pageMove(1)">下一页 ›</button>
-  </div>
-</main>
-<div class="mask" id="trashMask" onclick="if(event.target===this)closeTrash()">
-  <div class="panel">
-    <div class="ph">回收站（删除的记录在这里，可恢复）
-      <button class="tbtn red" onclick="purgeTrash()">清空回收站</button>
-      <button onclick="closeTrash()">关闭</button></div>
-    <div class="pb" id="trashBody"></div>
-  </div>
-</div>
-<script>
-var S = {sheets: [], cur: null, page: 1, q: "", f: {}, ftimer: null,
-         sort: "", dir: "desc", timer: null, editing: false, checked: new Set()};
-var COL_OPTS = {};
-/* 列显隐：用户可勾选显示/隐藏任意数据列；默认隐藏 shotlist_cols.json 里 "hide": true 的列。
-   状态保存在 localStorage 和 URL hash 里，刷新/分享链接都有效。只影响页面显示/打印，导出仍是全列。 */
-var HIDDEN = new Set();
-function dataCols(){
-  return [{key:"shot_time", name:"时间"}].concat(COLS).concat([
-    {key:"machine", name:"来源"},
-    {key:"file_count", name:"文件数"},
-    {key:"first_file", name:"首个文件"}
-  ]);
-}
-function visibleCols(){ return dataCols().filter(function(c){ return !HIDDEN.has(c.key); }); }
-function editablePitch(){ return 1 + COLS.filter(function(c){ return !HIDDEN.has(c.key); }).length; }
-function defaultHidden(){
-  var d = new Set();
-  COLS.forEach(function(c){ if(c.hide) d.add(c.key); });
-  return d;
-}
-function loadHidden(){
-  var m = /hide=([^&]*)/.exec(location.hash);
-  if(m && m[1] !== ""){
-    HIDDEN = new Set(decodeURIComponent(m[1]).split(",").filter(Boolean));
-  } else {
-    var s = localStorage.getItem("lsl_hidden_cols");
-    if(s){
-      try{ HIDDEN = new Set(JSON.parse(s)); }catch(_){ HIDDEN = defaultHidden(); }
-    } else { HIDDEN = defaultHidden(); }
-  }
-}
-function saveHidden(){
-  localStorage.setItem("lsl_hidden_cols", JSON.stringify(Array.from(HIDDEN)));
-  saveHash();
-}
-function updateHideBtn(){
-  var n = HIDDEN.size, total = dataCols().length;
-  document.getElementById("hideBtn").textContent = "列显隐 (" + (total - n) + "/" + total + ")";
-}
-function buildColPanel(){
-  var el = document.getElementById("colList"); el.innerHTML = "";
-  dataCols().forEach(function(c){
-    var lb = document.createElement("label");
-    var chk = document.createElement("input");
-    chk.type = "checkbox"; chk.checked = !HIDDEN.has(c.key); chk.dataset.k = c.key;
-    chk.onchange = function(){
-      if(chk.checked) HIDDEN.delete(c.key); else HIDDEN.add(c.key);
-      if(visibleCols().length === 0){ HIDDEN.delete(c.key); chk.checked = true; toast("至少保留一列"); }
-      updateHideBtn(); renderHead(); loadRows(); saveHidden();
-    };
-    lb.appendChild(chk);
-    lb.appendChild(document.createTextNode(" " + c.name));
-    el.appendChild(lb);
-  });
-}
-function toggleColPanel(){
-  var p = document.getElementById("colPanel");
-  var show = p.style.display === "none" || p.style.display === "";
-  p.style.display = show ? "block" : "none";
-  if(show) buildColPanel();
-}
-function setAllCols(show){
-  if(show){ HIDDEN.clear(); }
-  else {
-    HIDDEN = new Set(dataCols().map(function(c){ return c.key; }));
-    var first = dataCols()[0]; if(first) HIDDEN.delete(first.key);
-  }
-  buildColPanel(); updateHideBtn(); renderHead(); loadRows(); saveHidden();
-}
-function resetCols(){
-  HIDDEN = defaultHidden(); buildColPanel(); updateHideBtn(); renderHead(); loadRows(); saveHidden();
-}
+# ---- UI 模板已抽离到 ui/index.html（独立文件，git 合并只碰它、不碰本 .py，
+#      根治"A机改了UI、合并B机推送时被旧UI覆盖"）。按 mtime 缓存：
+#      改模板即生效，无需重启进程；文件缺失时返回显式错误页而不是崩。----
+_UI_PATH = os.path.join(BASE, 'ui/index.html')
+_UI_CACHE = {"mtime": None, "html": None}
 
-function toast(m){
-  var t = document.createElement("div"); t.className = "toast"; t.textContent = m;
-  document.body.appendChild(t); setTimeout(function(){t.remove();}, 1800);
-}
-function api(path, body, cb, fail){
-  fetch(path, body ? {method:"POST", cache:"no-store", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify(body)} : {cache:"no-store"})
-    .then(function(r){ return r.json().then(function(j){
-        if(!j.ok && !j.conflict) throw j.error||"请求失败"; return j; }); })
-    .then(cb).catch(function(e){ toast("出错: " + e); if (fail) fail(e); });
-}
-/* ---------- 勾选状态（跨自动刷新保留） ---------- */
-function syncCkall(){
-  var ck = document.getElementById("ckall"); if (!ck) return;
-  var boxes = document.querySelectorAll("#tb td.ck input"), n = 0;
-  boxes.forEach(function(c){ if (c.checked) n++; });
-  ck.checked = boxes.length > 0 && n === boxes.length;
-  ck.indeterminate = n > 0 && n < boxes.length;
-}
-/* 行复选框变化 → 记入 S.checked（事件委托，重渲染后依然有效） */
-document.addEventListener("change", function(e){
-  if (e.target && e.target.matches && e.target.matches("#tb td.ck input")){
-    var tr = e.target.closest("tr");
-    if (!tr || !tr.dataset.id) return;
-    if (e.target.checked) S.checked.add(+tr.dataset.id);
-    else S.checked.delete(+tr.dataset.id);
-    syncCkall();
-  }
-});
 
-/* ---------- 状态持久化（URL hash）：刷新后回到原表格/页码/搜索/排序 ---------- */
-function saveHash(){
-  var fkeys = Object.keys(S.f).filter(function(k){return S.f[k];});
-  var hide = Array.from(HIDDEN).join(",");
-  var h = "#sheet=" + (S.cur||"") + "&page=" + S.page + "&q=" + encodeURIComponent(S.q) +
-          "&sort=" + encodeURIComponent(S.sort) + "&dir=" + S.dir +
-          "&f=" + encodeURIComponent(JSON.stringify(
-            fkeys.reduce(function(o,k){o[k]=S.f[k];return o;},{}))) +
-          (hide ? "&hide=" + encodeURIComponent(hide) : "");
-  if (location.hash !== h) history.replaceState(null, "", h);
-}
-function loadHash(){
-  var m = /sheet=(\d+)/.exec(location.hash); if (m) S.cur = +m[1];
-  m = /page=(\d+)/.exec(location.hash);      if (m) S.page = +m[1];
-  m = /q=([^&]*)/.exec(location.hash);       if (m) { S.q = decodeURIComponent(m[1]);
-                                                       document.getElementById("q").value = S.q; }
-  m = /sort=([^&]*)/.exec(location.hash);    if (m) S.sort = decodeURIComponent(m[1]);
-  m = /dir=(asc|desc)/.exec(location.hash);  if (m) S.dir = m[1];
-  m = /f=([^&]*)/.exec(location.hash);
-  if (m){ try{ S.f = JSON.parse(decodeURIComponent(m[1])) || {}; }catch(_){ S.f = {}; } }
-}
-
-/* ---------- 表格（实验日）列表 ---------- */
-function loadSheets(){
-  api("/api/sheets", null, function(j){
-    S.sheets = j.sheets;
-    if (!S.cur || !j.sheets.some(function(x){return x.id===S.cur;}))
-      S.cur = j.sheets.length ? j.sheets[0].id : null;
-    renderSheets(); loadRows();
-  });
-}
-function renderSheets(){
-  var el = document.getElementById("sheetlist"); el.innerHTML = "";
-  S.sheets.forEach(function(s){
-    var d = document.createElement("div");
-    d.className = "sitem" + (s.id === S.cur ? " on" : "");
-    d.innerHTML = "<span>" + esc(s.name) +
-      (s.exp_date ? " <span class='d'>" + esc(s.exp_date) + "</span>" : "") +
-      "</span><span class='cnt'>" + s.count + "</span>";
-    d.onclick = function(){ if (S.cur !== s.id){ S.cur = s.id; S.page = 1; S.q = "";
-      document.getElementById("q").value = ""; S.sort = ""; S.dir = "desc"; S.checked.clear();
-      renderSheets(); loadRows(); } };
-    el.appendChild(d);
-  });
-}
-function toggleNewSheet(){
-  var r = document.getElementById("newrow");
-  var show = r.style.display === "none";
-  r.style.display = show ? "block" : "none";
-  if (show){ var i = document.getElementById("ns_name"); i.value = todayStr(); i.focus(); i.select(); }
-}
-function createSheet(){
-  var name = document.getElementById("ns_name").value.trim();
-  if (!name){ toast("先填表格名"); return; }
-  api("/api/sheets", {name:name}, function(j){
-    document.getElementById("newrow").style.display = "none";
-    S.cur = j.id; S.checked.clear(); loadSheets(); toast("表格已创建: " + name);
-  });
-}
-function renameSheet(){
-  var s = S.sheets.filter(function(x){return x.id===S.cur;})[0]; if (!s) return;
-  var name = prompt("修改表格名称：", s.name); if (!name) return;
-  api("/api/sheets/update", {id:s.id, name:name.trim()}, function(j){
-    loadSheets(); toast("已重命名");
-  });
-}
-function delSheet(){
-  var s = S.sheets.filter(function(x){return x.id===S.cur;})[0]; if (!s) return;
-  if (!confirm("删除表格【" + s.name + "】及其全部 " + s.count + " 条记录？\n（记录会进入回收站，可恢复；表格本身不可恢复）")) return;
-  api("/api/sheets/delete", {id:s.id}, function(j){
-    S.cur = null; S.checked.clear(); loadSheets(); toast("已删除（记录可在回收站恢复）");
-  });
-}
-function todayStr(){
-  var d = new Date();
-  return d.getFullYear() + "-" + ("0"+(d.getMonth()+1)).slice(-2) + "-" + ("0"+d.getDate()).slice(-2);
-}
-function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-
-/* ---------- 记录列表 ---------- */
-function qChange(){ clearTimeout(S.timer); S.timer = setTimeout(function(){ S.q = document.getElementById("q").value.trim(); S.page = 1; S.checked.clear(); loadRows(); }, 300); }
-function psizeChange(){ S.page = 1; S.checked.clear(); loadRows(); }
-function pageMove(d){ S.page += d; S.checked.clear(); loadRows(); }
-
-function loadRows(){
-  if (!S.cur) { document.getElementById("wrap").innerHTML = ""; saveHash(); return; }
-  var ps = document.getElementById("psize").value;
-  var url = "/api/rows?sheet_id=" + S.cur + "&page=" + S.page + "&page_size=" + ps +
-            "&q=" + encodeURIComponent(S.q) + "&sort=" + S.sort + "&dir=" + S.dir;
-  Object.keys(S.f).forEach(function(k){
-    if (S.f[k]) url += "&f_" + k + "=" + encodeURIComponent(S.f[k]);
-  });
-  var af = document.activeElement, afKey = (af && af.dataset) ? af.dataset.f : null;
-  api(url, null, function(j){
-    S.page = j.page;
-    var keep = document.getElementById("wrap").scrollTop;  // 保留滚动位置（自动刷新用）
-    renderHead(); renderRows(j.rows);
-    document.getElementById("wrap").scrollTop = keep;
-    if (afKey){   // 恢复筛选输入框焦点与光标位置
-      var el = document.querySelector(".frin[data-f='" + afKey + "']");
-      if (el){ el.focus(); try{ el.setSelectionRange(el.value.length, el.value.length); }catch(_){} }
-    }
-    var from = j.total ? (j.page-1)*j.page_size + 1 : 0;
-    var to = Math.min(j.total, j.page*j.page_size);
-    document.getElementById("info").textContent = "共 " + j.total + " 条";
-    document.getElementById("pginfo").textContent =
-      j.total ? ("第 " + from + "–" + to + " 条 / 共 " + j.total + " 条 ｜ 第 " + j.page + "/" + j.pages + " 页") : "无记录";
-    document.getElementById("prev").disabled = j.page <= 1;
-    document.getElementById("next").disabled = j.page >= j.pages;
-    var s = S.sheets.filter(function(x){return x.id===S.cur;})[0];
-    if (s){
-      document.getElementById("sheetName").textContent = s.name;
-      document.getElementById("sheetMeta").textContent =
-        (s.exp_date ? "实验日期 " + s.exp_date + " ｜ " : "") +
-        (s.note ? s.note + " ｜ " : "") + s.count + " 条记录";
-    }
-    bindEdit();
-    saveHash();
-  });
-}
-function renderHead(){
-  var VC = visibleCols();
-  var h = "<table><thead><tr><th class='ck'><input type=checkbox id=ckall></th>";
-  VC.forEach(function(c){ h += "<th data-k='" + c.key + "'>" + esc(c.name) + "</th>"; });
-  h += "<th>操作</th></tr>";
-  /* 列级筛选行 */
-  h += "<tr class='frow'><th class='ck'></th>";
-  VC.forEach(function(c){
-    h += "<th class='fh'><input class='frin' data-f='" + c.key + "' placeholder='筛选' value='" +
-         esc(S.f[c.key]||"") + "'></th>";
-  });
-  h += "<th></th></tr></thead><tbody id=tb></tbody></table>";
-  document.getElementById("wrap").innerHTML = h;
-  document.querySelectorAll("th[data-k]").forEach(function(th){
-    if (th.dataset.k === S.sort) th.innerHTML += "<span class='arr'>" + (S.dir==="asc"?"▲":"▼") + "</span>";
-    th.onclick = function(){
-      if (S.sort === th.dataset.k) S.dir = S.dir==="asc" ? "desc" : "asc";
-      else { S.sort = th.dataset.k; S.dir = "desc"; }
-      S.page = 1; S.checked.clear(); loadRows();
-    };
-  });
-  document.querySelectorAll(".frin").forEach(function(inp){
-    inp.addEventListener("input", function(){
-      clearTimeout(S.ftimer);
-      S.ftimer = setTimeout(function(){
-        S.f[inp.dataset.f] = inp.value.trim(); S.page = 1; S.checked.clear(); loadRows();
-      }, 400);
-    });
-    inp.addEventListener("keydown", function(e){
-      if (e.key === "Enter"){ clearTimeout(S.ftimer);
-        S.f[inp.dataset.f] = inp.value.trim(); S.page = 1; S.checked.clear(); loadRows(); }
-    });
-  });
-  document.getElementById("ckall").onchange = function(){
-    var on = this.checked;
-    document.querySelectorAll("#tb td.ck input").forEach(function(c){
-      c.checked = on;
-      var id = +c.closest("tr").dataset.id;
-      if (on) S.checked.add(id); else S.checked.delete(id);
-    });
-    this.indeterminate = false;
-  };
-}
-function renderRows(rows){
-  var VC = visibleCols();
-  var tb = document.getElementById("tb");
-  if (!rows.length){ tb.innerHTML = "<tr><td colspan=" + (VC.length + 2) +
-    " class='empty'>没有匹配的记录</td></tr>";
-    var ck0 = document.getElementById("ckall");
-    if (ck0){ ck0.checked = false; ck0.indeterminate = false; }
-    return; }
-  var h = "";
-  rows.forEach(function(r){
-    h += "<tr data-id='" + r.id + "' data-rev='" + (r.rev||1) + "'><td class='ck'><input type=checkbox></td>";
-    VC.forEach(function(c){
-      if(c.key === "shot_time"){
-        h += "<td class='t ed' data-f='shot_time' data-ph='点击填写'>" + esc(r.shot_time) + "</td>";
-      } else if(c.key === "machine"){
-        h += "<td>" + esc(r.machine || "-") + "</td>";
-      } else if(c.key === "file_count"){
-        h += "<td>" + (r.file_count||0) + "</td>";
-      } else if(c.key === "first_file"){
-        h += "<td class='t' title='" + esc(r.folder||"") + "'>" + esc(r.first_file || "-") + "</td>";
-      } else {
-        h += "<td class='ed' style='min-width:" + c.width + "px' data-f='" + c.key +
-             "' data-ph='点击填写'>" + esc(r.fields[c.key] || "") + "</td>";
-      }
-    });
-    h += "<td class='op'><button onclick=delRow(" + r.id + ")>删除</button></td></tr>";
-  });
-  tb.innerHTML = h;
-  /* 恢复勾选状态（8 秒自动刷新重渲染后勾选不丢） */
-  document.querySelectorAll("#tb td.ck input").forEach(function(c){
-    var tr = c.closest("tr");
-    if (tr && S.checked.has(+tr.dataset.id)) c.checked = true;
-  });
-  syncCkall();
-}
-function edCells(){ return Array.prototype.slice.call(document.querySelectorAll("td.ed")); }
-/* 按行串行的单元格写入队列：同一条记录的多次写按顺序执行，
-   每次都带该行最新 rev，避免并发写被乐观锁误判冲突 */
-var rowQ = {};
-function setCell(cell, v){
-  var tr = cell.closest("tr");
-  var key = tr.dataset.id;
-  var next = function(){   // 队列推进：成功/失败/冲突都要走，否则同行后续写入全部卡死
-    var q = rowQ[key];
-    if (q && q.length) q.shift()(); else delete rowQ[key];
-  };
-  var task = function(){
-    cell.textContent = v;
-    api("/api/field", {id:+key, field:cell.dataset.f, value:v, rev:+tr.dataset.rev||1},
-        function(j){
-          if (j.conflict){ cell.textContent = j.value; tr.dataset.rev = j.rev; }
-          else tr.dataset.rev = j.rev;
-          next();
-        }, next);
-  };
-  if (rowQ[key]) rowQ[key].push(task);
-  else { rowQ[key] = []; task(); }
-}
-function bindEdit(){
-  var pitch = editablePitch();   // 每行可编辑单元格数：时间 + 当前显示列
-  document.querySelectorAll("td.ed").forEach(function(td){
-    td.addEventListener("click", function(){
-      if (S.editing) return;
-      S.editing = true;
-      var old = td.textContent;
-      var sizer = document.createElement("span");
-      sizer.style.visibility = "hidden"; sizer.textContent = old;
-      td.textContent = ""; td.appendChild(sizer);
-      var opts = COL_OPTS[td.dataset.f];
-      var inp;
-      if (opts){   // 配置了 options 的列 → 下拉选择
-        inp = document.createElement("select");
-        inp.style.cssText = "position:absolute;left:0;top:0;width:100%;height:100%;" +
-          "border:none;outline:none;font:inherit;background:#fff8dc;padding:6px 4px;" +
-          "margin:0;box-sizing:border-box";
-        [""].concat(opts).forEach(function(o){
-          var op = document.createElement("option");
-          op.value = o; op.textContent = o || "(空)";
-          inp.appendChild(op);
-        });
-        inp.value = opts.indexOf(old) >= 0 ? old : "";
-      } else {
-        inp = document.createElement("input");
-        inp.value = old;
-      }
-      td.appendChild(inp);
-      inp.focus();
-      if (inp.tagName === "INPUT") inp.select();
-      var done = false;
-      function save(){
-        if (done) return; done = true; S.editing = false;
-        var v = inp.value.trim();
-        var tr = td.closest("tr");
-        td.textContent = v;
-        api("/api/field", {id: +tr.dataset.id, field: td.dataset.f, value: v,
-            rev: +tr.dataset.rev||1}, function(j){
-          if (j.conflict){
-            td.textContent = j.value; tr.dataset.rev = j.rev;
-            toast("该单元格刚被他人修改过，已显示最新值");
-          } else {
-            tr.dataset.rev = j.rev;
-            toast("已保存");
-          }
-        });
-      }
-      inp.addEventListener("keydown", function(e){
-        if (e.key === "Enter") inp.blur();
-        if (e.key === "Tab"){          // Tab / Shift+Tab 在单元格间跳转
-          e.preventDefault();
-          var cells = edCells();
-          var i = cells.indexOf(td);
-          var nx = cells[i + (e.shiftKey ? -1 : 1)];
-          inp.blur();                  // 先保存当前格
-          if (nx) nx.click();
-          return;
-        }
-        if (e.key === "Escape"){ done = true; S.editing = false; td.textContent = old; }
-      });
-      if (inp.tagName === "INPUT"){
-        inp.addEventListener("paste", function(e){   // Excel 式多行粘贴
-          var text = (e.clipboardData || window.clipboardData).getData("text");
-          if (!text || text.indexOf("\n") < 0) return;   // 单行照常粘贴
-          e.preventDefault();
-          done = true; S.editing = false;   // 先关闭 blur→save 通道，防止竞态覆盖
-          var lines = text.replace(/\r/g, "").split("\n");
-          if (lines.length && lines[lines.length-1] === "") lines.pop();
-          var cells = edCells();
-          var i0 = cells.indexOf(td), n = 0;
-          for (var li = 0; li < lines.length; li++){
-            var vals = lines[li].split("\t");
-            for (var vi = 0; vi < vals.length; vi++){
-              var cell = cells[i0 + li*pitch + vi];
-              if (!cell) break;
-              setCell(cell, vals[vi].trim());
-              n++;
-            }
-          }
-          if (inp.parentNode) inp.parentNode.removeChild(inp);  // 退出编辑态
-          if (n) toast("已粘贴 " + n + " 个单元格");
-        });
-      }
-      inp.addEventListener("blur", save);
-      if (inp.tagName === "SELECT") inp.addEventListener("change", function(){ inp.blur(); });
-    });
-  });
-}
-
-/* ---------- 行操作 ---------- */
-function addRow(){
-  api("/api/row", {sheet_id: S.cur}, function(j){ toast("已新增一行"); loadSheets(); loadRows(); });
-}
-function delRow(id){
-  if (!confirm("删除这条记录？")) return;
-  api("/api/row/delete", {ids:[id]}, function(j){ S.checked.delete(id); toast("已移入回收站"); loadSheets(); loadRows(); });
-}
-function delSelected(){
-  var ids = [];
-  document.querySelectorAll("#tb tr").forEach(function(tr){
-    var c = tr.querySelector("td.ck input");
-    if (c && c.checked) ids.push(+tr.dataset.id);
-  });
-  if (!ids.length){ toast("先勾选要删除的行"); return; }
-  if (!confirm("删除选中的 " + ids.length + " 条记录？\n（会移入回收站，可在回收站恢复）")) return;
-  api("/api/row/delete", {ids:ids}, function(j){
-    S.checked.clear();
-    toast("已移入回收站 " + ids.length + " 条"); loadSheets(); loadRows();
-  });
-}
-
-/* ---------- 导出 ---------- */
-function doExport(kind){
-  window.open("/export." + kind + "?sheet_id=" + S.cur, "_blank");
-}
-
-/* ---------- 回收站 ---------- */
-function openTrash(){
-  document.getElementById("trashMask").style.display = "flex";
-  api("/api/trash", null, function(j){
-    var b = document.getElementById("trashBody");
-    if (!j.rows.length){ b.innerHTML = "<div class='empty'>回收站是空的</div>"; return; }
-    var h = "<table><tr><th>删除时间</th><th>原表格</th><th>时间</th><th>来源</th><th>首个文件</th><th>操作</th></tr>";
-    j.rows.forEach(function(r){
-      h += "<tr data-id='" + r.id + "'><td class='t'>" + esc(r.deleted_at) + "</td><td>" +
-           esc(r.sheet_name || "-") + "</td><td class='t'>" + esc(r.shot_time) + "</td><td>" +
-           esc(r.machine || "-") + "</td><td class='t'>" + esc(r.first_file || "-") +
-           "</td><td><span class='lk' onclick=restoreOne(" + r.id + ")>恢复</span>" +
-           "<span class='lk red' onclick=trashOne(" + r.id + ")>彻底删除</span></td></tr>";
-    });
-    b.innerHTML = h + "</table>";
-  });
-}
-function closeTrash(){ document.getElementById("trashMask").style.display = "none"; }
-function restoreOne(id){
-  api("/api/trash/restore", {ids:[id]}, function(j){ toast("已恢复 " + j.restored + " 条");
-    openTrash(); loadSheets(); });
-}
-function trashOne(id){
-  if (!confirm("彻底删除这条记录？将无法恢复！")) return;
-  api("/api/trash/delete", {ids:[id]}, function(j){ openTrash(); });
-}
-function purgeTrash(){
-  if (!confirm("清空回收站？全部记录将永久删除！")) return;
-  api("/api/trash/delete", {}, function(j){ toast("回收站已清空"); openTrash(); loadSheets(); });
-}
-
-/* ---------- 告警横幅（B 机目录失效等） ---------- */
-function loadAlerts(){
-  fetch("/api/alerts", {cache:"no-store"}).then(function(r){ return r.json(); }).then(function(j){
-    var b = document.getElementById("banner");
-    if (!j.alerts || !j.alerts.length){ b.style.display = "none"; return; }
-    var a = j.alerts[0];
-    b.textContent = "⚠ [" + a.machine + "] " + a.message + "  (" + a.at + ")" +
-                    (j.alerts.length > 1 ? "  —— 共 " + j.alerts.length + " 条告警" : "");
-    var btn = document.createElement("span");
-    btn.textContent = "  [清除告警]";
-    btn.style.cssText = "cursor:pointer;text-decoration:underline;margin-left:8px";
-    btn.onclick = function(){
-      if (!confirm("清除全部告警记录？")) return;
-      api("/api/alerts/clear", {}, function(){ toast("告警已清除"); loadAlerts(); });
-    };
-    b.appendChild(btn);
-    b.className = a.level === "error" ? "" : "info";
-    b.style.display = "block";
-  }).catch(function(){});
-}
-
-/* ---------- 自动刷新：4 秒轮询（编辑中/回收站打开/页面隐藏时暂停） ---------- */
-setInterval(function(){
-  if (S.editing || document.hidden) return;
-  if (document.getElementById("trashMask").style.display === "flex") return;
-  if (document.querySelector("td.ed input, td.ed select")) return;
-  loadSheets(); loadAlerts();
-}, 4000);
-/* 切回标签页/恢复窗口时立即刷新，不等下一个 4 秒节拍 */
-document.addEventListener("visibilitychange", function(){
-  if (document.hidden || S.editing) return;
-  if (document.getElementById("trashMask").style.display === "flex") return;
-  loadSheets(); loadAlerts();
-});
-window.addEventListener("focus", function(){
-  if (S.editing) return;
-  if (document.getElementById("trashMask").style.display === "flex") return;
-  loadSheets();
-});
-
-/* ---------- 实时通道：SSE 收到数据变化通知立即刷新（4s 轮询仅兜底） ---------- */
-var ES = null;
-function connectSSE(){
-  if (!window.EventSource) return;
-  try { ES = new EventSource("/api/events"); } catch(e){ return; }
-  ES.onmessage = function(){
-    if (S.editing || document.hidden) return;
-    if (document.getElementById("trashMask").style.display === "flex") return;
-    if (document.querySelector("td.ed input, td.ed select")) return;
-    loadSheets(); loadAlerts();
-  };
-}
-connectSSE();
-
-/* ---------- 启动 ---------- */
-var COLS = __COLS__;
-COLS.forEach(function(c){ if (c.options) COL_OPTS[c.key] = c.options; });
-loadHidden();
-updateHideBtn();
-loadHash();
-loadSheets();
-loadAlerts();
-</script>
-</body>
-</html>"""
+def _load_ui_html():
+    """读 UI 模板（mtime 缓存）。绝不在这里抛异常打断 HTTP 通道。"""
+    try:
+        mt = os.path.getmtime(_UI_PATH)
+        if _UI_CACHE["mtime"] != mt or _UI_CACHE["html"] is None:
+            with open(_UI_PATH, encoding="utf-8") as f:
+                _UI_CACHE["html"] = f.read()
+            _UI_CACHE["mtime"] = mt
+        return _UI_CACHE["html"]
+    except OSError as e:
+        return ("<!DOCTYPE html><meta charset=utf-8>"
+                "<h2>UI 模板缺失</h2><p>%s 读不到: %r</p>"
+                "<p>请 git pull 补齐 ui/ 目录。</p>"
+                % (_UI_PATH, e))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1448,6 +728,27 @@ class Handler(BaseHTTPRequestHandler):
         files_sorted = sorted(files, key=lambda f: f.get("mtime", 0))
         first = files_sorted[0] if files_sorted else {}
         first_name = first.get("name", "")
+        # ---- 入口校验：绝不接受"不像发次"的上报（第二道防线）----
+        # B 机侧已有白名单，这里再挡一次：某台机 config 配错 / 旧版本未更新 /
+        # 有人手工 curl，都不能污染日志表。拒绝时写账本留证据，不静默吞掉。
+        if not files_sorted or not first_name:
+            aled({"ev": "a_shot_reject", "reason": "empty_files",
+                  "machine": machine, "shot_time": shot_time,
+                  "client_ip": self.client_address[0]},
+                 day=str(shot_time)[:10] or None)
+            return self._err("files 为空：无法建行（一行必须对应一个 shot 文件）")
+        if ENFORCE_SHOT_FILE:
+            bad = [f.get("name", "") for f in files_sorted
+                   if not SHOT_FILE_RE.match(str(f.get("name", "")))]
+            if bad:
+                aled({"ev": "a_shot_reject", "reason": "not_shot_file",
+                      "machine": machine, "shot_time": shot_time,
+                      "names": bad[:10], "client_ip": self.client_address[0]},
+                     day=str(shot_time)[:10] or None)
+                return self._err(
+                    "文件名不符合发次命名规则，拒绝建行: %s"
+                    "（如确需纳入，改 config_a.json 的 shot_file_patterns，"
+                    "或把 enforce_shot_file 设为 false）" % bad[:3])
         new_id, drev = None, None   # 建行/去重两条路径共用，供末尾统一返回
         with _db_lock, db() as conn:
             if p.get("sheet_id"):
@@ -1469,12 +770,12 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT id, fields FROM shots WHERE machine IS ? AND shot_time=? "
                 "AND first_file IS ? AND sheet_id=?",
                 (machine, shot_time, first_name, sh["id"])).fetchone()
-            # 跨机器同发次合并：C机发次号与B机无对应关系（编号不可参考），
-            # 只按时间窗口匹配 shot_xx.PNG 的打靶时间。仅"不同机器"才允许合并
-            # （C机 shor_x.tif 并入 B机 shot_x.PNG 的行）；同一台机器的连续发次
-            # （快速连打 shot79/shot80 差 15s）绝不并入——一个 shot 文件 = 一条记录。
+            # 跨机器同发次合并 —— **默认关闭**（SHOT_MERGE_SEC=0）。
+            # 现行口径：C 机永不建行（只推 tif 时间表给 B 机做能量匹配），
+            # 所以"跨机合并"已无使用场景；留着只会像 09-30 那样吃掉连发。
+            # 一个 shot 文件 = 一条记录，同机/跨机都不合并。
             near = None
-            if not dup:
+            if not dup and SHOT_MERGE_SEC > 0:
                 cand = conn.execute(
                     "SELECT id, fields, sheet_id, shot_time, machine FROM shots WHERE "
                     "ABS(julianday(shot_time) - julianday(?)) * 86400 <= ? "
@@ -1572,7 +873,9 @@ class Handler(BaseHTTPRequestHandler):
            只在目标行没有 No. 时补写，绝不改写；行 No 与 shot_no 不一致时
            在返回中带 no_mismatch 提示）；
         2. 窗口未中且带 shot_no：精确匹配当天 fields.no == shot_no 的行兜底；
-        3. 都没中：返回 no_match（可 create:true 补录独立记录）。
+        3. 都没中：返回 no_match。⚠️ **能量绝不建行/建表**——一行只能由
+           B 机的 shot PNG 发次建立，能量只能绑到已存在的行；调用方
+           （B 机 helper）会把这条能量暂存起来，等对应发次行出现后再重绑。
         能量可重复发送（覆盖更新），便于解谱修正后重报。"""
         p = self._json_body()
         st = norm_shot_time(p.get("shot_time"))
@@ -1837,7 +1140,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- 页面 ----------
     def page_index(self):
-        self._send(200, PAGE.replace("__COLS__", json.dumps(COLS, ensure_ascii=False)))
+        self._send(200, _load_ui_html().replace("__COLS__", json.dumps(COLS, ensure_ascii=False)))
 
     def log_message(self, fmt, *args):
         pass  # 静默访问日志

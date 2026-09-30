@@ -17,8 +17,12 @@
      写入 A 机；解谱后填入能量点"发送"→ A 机 /api/energy 绑定/覆盖能量列。
   4. 绑定问题兜底：
      - 发送失败 → 状态"发送失败"，可重发；
-     - 窗口内找不到发次（如 A 机漏记）→ 状态"无匹配发次"，
-       页面显示 A 机最近一条记录时间，可点"补录"强行建一条独立记录。
+     - 窗口内找不到发次（B 机还没建这一行 / C 机能量比 B 机 PNG 早到）
+       → 状态"无匹配发次"，能量**本地留存**（state_helper.json 的 unmatched
+       列表 + 账本），等对应发次行建好后自动/手动重绑。
+     - ⚠️ 能量**永远不会**单独建行、更不会新建表格：一行 = 一个 B 机
+       shot PNG 发次，这是全系统唯一建行入口（旧的"补录独立记录"已废弃，
+       A 机 /api/energy 也不再支持 create）。
 
 特性：
   - 纯 Python 标准库，零第三方依赖
@@ -488,6 +492,20 @@ def _export_daily_csv(day, data):
 STATE_PATH = os.path.join(BASE, "state_helper.json")
 B_LOCAL_CONFIG_PATH = os.path.join(BASE, "config_b.local.json")  # b_watcher 本机配置（监视目录变更需同步给它）
 
+# 生产数据写保护开关：只有 main() 真正从磁盘 load 过 STATE 后才置 True。
+# 测试/脚本 `import thomson_helper` 时它恒为 False → save_state() 直接 no-op，
+# 绝不会覆盖生产 state_helper.json（2026-10-01 清空事故的根治）。
+_STATE_LOADED = False
+_WARNED = set()          # 同类告警只打一次，避免刷屏
+
+
+def _warn_once(msg):
+    if msg in _WARNED:
+        return
+    _WARNED.add(msg)
+    log("⚠ " + msg)
+
+
 # RLock：save_state() 在调用方已持锁时也会被调用，必须可重入
 _state_lock = threading.RLock()
 STATE = {"seen": {}, "pend": [], "shots": [], "queue": [], "no_seq": {},
@@ -744,6 +762,35 @@ def live_fetch_target(timeout=3.0, min_gap=3.0):
     return d
 
 
+# live_fetch_target 的异步版：主循环发现新文件时调用它，**绝不阻塞扫描**。
+# 同步版会在靶系统离线时卡住 3s（实测），这段时间主循环完全不扫描——
+# 这就是"说好百 ms、实际十几秒"的真凶之一。改成后台线程跑，主循环立即返回。
+_LIVE_INFLIGHT = threading.Event()   # 已有查询在飞就不再叠加
+
+
+def live_fetch_target_async(timeout=3.0, min_gap=3.0):
+    """非阻塞触发一次实时靶位查询。结果稍后进 TARGET_HIST；
+    发次转正时若查询还没回来，attach_target 自动降级用最近的历史样本。"""
+    now = time.time()
+    with _LIVE_TGT["lock"]:
+        if now - _LIVE_TGT["t"] < min_gap:
+            return False                       # 节流窗口内，跳过
+        if _LIVE_INFLIGHT.is_set():
+            return False                       # 上一次还在飞，不叠加
+        _LIVE_TGT["t"] = now
+        _LIVE_INFLIGHT.set()
+
+    def _run():
+        try:
+            live_fetch_target(timeout=timeout, min_gap=0)
+        except Exception as e:
+            log("异步实时靶位查询异常: %r" % e)
+        finally:
+            _LIVE_INFLIGHT.clear()
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
 def bump_ver():
     global STATE_VER
     STATE_VER += 1
@@ -814,6 +861,18 @@ def save_json(path, data):
 
 
 def save_state():
+    # ══════════ 生产数据写保护（2026-10-01 事故的根治） ══════════
+    # 事故：AI 的测试进程 `import thomson_helper` 后调用了会触发 save_state()
+    # 的函数 → 把内存里的**空 STATE** 写进 state_helper.json，
+    # 覆盖了 289 条发次 + 14216 条 seen（靠运行实例内存才抢回来）。
+    # 两道锁，缺一都可能再次清空生产数据：
+    #   锁1 _STATE_LOADED：只有 main() 真正从磁盘恢复过状态，才允许写盘。
+    #        → 测试/脚本 import 模块后绝不可能覆盖生产文件。
+    #   锁2 空数据保护：STATE 全空而磁盘已有数据时拒绝覆盖。
+    #        → 即使 load 失败/config 读错，也不会把库清空。
+    # 确需强制写空（如彻底重置）：设环境变量 LSL_FORCE_EMPTY_STATE=1。
+    if not _STATE_LOADED and os.environ.get("LSL_FORCE_EMPTY_STATE") != "1":
+        return
     with _state_lock:
         # _files（文件明细 name/folder/path/浮点mtime）只活在内存里给账本用，
         # 不落盘：state_helper.json 已 1.7MB，再塞 289 发 × 明细会翻几倍，
@@ -827,6 +886,21 @@ def save_state():
         if isinstance(fm, dict):
             slim["forming_shot"] = {k: v for k, v in fm.items()
                                     if k != "_files"}
+        if os.environ.get("LSL_FORCE_EMPTY_STATE") != "1":
+            empty_now = (not slim.get("shots") and not slim.get("seen"))
+            if empty_now:
+                try:
+                    old = json.load(open(STATE_PATH, encoding="utf-8"))
+                except Exception:
+                    old = {}
+                if old.get("shots") or old.get("seen"):
+                    _warn_once(
+                        "拒绝把空状态写进 state_helper.json（磁盘已有 "
+                        "%d 发/%d seen）。如确需清空，先停 helper 并设 "
+                        "LSL_FORCE_EMPTY_STATE=1。"
+                        % (len(old.get("shots") or []),
+                           len(old.get("seen") or {})))
+                    return
         save_json(STATE_PATH, slim)
 
 
@@ -902,14 +976,97 @@ def _scan_dir(d, out):
         _scan_dir(sub, out)
 
 
-# 非发次文件（谱仪目录里的记录/日志类文件）：不参与发次检测，防止刷假发次
-# 规则：① 名为"发次记录*"的文件；② 所有 .txt/.log/.ini/.tmp/.csv/.xls/.xlsx/.json
+# ---------------- 发次文件识别：白名单（默认，09-30 教训） ----------------
+# 旧做法是黑名单（只排除 .txt/.log/.xls/发次记录*），但监视父目录
+# D:\data_main\Target_Front\2026 下实测有 **1517 个非发次 PNG**：
+#   高倍靶前-20260109-161102-761-...PNG / 315远场-Snapshot-...PNG /
+#   15B 高倍靶前-TF20260424-...PNG / M1回光测量-Snapshot-...PNG …
+# 这些一旦新落盘就被当成"发次"，而且文件名里没有 shot 编号 → 解析不出 no
+# → 走"自动补号"抢走真发次的序号，整表条目错位（09-30 shot21/22/79/80 之乱）。
+#
+# 新规则：**只有文件名匹配发次命名规则的才可能建条目**，其余一律只登记不处理。
+# 现场遇到没收进来的新相机命名时，改 config 的 shot_file_patterns 即可，
+# 无需改代码；实在来不及可把 shot_file_mode 设成 "blacklist" 应急回退。
 _META_FILE_RE = re.compile(
     r"发次记录[^/\\]*$|\.(txt|log|ini|tmp|csv|xls|xlsx|json)$", re.IGNORECASE)
+
+DEFAULT_SHOT_PATTERNS = [
+    r"^shot[-_ ]?\d+\.(png|tif|tiff|dat|raw|jpg|jpeg|bmp)$",   # B机 shot79.PNG
+    r"^shor[-_ ]?\d+\.(png|tif|tiff|dat|raw|jpg|jpeg|bmp)$",   # C机 shor_79.tif
+]
+
+_PAT_CACHE = {}        # {(mode, patterns元组): 编译好的 re} —— 支持热重载
+_IGNORED_SEEN = set()  # 已提示过"被忽略"的文件名模式，避免每 200ms 刷屏
 
 
 def is_meta_file(path):
     return bool(_META_FILE_RE.search(os.path.basename(str(path))))
+
+
+def _shot_filter():
+    """返回 (mode, 白名单正则)。config 改了自动重编译（缓存按配置签名）。"""
+    cfg = CFG or {}
+    pats = cfg.get("shot_file_patterns") or DEFAULT_SHOT_PATTERNS
+    if not isinstance(pats, (list, tuple)) or not pats:
+        pats = DEFAULT_SHOT_PATTERNS
+    mode = str(cfg.get("shot_file_mode", "whitelist")
+               or "whitelist").strip().lower()
+    if mode not in ("whitelist", "blacklist"):
+        mode = "whitelist"
+    key = (mode, tuple(str(x) for x in pats))
+    rx = _PAT_CACHE.get(key)
+    if rx is None:
+        try:
+            rx = re.compile("|".join(pats), re.IGNORECASE)
+        except re.error as e:
+            log("shot_file_patterns 正则非法(%r)，回退默认白名单" % e)
+            rx = re.compile("|".join(DEFAULT_SHOT_PATTERNS), re.IGNORECASE)
+        _PAT_CACHE[key] = rx
+    return mode, rx
+
+
+def is_shot_file(path):
+    """这个文件能不能建发次条目？白名单模式下：只有匹配发次命名的才行。"""
+    name = os.path.basename(str(path))
+    mode, rx = _shot_filter()
+    if mode == "blacklist":        # 应急回退：旧行为（只排黑名单）
+        return not is_meta_file(name)
+    return bool(rx.match(name))
+
+
+def _shot_filter_desc():
+    """启动日志用：当前发次识别规则的人话描述。"""
+    mode, rx = _shot_filter()
+    if mode == "blacklist":
+        return ("黑名单(应急模式，不推荐)",
+                "除 .txt/.log/.xls/发次记录* 外都当发次")
+    return ("白名单", rx.pattern)
+
+
+def note_ignored(files):
+    """被白名单挡掉的新文件：每类命名只提示一次 + 写账本（留证据）。
+    现场如果看到"某真发次被忽略了"，把它的命名加进 config 的
+    shot_file_patterns 即可，不必改代码。"""
+    if not files:
+        return
+    fresh = []
+    for p, mt in files:
+        name = os.path.basename(str(p))
+        sig = re.sub(r"\d+", "N", name).lower()     # 数字归一 → 同类只报一次
+        if sig in _IGNORED_SEEN:
+            continue
+        _IGNORED_SEEN.add(sig)
+        fresh.append((name, sig, mt))
+    if not fresh:
+        return
+    for name, sig, mt in fresh[:5]:
+        log("已忽略非发次文件: %s（不建条目；如需纳入请改 config 的 "
+            "shot_file_patterns）" % name)
+    if len(fresh) > 5:
+        log("…另有 %d 类非发次文件被忽略" % (len(fresh) - 5))
+    led({"ev": "file_ignored", "count": len(files),
+         "kinds": [{"name": n, "pattern": s} for n, s, _m in fresh[:20]],
+         "mode": _shot_filter()[0]})
 
 
 def group_into_shots(entries, window):
@@ -1363,11 +1520,13 @@ def ingest_detect(payload):
     st = str(payload.get("shot_time", "")).strip()
     if not st:
         return {"ok": False, "error": "shot_time 为空"}
-    # 过滤非发次文件（发次记录.txt 等）：b_watcher 分组前没过滤也在这里兜底
+    # 兜底过滤（b_watcher 侧已过滤，这里再挡一次）：只收发次命名文件。
+    # 白名单模式下的意义：即使有人改了 config_b.local.json 的 watch_exts
+    # 把 .txt/.PNG 全放进来，这里也不会让它变成发次条目。
     raw_files = payload.get("files") or []
     files = [f for f in raw_files
-             if not is_meta_file(f.get("name", "") if isinstance(f, dict)
-                                 else str(f))]
+             if is_shot_file(f.get("name", "") if isinstance(f, dict)
+                             else str(f))]
     if not files:
         return {"ok": True, "merged": False, "ignored": True}
     names = [(f.get("name", "") if isinstance(f, dict) else str(f))
@@ -1493,11 +1652,17 @@ def report_shot(shot):
 
 
 def retry_queue():
-    """补发断网期间没送出去的发次上报"""
+    """补发断网期间没送出去的发次上报。
+    ⚠️ 这是**阻塞**函数：每条 http_post_json timeout=6s，队列 N 条最坏 N×6s。
+    只能由 retry_loop() 后台线程调用，**绝不能在 monitor_loop 主循环里同步调**
+    （09-30 的教训：主循环被它卡住十几秒，页面看着像"监测延迟 10s"）。"""
     if not STATE["queue"]:
         return
+    with _state_lock:
+        todo = list(STATE["queue"])      # 取快照再发，避免长时间持锁
+    todo_ids = {id(pl) for pl in todo}   # 用对象身份区分，避免 dict 值相等误删
     still = []
-    for pl in STATE["queue"]:
+    for pl in todo:
         try:
             j = http_post_json(SERVER_URL.rstrip("/") + "/api/shot", pl)
             log("补发成功: %s" % pl.get("shot_time"))
@@ -1511,11 +1676,35 @@ def retry_queue():
             led({"ev": "report_retry", "shot_time": pl.get("shot_time"),
                  "ok": False, "err": repr(ex)},
                 day=str(pl.get("shot_time", ""))[:10] or None)
-    if len(still) != len(STATE["queue"]):
-        with _state_lock:
-            STATE["queue"] = still
-            bump_ver()
-            save_state()
+    with _state_lock:
+        # 保留"补发期间主循环新塞进来的"（不在 todo 快照里的）+ 本轮没发成功的。
+        # 绝不整体覆盖 STATE["queue"]，否则会把补发期间新增的失败条目弄丢。
+        newcomers = [pl for pl in STATE["queue"] if id(pl) not in todo_ids]
+        STATE["queue"] = newcomers + still
+        bump_ver()
+        save_state()
+
+
+_RETRY_LOCK = threading.Lock()
+
+
+def retry_loop(gap=30.0):
+    """独立后台线程：周期性补发失败队列。
+    与 monitor_loop 解耦——A 机不通时补发线程慢慢等，扫描照常百 ms 级跑。"""
+    while True:
+        try:
+            if STATE.get("queue") and _RETRY_LOCK.acquire(blocking=False):
+                try:
+                    n0 = len(STATE["queue"])
+                    retry_queue()
+                    n1 = len(STATE["queue"])
+                    if n1 != n0:
+                        log("补发线程: 队列 %d → %d" % (n0, n1))
+                finally:
+                    _RETRY_LOCK.release()
+        except Exception as e:
+            log("补发线程异常(继续): %r" % e)
+        time.sleep(gap)
 
 
 def _norm_dir(d):
@@ -1724,7 +1913,10 @@ def monitor_loop(interval, window):
     missing_seen = {}      # {目录: 上次告警时间}，60 秒节流
     while True:
         try:
-            retry_queue()
+            # ⚠️ retry_queue() 不在这里同步调了——它每条 http_post_json
+            # timeout=6s，A 机 IP 不通时队列有 N 条就阻塞 N×6s，主循环这期间
+            # 完全不扫描（"说好百 ms、实际十几秒"的真凶之一）。已移到独立
+            # 后台线程 retry_loop()，与扫描解耦。
             dirs = list(WATCH_DIRS)       # 快照：页面改目录后下一轮即生效
             _t0 = time.time()
             entries, missing = scan_all(dirs)
@@ -1739,11 +1931,27 @@ def monitor_loop(interval, window):
                 if d not in missing:
                     del missing_seen[d]
                     log("目录已恢复: %s" % d)
-            new_entries = [(p, mt) for p, mt in entries
-                           if p not in STATE["seen"] and not is_meta_file(p)]
+            new_entries = []
+            ignored = []
+            for p, mt in entries:
+                if p in STATE["seen"]:
+                    continue
+                # 白名单：只有发次命名（shot79.PNG / shor_79.tif）才进发次检测。
+                # 其余（高倍靶前-*.PNG、315远场-Snapshot-*.PNG、发次记录.txt…）
+                # 只登记 seen，绝不建条目、绝不参与归组与补号。
+                if is_shot_file(p):
+                    new_entries.append((p, mt))
+                else:
+                    ignored.append((p, mt))
+                    STATE["seen"][p] = mt
+            if ignored:
+                note_ignored(ignored)
             if new_entries:
-                # 关键：发现新文件立刻实时取靶位（不是等转正后的"当前值"）
-                live_fetch_target()
+                # 关键：发现新文件立刻实时取靶位（不是等转正后的"当前值"）。
+                # 异步版：靶系统离线时不会阻塞主循环 3s（实测同步版会卡）。
+                # 结果稍后进 TARGET_HIST；发次转正时若还没回来，
+                # attach_target 自动降级用最近的历史样本（最多 30s 旧）。
+                live_fetch_target_async()
             all_new = [tuple(x) for x in STATE["pend"]] + new_entries
             # 即时行：有未到齐的文件（含刚落盘还没过安静期的）立刻上表显示
             forming = None
@@ -1876,1046 +2084,27 @@ def monitor_loop(interval, window):
 
 # ---------------- 本机页面（视觉与 A 机主系统同一套风格） ----------------
 
-HELP_PAGE = r"""<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<title>打靶日志系统 · 谱仪上报</title>
-<style>
-  *{box-sizing:border-box}
-  body{font-family:"Microsoft YaHei",sans-serif;margin:0;background:#f0f2f5;color:#222;
-       display:flex;flex-direction:column;height:100vh;overflow:hidden}
-  /* ---------- 顶栏（与主系统侧栏同色系） ---------- */
-  #top{background:#243342;color:#dfe6ee;display:flex;align-items:center;
-       padding:0 20px;flex-shrink:0;height:52px}
-  #top .logo{font-size:16px;font-weight:bold}
-  #top .logo small{font-weight:normal;color:#8fa4bb;font-size:11px;margin-left:10px}
-  #top .right{margin-left:auto;font-size:12px;color:#8fa4bb;display:flex;
-              align-items:center;gap:8px}
-  .dot{width:9px;height:9px;border-radius:50%;background:#666;display:inline-block}
-  .dot.ok{background:#2ecc71}.dot.bad{background:#e74c3c}
-  /* ---------- 信息条（两行分组：操作/状态在上，环境信息在下） ---------- */
-  #bar{background:#fff;padding:8px 16px;border-bottom:1px solid #e2e4e8;font-size:13px;
-       color:#666;flex-shrink:0}
-  .brow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  .brow + .brow{margin-top:7px}
-  .chip{display:inline-flex;align-items:center;gap:5px;background:#f6f8fa;
-        border:1px solid #e4e8ec;border-radius:8px;padding:4px 10px;white-space:nowrap}
-  .chip b{color:#2c3e50}
-  #dirs{display:inline-block;max-width:460px;overflow:hidden;text-overflow:ellipsis;
-        vertical-align:bottom;white-space:nowrap}
-  .bbtn{padding:4px 12px;cursor:pointer;border-radius:6px;font-size:12px;
-        font-family:inherit;background:#fff;color:#333;border:1px solid #ccd}
-  .bbtn:hover{background:#f0f3f6}
-  .bbtn.red{border-color:#ecc;color:#c33}
-  .bbtn.red:hover{background:#fdf3f3}
-  .bbtn.green{border-color:#9c8;background:#f4fbf4;color:#2a7}
-  .bbtn.green:hover{background:#e9f7e9}
-  /* ---------- 表格（同主系统数据表） ---------- */
-  .wrap{flex:1;overflow:auto;background:#fff}
-  table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;
-        font-size:13px}
-  th{background:#2c3e50;color:#fff;padding:8px 10px;text-align:left;font-weight:normal;
-     white-space:nowrap;position:sticky;top:0;z-index:3}
-  td{border-bottom:1px solid #eceef1;border-right:1px solid #f2f3f5;padding:6px 10px;
-     white-space:nowrap;vertical-align:middle}
-  tr:hover td{background:#f2f7ff}
-  td.t{font-family:Consolas,monospace}
-  .files{color:#888;font-size:12px;max-width:360px;overflow:hidden;
-         text-overflow:ellipsis;max-width:360px}
-  input.e{width:110px;padding:6px 8px;border:1px solid #d5d9de;border-radius:5px;
-          font-size:13px;font-family:inherit}
-  input.e:focus{outline:none;border-color:#9fc3e8;background:#fff8dc}
-  input.n{width:54px;padding:6px 6px;border:1px solid #d5d9de;border-radius:5px;
-          font-size:13px;text-align:center;font-family:Consolas,monospace}
-  input.n:focus{outline:none;border-color:#9fc3e8;background:#fff8dc}
-  input.tm{width:100%;min-width:72px;box-sizing:border-box;padding:3px 4px;
-           border:1px solid #dde;border-radius:4px;font-size:12px;
-           font-family:inherit;text-align:center}
-  input.tm:focus{outline:none;border-color:#9fc3e8;background:#fff8dc}
-  .tbtn{background:#2c3e50;color:#fff;border:none;border-radius:5px;padding:6px 14px;
-        font-size:13px;cursor:pointer;font-family:inherit}
-  .tbtn:hover{background:#3d5875}
-  .tbtn.orange{background:#d35400}
-  .tbtn.orange:hover{background:#e67e22}
-  .st{display:inline-block;padding:2px 10px;border-radius:10px;font-size:12px}
-  .st.pending{background:#f6e8c8;color:#8a6d3b}
-  .st.sent{background:#d4edda;color:#256029}
-  .st.forming{background:#e2e3fe;color:#3d3d8f}
-  .st.no_match{background:#f8d7da;color:#721c24}
-  .st.error{background:#f8d7da;color:#721c24}
-  .empty{padding:50px;text-align:center;color:#999}
-  /* ---------- 底部状态（同主系统 pager） ---------- */
-  #foot{background:#fff;border-top:1px solid #e2e4e8;padding:8px 20px;font-size:13px;
-        color:#888;flex-shrink:0}
-  .toast{position:fixed;top:18px;left:50%;transform:translateX(-50%);background:#2c3e50;
-         color:#fff;padding:8px 22px;border-radius:20px;font-size:13px;display:none;
-         box-shadow:0 2px 8px rgba(0,0,0,.25);z-index:99}
-  @media print{
-    body{display:block;height:auto;overflow:visible;background:#fff}
-    #top,#bar,#foot,.toast{display:none !important}
-    .wrap{overflow:visible}
-    th{background:#eee !important;color:#000 !important;position:static}
-  }
-</style>
-</head>
-<body>
-<div id="top">
-  <span class="logo">打靶日志系统<small>谱仪上报终端 · BLAC 实验数据 · 内网</small></span>
-  <span class="right">
-    <span id="machine"></span>
-    <span class="dot" id="dot"></span><span id="srv"></span>
-  </span>
-</div>
-<div id="bar">
-  <div class="brow">
-    <span class="chip">上报表格：<b id="sheetName" style="cursor:pointer;border-bottom:1px dotted #888"
-          onclick="openSheet()" title="点击选择打靶上报写入的表格">-</b></span>
-    <span class="chip">查看日期：<input type="text" id="viewDate" placeholder="YYYY-MM-DD"
-          onchange="setVDate(this.value)"
-          onkeydown="if(event.key==='Enter'){setVDate(this.value);this.blur();}"
-          title="支持测试日期，如 2026-09-31；清空回车 = 今天"
-          style="width:86px;padding:1px 4px;border:1px solid #d5d8dc;border-radius:5px;
-          font-family:inherit;font-size:12px"></span>
-    <span class="chip">本日 <b id="nday">0</b> 发｜未上报 <b id="npending"
-          style="color:#c0392b">0</b> 发</span>
-    <span class="chip">当前靶位：<b id="tgt">…</b><span id="tgtF"
-          style="color:#888;font-size:12px"></span></span>
-    <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
-      <button class="bbtn" onclick="clearShots('sent')">清理已绑定</button>
-      <button class="bbtn red" onclick="clearShots('all')">清空列表</button>
-      <button class="bbtn" onclick="openTmap()">靶类型</button>
-      <button class="bbtn" onclick="openTrash()">回收站</button>
-      <button class="bbtn green" onclick="window.open('/export.xlsx')">导出Excel</button>
-    </span>
-  </div>
-  <div class="brow">
-    <span class="chip">监视目录：<b id="dirs" style="cursor:pointer;border-bottom:1px dotted #888"
-          onclick="openDirs()" title="点击管理监视目录">-</b></span>
-    <span class="chip">绑定窗口 ±<input id="win" type="number" min="3" max="300"
-          step="1" value="CFG_WINDOW" onchange="setWin(this)"
-          title="能量与发次的时间绑定窗口，改完回车/点别处生效"
-          style="width:48px;padding:1px 4px;border:1px solid #d5d8dc;border-radius:5px;
-          font-family:inherit;font-size:12px;text-align:center">s</span>
-    <span class="chip">能量写入列：<b id="efields">-</b></span>
-  </div>
-</div>
-<div class="wrap">
-  <table>
-    <thead><tr>
-      <th>No.</th><th>发次时间</th><th>图片数</th><th>图片文件</th>
-      <th>靶位/离焦</th><th>靶类型</th>
-      <th>能量（闪烁光纤 / TPS）</th><th>状态</th><th>操作</th>
-    </tr></thead>
-    <tbody id="tb"></tbody>
-  </table>
-</div>
-<div id="foot">打靶需在页面点「确认上报」后才写入日志系统 ｜ 切换「查看日期」可回看当天上报情况（未上报/漏报一目了然）｜ 旧/误发次点"忽略"进回收站（右上可恢复） ｜ 右上「导出Excel」备份当前列表</div>
-<div id="toast"></div>
-<div id="dirMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
-     z-index:50;align-items:center;justify-content:center"
-     onclick="if(event.target===this)closeDirs()">
-  <div style="background:#fff;border-radius:12px;width:600px;max-width:92vw;
-       padding:20px 24px;max-height:80vh;overflow:auto">
-    <div style="display:flex;align-items:center;margin-bottom:6px">
-      <b style="font-size:15px">监视目录管理</b>
-      <span style="margin-left:auto;cursor:pointer;color:#999;font-size:20px;
-            line-height:1" onclick="closeDirs()">✕</span>
-    </div>
-    <div style="font-size:12px;color:#888;margin-bottom:12px">
-      点"浏览…"会弹出本机文件夹选择窗口（真实路径自动填入）；也可直接手动输入。
-      新增目录会静默登记其中已有文件（历史数据不会误报为新发次）；删除即时生效，
-      并自动同步给打靶监测（b_watcher），两侧目录始终一致。
-    </div>
-    <div id="dirList"></div>
-    <div style="display:flex;gap:8px;margin-top:12px">
-      <input id="newDir" style="flex:1;padding:7px 10px;border:1px solid #d5d9de;
-             border-radius:6px;font-size:13px;font-family:Consolas,monospace"
-             placeholder="输入目录，如 D:\data117\TPS 或 D:\实验数据\XXX"
-             onkeydown="if(event.key==='Enter')addDir()">
-      <button class="tbtn" id="btnBrowse" onclick="browseDir()">浏览…</button>
-      <button class="tbtn" onclick="addDir()">添加</button>
-    </div>
-  </div>
-</div>
-<div id="sheetMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
-     z-index:50;align-items:center;justify-content:center"
-     onclick="if(event.target===this)closeSheet()">
-  <div style="background:#fff;border-radius:12px;width:520px;max-width:92vw;
-       padding:20px 24px;max-height:80vh;overflow:auto">
-    <div style="display:flex;align-items:center;margin-bottom:6px">
-      <b style="font-size:15px">上报表格绑定</b>
-      <span style="margin-left:auto;cursor:pointer;color:#999;font-size:20px;
-            line-height:1" onclick="closeSheet()">✕</span>
-    </div>
-    <div style="font-size:12px;color:#888;margin-bottom:12px">
-      选择打靶记录写入的表格：切换后立即生效（含打靶上报与能量页自动上报），
-      b_watcher 同步跟随，无需重启。表格不存在时 A 机会自动创建。
-    </div>
-    <div id="sheetList"></div>
-  </div>
-</div>
-<div id="tmapMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
-     z-index:50;align-items:center;justify-content:center"
-     onclick="if(event.target===this)closeTmap()">
-  <div style="background:#fff;border-radius:12px;width:960px;max-width:94vw;
-       padding:20px 24px;max-height:84vh;overflow:auto">
-    <div style="display:flex;align-items:center;margin-bottom:6px">
-      <b style="font-size:15px">靶类型映射表（第 x 次打靶靶位表）</b>
-      <span style="margin-left:auto;cursor:pointer;color:#999;font-size:20px;
-            line-height:1" onclick="closeTmap()">✕</span>
-    </div>
-    <div style="font-size:12px;color:#888;margin-bottom:12px">
-      1:1 复刻打靶靶位表（Sheet4）：蓝格＝靶类型，白格＝靶位编号/待填；
-      合并的大格＝同一靶块（一个类型管整块靶位），改一处整块生效，失焦自动保存。
-      手动值优先于 xls 自动映射；清空一格 = 整块恢复 xls 自动值。
-      保存后待确认列表的靶类型列实时刷新。
-    </div>
-    <div id="tmapList"></div>
-  </div>
-</div>
-<div id="trashMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
-     z-index:50;align-items:center;justify-content:center"
-     onclick="if(event.target===this)closeTrash()">
-  <div style="background:#fff;border-radius:12px;width:640px;max-width:92vw;
-       padding:20px 24px;max-height:80vh;overflow:auto">
-    <div style="display:flex;align-items:center;margin-bottom:6px">
-      <b style="font-size:15px">回收站（忽略/清理的发次都在这里，可恢复）</b>
-      <span style="margin-left:auto;cursor:pointer;color:#999;font-size:20px;
-            line-height:1" onclick="closeTrash()">✕</span>
-    </div>
-    <div style="font-size:12px;color:#888;margin-bottom:12px">
-      「忽略」和「清理/清空列表」只是把发次移到这里，不写日志系统也不丢数据；
-      可单条「恢复」回待确认列表，或「彻底删除」永久移除（无法恢复）。
-    </div>
-    <div style="margin-bottom:10px">
-      <button onclick="clearTrash()" style="padding:3px 10px;cursor:pointer;
-        border:1px solid #ecc;border-radius:6px;background:#fff;color:#c33">清空回收站</button>
-    </div>
-    <div id="trashList"></div>
-  </div>
-</div>
-<script>
-var SHOTS = [], LASTJSON = "", T = null;
-var CFG_EFIELDS = CFG_EFIELDS_JSON;   /* 能量列清单（服务端注入，只替换一次） */
-function toast(s){
-  var t = document.getElementById("toast");
-  t.textContent = s; t.style.display = "block";
-  clearTimeout(T); T = setTimeout(function(){ t.style.display = "none"; }, 2600);
-}
-function stLabel(s){
-  return {pending:"待确认", sent:"已绑定", no_match:"无匹配发次",
-          error:"发送失败", forming:"检测中…"}[s] || s;
-}
-function eStr(s){
-  var es = s.energies || {}, parts = [];
-  CFG_EFIELDS.forEach(function(ef){
-    var v = String(es[ef.key] || "").trim();
-    if (v) parts.push(ef.label.replace("能量","") + ":" + v);
-  });
-  if (!parts.length && s.energy) parts.push(String(s.energy));
-  return parts.join("  ");
-}
-function todayStr(){
-  var d = new Date();
-  return d.getFullYear() + "-" + ("0"+(d.getMonth()+1)).slice(-2) +
-         "-" + ("0"+d.getDate()).slice(-2);
-}
-var VDATE = "";
-function setVDate(v){
-  /* 文本框替代原生 date 控件：原生控件存不了 2026-09-31 这类测试日期 */
-  v = (v || "").trim();
-  if (v === ""){
-    VDATE = todayStr();
-  } else if (!/^\d{4}-\d{2}-\d{2}$/.test(v)){
-    toast("日期格式应为 YYYY-MM-DD（测试日期如 2026-09-31 也可以）");
-    document.getElementById("viewDate").value = VDATE;
-    return;
-  } else {
-    VDATE = v;
-  }
-  document.getElementById("viewDate").value = VDATE;
-  render(); LASTJSON = "";
-}
-function viewIdx(){   // 当前查看日期对应的 SHOTS 下标（本地留痕，按发次时间过滤）
-  if (!VDATE) return SHOTS.map(function(_, i){ return i; });
-  return SHOTS.map(function(_, i){ return i; })
-              .filter(function(i){ return (SHOTS[i].shot_time || "")
-                                            .slice(0, 10) === VDATE; });
-}
-function render(){
-  var tb = document.getElementById("tb");
-  var view = viewIdx();
-  if (!view.length){
-    tb.innerHTML = "<tr><td colspan=9 class='empty'>" +
-      (VDATE && VDATE !== todayStr()
-        ? VDATE + " 当天没有发次记录"
-        : "暂未检测到发次——等待谱仪图片落盘…") + "</td></tr>";
-  } else {
-    var h = "";
-    view.forEach(function(i){
-      var s = SHOTS[i];
-      h += "<tr data-i='" + i + "'>";
-      h += "<td><input class='n' data-i='" + i + "' value='" +
-           (s.no != null ? s.no : "") + "'></td>";
-      h += "<td class='t'>" + s.shot_time + "</td>";
-      h += "<td>" + s.file_count + "</td>";
-      h += "<td class='files' title='" + s.files.join("  ") + "'>" +
-           (s.files[0] || "-") + (s.file_count > 1 ? " 等" + s.file_count + "个" : "") + "</td>";
-      var tgt = s.target || "-";
-      if (s.defocus !== "" && s.defocus != null) tgt += " <span style='color:#888'>离焦 " + s.defocus + "</span>";
-      h += "<td style='white-space:nowrap'>" + tgt + "</td>";
-      h += "<td style='white-space:nowrap;color:#1a6fb5'>" + (s.ttype || "-") + "</td>";
-      var es = s.energies || {};
-      h += "<td>";
-      CFG_EFIELDS.forEach(function(ef){
-        h += "<div style='display:flex;align-items:center;gap:5px;margin:2px 0'>" +
-             "<span style='font-size:11px;color:#888;min-width:70px;white-space:nowrap'>" +
-             ef.label + "</span>" +
-             "<input class='e' data-f='" + ef.key + "' data-i='" + i + "' value='" +
-             String(es[ef.key] || "").replace(/'/g,"&#39;") +
-             "' placeholder='" + ef.ph + "' onkeydown='if(event.key===\"Enter\")send(" + i + ",false)'></div>";
-      });
-      h += "</td>";
-      var cls = s.status || "pending";
-      h += "<td><span class='st " + cls + "'>" + stLabel(cls) + "</span>" +
-           (s.info ? "<div style='color:#999;font-size:11px;margin-top:2px'>" + s.info + "</div>" : "") + "</td>";
-      h += "<td>";
-      if (s.status === "forming"){
-        h += "<span style='color:#999;font-size:12px'>等待文件到齐…</span>";
-      } else if (s.status === "no_match"){
-        h += "<button class='tbtn orange' onclick='send(" + i + ",true)'>补录</button> ";
-      } else if (!s.reported){
-        h += "<button class='tbtn green' onclick='send(" + i + ",false)'>确认上报</button> ";
-      } else {
-        h += "<button class='tbtn' onclick='send(" + i + ",false)'>" +
-             (s.status === "sent" ? "重发" : "发送") + "</button> ";
-      }
-      if (s.status !== "forming"){
-        h += "<button class='tbtn' style='background:#fff;color:#999;border-color:#ddd' " +
-             "onclick='ignoreShot(" + i + ")' title='从列表移除，不写日志系统'>忽略</button>";
-      }
-      h += "</td></tr>";
-    });
-    tb.innerHTML = h;
-  }
-  var dayStr = VDATE || todayStr();
-  document.getElementById("nday").textContent = view.length;
-  var np = view.filter(function(i){
-    return SHOTS[i].status !== "sent"; }).length;
-  document.getElementById("npending").textContent = np;
-  if (VDATE && VDATE !== todayStr()){
-    document.getElementById("npending").style.color = np ? "#c0392b" : "#256029";
-  }
-}
-function apply(j){
-  document.getElementById("dot").className = "dot ok";
-  var s = JSON.stringify(j.shots);
-  if (s !== LASTJSON){
-    var focused = document.activeElement;
-    var typing = focused && focused.classList &&
-                 (focused.classList.contains("e") || focused.classList.contains("n"));
-    if (!typing){          // 正在输入时不重绘，避免打断
-      SHOTS = j.shots; LASTJSON = s; render();
-    }
-  }
-  if (j.dirs){            // 目录变更 → 信息条实时更新（其他标签页也同步）
-    var d = j.dirs.join("；") || "-";
-    var el = document.getElementById("dirs");
-    if (el.textContent !== d){
-      el.textContent = d;
-      if (document.getElementById("dirMask").style.display === "flex") openDirs();
-    }
-  }
-  if (j.target){          // 重频靶系统实时状态 → 信息条
-    var t = j.target, e2 = document.getElementById("tgt"),
-        e3 = document.getElementById("tgtF");
-    if (t.ok && t.pos){
-      e2.textContent = t.pos;
-      e2.style.color = "#2c3e50";
-      e3.textContent = t.defocus !== "" ? "（离焦 " + t.defocus + "）" : "";
-    } else {
-      e2.textContent = "离线";
-      e2.style.color = "#c0392b";
-      e3.textContent = "";
-    }
-  }
-}
-/* ---------- 监视目录管理面板 ---------- */
-var DIRS = [];
-function openDirs(){
-  document.getElementById("dirMask").style.display = "flex";
-  fetch("/api/watchdirs", {cache:"no-store"}).then(function(r){ return r.json(); })
-  .then(function(j){ DIRS = j.dirs || []; renderDirs(); });
-}
-function closeDirs(){ document.getElementById("dirMask").style.display = "none"; }
-function renderDirs(){
-  var h = "";
-  DIRS.forEach(function(d, i){
-    h += "<div style='display:flex;align-items:center;gap:8px;padding:7px 10px;" +
-         "border:1px solid #e6e8eb;border-radius:6px;margin-bottom:6px;font-size:13px;" +
-         "font-family:Consolas,monospace'>";
-    h += "<span style='flex:1;word-break:break-all'>" + d.path + "</span>";
-    if (!d.exists)
-      h += "<span style='color:#8a6100;background:#fff3cd;border-radius:4px;" +
-           "padding:2px 8px;font-size:11px;font-family:inherit'>目录不存在</span>";
-    h += "<button class='tbtn' style='background:#c0392b;padding:4px 12px' " +
-         "onclick='delDir(" + i + ")'>删除</button></div>";
-  });
-  document.getElementById("dirList").innerHTML =
-    h || "<div style='color:#999;font-size:13px'>（无监视目录）</div>";
-}
-function addDir(){
-  var inp = document.getElementById("newDir");
-  var v = inp.value.trim();
-  if (!v){ toast("请输入目录路径"); return; }
-  saveDirs(DIRS.map(function(d){ return d.path; }).concat([v]));
-  inp.value = "";
-}
-function delDir(i){
-  var rest = DIRS.map(function(d){ return d.path; });
-  rest.splice(i, 1);
-  saveDirs(rest);
-}
-function saveDirs(list){
-  fetch("/api/watchdirs", {method:"POST", cache:"no-store",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({dirs: list})})
-  .then(function(r){ return r.json(); }).then(function(j){
-    if (!j.ok){ toast(j.error || "保存失败"); return; }
-    DIRS = j.dirs || []; renderDirs();
-    document.getElementById("dirs").textContent =
-      DIRS.map(function(d){ return d.path; }).join("；") || "-";
-    if ((j.added||[]).length) toast("已添加并静默登记：" + j.added.join("、"));
-    if ((j.removed||[]).length) toast("已移除：" + j.removed.join("、"));
-  }).catch(function(){ toast("保存失败（网络错误）"); });
-}
-/* 浏览按钮：后端弹系统文件夹对话框，轮询取回真实路径后自动添加 */
-function browseDir(){
-  var btn = document.getElementById("btnBrowse");
-  fetch("/api/pickdir", {method:"POST", cache:"no-store"})
-  .then(function(r){ return r.json(); }).then(function(j){
-    if (!j.ok){ toast(j.error || "无法打开选择窗口"); return; }
-    toast("请在弹出的窗口中选择要监视的文件夹…");
-    btn.disabled = true;
-    var n = 0;
-    var timer = setInterval(function(){
-      fetch("/api/pickdir", {cache:"no-store"})
-      .then(function(r){ return r.json(); }).then(function(j){
-        if (j.state === "done"){
-          clearInterval(timer); btn.disabled = false;
-          document.getElementById("newDir").value = j.path;
-          addDir();
-        } else if (j.state === "canceled"){
-          clearInterval(timer); btn.disabled = false;
-          if (j.error && j.error !== "已取消") toast(j.error);
-        }
-      }).catch(function(){});
-      if (++n > 1200){ clearInterval(timer); btn.disabled = false; }
-    }, 500);
-  }).catch(function(){ toast("无法打开选择窗口"); });
-}
-/* ---------- 上报表格绑定面板 ---------- */
-var CUR_SHEET = "";
-function sheetLabel(sn){
-  return sn === "@date" ? "按日期自动分表" : (sn || "实时打靶(默认)");
-}
-function loadSheetBinding(){
-  fetch("/api/sheetname", {cache:"no-store"}).then(function(r){ return r.json(); })
-  .then(function(j){
-    if (!j.ok) return;
-    CUR_SHEET = j.sheet_name || "";
-    document.getElementById("sheetName").textContent = j.label || sheetLabel(CUR_SHEET);
-  }).catch(function(){});
-}
-function openSheet(){
-  document.getElementById("sheetMask").style.display = "flex";
-  document.getElementById("sheetList").innerHTML =
-    "<div style='color:#999;font-size:13px'>加载中…</div>";
-  fetch("/api/sheetname", {cache:"no-store"}).then(function(r){ return r.json(); })
-  .then(function(j){
-    if (!j.ok){ toast("读取失败"); return; }
-    CUR_SHEET = j.sheet_name || "";
-    renderSheet(j.sheets || []);
-  }).catch(function(){
-    document.getElementById("sheetList").innerHTML =
-      "<div style='color:#c0392b;font-size:13px'>连接失败，请稍后重试</div>";
-  });
-}
-function closeSheet(){ document.getElementById("sheetMask").style.display = "none"; }
-/* ---------- 靶类型映射表（Sheet4 网格，可手动修改） ---------- */
-function openTmap(){
-  document.getElementById("tmapMask").style.display = "flex";
-  document.getElementById("tmapList").innerHTML =
-    "<div style='color:#999;font-size:13px'>加载中…</div>";
-  fetch("/api/targetmap", {cache:"no-store"}).then(function(r){ return r.json(); })
-  .then(function(j){ TMAP_DIRTY = {}; TMAP_DATE = j.date || TMAP_DATE; tmRefreshBtn();
-    renderTmap(j); })
-  .catch(function(){
-    document.getElementById("tmapList").innerHTML =
-      "<div style='color:#c0392b;font-size:13px'>加载失败，请稍后重试</div>";
-  });
-}
-function closeTmap(){
-  var n = (typeof tmCount === "function") ? tmCount() : 0;
-  if (n && !confirm("有 " + n + " 处靶类型修改尚未保存，确定关闭？")) return;
-  TMAP_DIRTY = {};
-  document.getElementById("tmapMask").style.display = "none";
-}
-function renderTmap(j){
-  if (!j.ok){
-    document.getElementById("tmapList").innerHTML =
-      "<div style='color:#c0392b;font-size:13px'>读取失败</div>";
-    return;
-  }
-  var L = j.layout;
-  if (!L || !L.labels || !L.labels.length){ renderTmapFlat(j); return; }
+# ---- UI 模板已抽离到 ui/helper.html（独立文件，git 合并只碰它、不碰本 .py，
+#      根治"A机改了UI、合并B机推送时被旧UI覆盖"）。按 mtime 缓存：
+#      改模板即生效，无需重启进程；文件缺失时返回显式错误页而不是崩。----
+_UI_PATH = os.path.join(BASE, 'ui/helper.html')
+_UI_CACHE = {"mtime": None, "html": None}
 
-  /* 区块索引：key "r1,c1,r2,c2" -> 覆盖的靶位列表（labels: [r,c,pos,r1,c1,r2,c2]）
-     标签 X-Y 是靶盘号！盘行 b → 行 2b-1、2b；槽 p → 列 4p-3 ~ 4p，共 8 个靶位 */
-  var regionPos = {};
-  L.labels.forEach(function(a){
-    if (a.length >= 7){
-      var k = a[3] + "," + a[4] + "," + a[5] + "," + a[6];
-      var ab = String(a[2]).split("-"), b = parseInt(ab[0], 10),
-          pp = parseInt(ab[1], 10), poss = [];
-      if (!isNaN(b) && !isNaN(pp) && pp <= 5 && b <= 13){
-        for (var rr = 2*b - 1; rr <= 2*b; rr++)
-          for (var cc = 4*pp - 3; cc <= 4*pp; cc++)
-            poss.push(rr + "-" + cc);
-      } else poss = [String(a[2])];
-      regionPos[k] = (regionPos[k] || []).concat(poss);
-    }
-  });
-  var covered = {}, region = {};
-  function addRegion(k){
-    if (region[k]) return;
-    var a = k.split(",").map(Number);
-    region[k] = a;
-    for (var r = a[0]; r < a[2]; r++)
-      for (var c = a[1]; c < a[3]; c++) covered[r + "," + c] = k;
-  }
-  Object.keys(regionPos).forEach(addRegion);          // 类型格区块（可编辑）
-  (L.merges || []).forEach(function(m){               // 其余合并区（静态文字）
-    addRegion(m.join(","));
-  });
 
-  function tclean(s){ var t = String(s||"").trim();     // nan/none/null/0 = 未填（空）
-    return /^(nan|none|null|0|0\.0)$/i.test(t) ? "" : t; }
-  function effType(poss){                              // 区块生效类型：手动优先
-    for (var i = 0; i < poss.length; i++)
-      if (j.overrides && j.overrides.hasOwnProperty(poss[i]))
-        return tclean(j.overrides[poss[i]]);
-    for (var i2 = 0; i2 < poss.length; i2++)
-      if (tclean(j.map[poss[i2]])) return tclean(j.map[poss[i2]]);
-    return "";
-  }
-  function anyManual(poss){
-    return poss.some(function(p){
-      return j.overrides && j.overrides.hasOwnProperty(p); });
-  }
-
-  var labelAt = {};
-  L.labels.forEach(function(a){ labelAt[a[0] + "," + a[1]] = a[2]; });
-  var HR = (typeof L.header_row === "number" && L.header_row >= 0)
-           ? L.header_row : -1;
-  var TTLOVR = j.title || "";
-
-  var h = "<div style='font-size:11px;color:#888;margin-bottom:6px'>" +
-          "本表绑定日期：<b style='color:#2c3e50'>" + tesc(j.date || "今天") +
-          "</b>（与当天日志表一致；点「保存全部修改」一次存入 target_types\\" +
-          tesc(j.date || "") + ".json）<br>" +
-          "版面复刻自 " + tesc(L.sheet) +
-          "：蓝格＝靶类型（合并大格＝同一靶块，改一处整块生效），" +
-          "白格＝靶位编号/待填；大标题（含日期）可直接点击修改" +
-          "<span style='float:right'>" +
-          "<button id='tmapSaveBtn' onclick='saveTmapAll(this)' " +
-          "style='font-size:11px;padding:2px 10px;cursor:pointer;margin-right:6px;" +
-          "background:#eee;color:#333;border:1px solid #ccc'>保存全部修改</button>" +
-          "<button onclick='solidifyTmap(this)' " +
-          "style='font-size:11px;padding:2px 8px;cursor:pointer'>" +
-          "以当前表为准（存为今天）</button></span></div>" +
-          "<table style='border-collapse:collapse;font-size:12px;table-layout:fixed'>";
-  if (L.ncols > 1){
-    h += "<colgroup><col style='width:34px'>";
-    for (var ci = 1; ci < L.ncols; ci++) h += "<col style='width:52px'>";
-    h += "</colgroup>";
-  }
-  for (var r = 0; r < L.nrows; r++){
-    h += "<tr>";
-    for (var c = 0; c < L.ncols; c++){
-      var ck = r + "," + c, k = covered[ck];
-      if (k && region[k][0] !== r || (k && region[k][0] === r && region[k][1] !== c)){
-        continue;                                      // 合并区内部格
-      }
-      if (k){                                          // 合并区锚格
-        var a = region[k], poss = regionPos[k] || [],
-            rs = a[2] - a[0], cs = a[3] - a[1],
-            span = (rs > 1 ? " rowspan='" + rs + "'" : "") +
-                   (cs > 1 ? " colspan='" + cs + "'" : "");
-        if (poss.length){                              // 靶类型块（可编辑）
-          var man = anyManual(poss), v = effType(poss),
-              bgc = man ? "#e67e22" : (v ? "#4472C4" : "#fff");
-          h += "<td" + span + " style='border:1px solid #8a8f98;background:" +
-               bgc + ";padding:0'" + (man ? " title='手动覆盖'" : "") + ">" +
-               "<input class='tm' style='width:94%;min-height:24px;" +
-               "background:transparent;border:none;outline:none;" +
-               "text-align:center;font-size:12px;color:#111' data-positions='" +
-               poss.join(",") + "' data-origin='" + v.replace(/'/g,"&#39;") +
-               "' value='" + v.replace(/'/g,"&#39;") +
-               "' placeholder=' ' onfocus='this.select()' " +
-               "onchange='tmMark(this)'></td>";
-        } else {                                       // 标题 / 靶位编号块
-          var txt = (L.merge_text && L.merge_text[k]) ||
-                    (L.values && L.values[ck]) || "";
-          if (HR >= 0 && a[0] < HR){                   // 标题行：可编辑（如日期）
-            var tv = TTLOVR || txt;
-            h += "<td" + span + " style='border:none;text-align:center;padding:4px'>" +
-                 "<input value='" + tesc(tv).replace(/'/g,"&#39;") +
-                 "' title='点击修改标题（如打靶日期）' onchange='saveTmapTitle(this)' " +
-                 "style='width:96%;font-weight:bold;font-size:14px;text-align:center;" +
-                 "border:none;outline:none;background:transparent;color:#111;" +
-                 "font-family:inherit'></td>";
-          } else {                                     // 编号块：白底黑字
-            h += "<td" + span + " style='border:1px solid #8a8f98;background:#fff;" +
-                 "text-align:center;color:#111;padding:2px'>" + tesc(txt) + "</td>";
-          }
-        }
-        continue;
-      }
-      if (labelAt[ck]){                                // 靶位编号（未合并）
-        h += "<td style='border:1px solid #8a8f98;background:#fff;" +
-             "text-align:center;color:#111;height:16px'>" +
-             tesc(labelAt[ck]) + "</td>";
-        continue;
-      }
-      var v2 = L.values ? L.values[ck] : "";
-      if (v2){                                         // 列号 / 行号等
-        h += "<td style='border:1px solid #8a8f98;background:#fff;" +
-             "text-align:center;color:#111;height:16px'>" + tesc(v2) + "</td>";
-      } else {                                         // 空格
-        h += "<td style='border:1px solid #e3e6ea;background:#fff;height:16px'></td>";
-      }
-    }
-    h += "</tr>";
-  }
-  h += "</table>";
-  /* 版面外靶位：旧 xls 里这些槽位没有可编辑格 → 在此补输入框 */
-  var editablePos = {};
-  Object.keys(regionPos).forEach(function(k){
-    (regionPos[k] || []).forEach(function(p){ editablePos[p] = 1; });
-  });
-  var maxB = 0, maxP = 0;
-  function scanPos(pos){
-    var a = String(pos || "").split("-");
-    var b = parseInt(a[0], 10), p = parseInt(a[1], 10);
-    if (!isNaN(b) && !isNaN(p)){
-      if (b > maxB) maxB = b;
-      if (p > maxP) maxP = p;
-    }
-  }
-  Object.keys(j.map || {}).forEach(scanPos);
-  (L.labels || []).forEach(function(a){ scanPos(a[2]); });
-  if (maxB && maxP){
-    var byB = [], b, p, pos;
-    for (b = 1; b <= maxB; b++){
-      for (p = 1; p <= maxP; p++){
-        pos = b + "-" + p;
-        if (!editablePos[pos]) (byB[b] = byB[b] || []).push(pos);
-      }
-    }
-    var extraRows = "";
-    for (b = 1; b <= maxB; b++){
-      if (!byB[b]) continue;
-      extraRows += "<tr><th style='padding:2px 6px;color:#888;background:#f6f8fa;" +
-                   "border:1px solid #e6e8eb;white-space:nowrap'>" + b + " 块</th>";
-      byB[b].forEach(function(pos2){
-        var man2 = j.overrides && j.overrides.hasOwnProperty(pos2),
-            v3 = String((j.map && j.map[pos2]) || "");
-        extraRows += "<td style='border:1px solid #e6e8eb;padding:2px;" +
-                     "background:" + (man2 ? "#fdf0e4" : "#fff") + "'>" +
-                     "<div style='font-size:10px;color:" + (man2 ? "#d35400" : "#bbb") +
-                     ";line-height:1.1'>" + pos2 + (man2 ? " ✎" : "") + "</div>" +
-                     "<input class='tm' data-positions='" + pos2 +
-                     "' data-origin='" + v3.replace(/'/g,"&#39;") +
-                     "' value='" + v3.replace(/'/g,"&#39;") +
-                     "' placeholder='靶类型' onfocus='this.select()' " +
-                     "onchange='tmMark(this)' style='width:64px'></td>";
-      });
-      extraRows += "</tr>";
-    }
-    if (extraRows){
-      h += "<div style='margin-top:10px;font-size:11px;color:#888'>以下靶位在原 xls 版面中" +
-           "没有格子（旧表这些槽位为空），在此填写同样生效、同样进自动备份：</div>" +
-           "<table style='border-collapse:collapse;font-size:12px;margin-top:4px'>" +
-           extraRows + "</table>";
-    }
-  }
-  document.getElementById("tmapList").innerHTML = h;
-}
-/* 无版面数据时的兜底：平铺网格 */
-function renderTmapFlat(j){
-  var keys = Object.keys(j.map || {});
-  if (!keys.length){
-    document.getElementById("tmapList").innerHTML =
-      "<div style='color:#999;font-size:13px'>映射为空：检查 config_helper.json 的 target_type_map（xls 路径）是否有效</div>";
-    return;
-  }
-  var rows = {}, cols = {};
-  keys.forEach(function(k){
-    var p = k.split("-");
-    rows[parseInt(p[0], 10)] = 1; cols[parseInt(p[1], 10)] = 1;
-  });
-  var rl = Object.keys(rows).map(Number).sort(function(a,b){ return a-b; });
-  var cl = Object.keys(cols).map(Number).sort(function(a,b){ return a-b; });
-  var h = "<table style='border-collapse:collapse;font-size:12px'>" +
-          "<tr><th style='padding:2px 6px;color:#999;background:#f6f8fa'>行\\列</th>";
-  cl.forEach(function(c){
-    h += "<th style='padding:2px 6px;color:#888;background:#f6f8fa;" +
-         "border:1px solid #e6e8eb'>" + c + "</th>";
-  });
-  h += "</tr>";
-  rl.forEach(function(r){
-    h += "<tr><th style='padding:2px 6px;color:#888;background:#f6f8fa;" +
-         "border:1px solid #e6e8eb'>" + r + "</th>";
-    cl.forEach(function(c){
-      var pos = r + "-" + c;
-      if (!j.map.hasOwnProperty(pos)){
-        h += "<td style='border:1px solid #f0f1f3;background:#fafbfc'></td>";
-        return;
-      }
-      var manual = j.overrides && j.overrides.hasOwnProperty(pos);
-      h += "<td style='border:1px solid #e6e8eb;padding:2px'>" +
-           "<div style='font-size:10px;color:" + (manual ? "#d35400" : "#bbb") +
-           ";line-height:1.1'>" + pos + (manual ? " ✎" : "") + "</div>" +
-           "<input class='tm' data-positions='" + pos + "' data-origin='" +
-           String(j.map[pos] || "").replace(/'/g,"&#39;") +
-           "' value='" + String(j.map[pos] || "").replace(/'/g,"&#39;") +
-           "' placeholder='靶类型' onfocus='this.select()' " +
-           "onchange='tmMark(this)'></td>";
-    });
-    h += "</tr>";
-  });
-  h += "</table>";
-  document.getElementById("tmapList").innerHTML = h;
-}
-/* ---- 靶类型批量保存（在线表格式：改完点「保存全部修改」一次落盘） ---- */
-var TMAP_DIRTY = {};          // data-positions -> input 元素
-var TMAP_DATE = "";           // 对话框当前编辑的日期（跟随上报表格绑定）
-function tmCount(){ return Object.keys(TMAP_DIRTY).length; }
-function tmRefreshBtn(){
-  var b = document.getElementById("tmapSaveBtn");
-  if (!b) return;
-  var n = tmCount();
-  b.textContent = n ? ("保存全部修改（" + n + " 处未保存）") : "保存全部修改";
-  b.style.background = n ? "#e67e22" : "#eee";
-  b.style.color = n ? "#fff" : "#333";
-  b.style.border = "1px solid " + (n ? "#d35400" : "#ccc");
-}
-function tmMark(inp){
-  var k = inp.getAttribute("data-positions") || "";
-  if (!k) return;
-  var origin = (inp.getAttribute("data-origin") || "").replace(/\s+/g, "");
-  if ((inp.value || "").replace(/\s+/g, "") === origin){
-    delete TMAP_DIRTY[k];
-    inp.style.boxShadow = "";
-  } else {
-    TMAP_DIRTY[k] = inp;
-    inp.style.boxShadow = "inset 0 0 0 2px #e67e22";   // 橙描边 = 未保存
-  }
-  tmRefreshBtn();
-}
-function saveTmapAll(btn){
-  var items = Object.keys(TMAP_DIRTY).map(function(k){ return TMAP_DIRTY[k]; });
-  if (!items.length){ toast("没有未保存的修改"); return; }
-  if (btn) btn.disabled = true;
-  var i = 0, fails = 0, saved = 0;
-  function next(){
-    if (i >= items.length){
-      if (btn) btn.disabled = false;
-      if (!fails){
-        toast("已保存 " + saved + " 处修改 → target_types（当日表）");
-        TMAP_DIRTY = {};
-        openTmap();              // 重渲染（脏标记清零、✎ 同步）
-      } else {
-        toast(fails + " 处保存失败，请重试；" + saved + " 处已保存");
-        tmRefreshBtn();
-      }
-      return;
-    }
-    var inp = items[i];
-    fetch("/api/targetmap", {method:"POST", cache:"no-store",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        positions: (inp.getAttribute("data-positions") || "").split(","),
-        type: inp.value.trim(), day: TMAP_DATE})})
-    .then(function(r){ return r.json(); })
-    .then(function(j){
-      if (!j.ok){ fails++; toast(j.error || "保存失败"); }
-      else { saved++; delete TMAP_DIRTY[inp.getAttribute("data-positions")]; }
-      i++; next();
-    })
-    .catch(function(){ fails++; i++; next(); });
-  }
-  next();
-}
-function saveTmapBlock(inp){     // 兼容旧入口：单格即时保存
-  fetch("/api/targetmap", {method:"POST", cache:"no-store",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({positions: (inp.getAttribute("data-positions") || "").split(","),
-                          type: inp.value.trim(), day: TMAP_DATE})})
-  .then(function(r){ return r.json(); })
-  .then(function(j){
-    if (!j.ok){ toast(j.error || "保存失败"); openTmap(); return; }
-    toast("靶类型已保存");
-    openTmap(); refresh(); LASTJSON = "";
-  })
-  .catch(function(){ toast("保存失败（网络错误）"); });
-}
-function solidifyTmap(btn){
-  if (btn){ btn.disabled = true; btn.textContent = "固化中…"; }
-  fetch("/api/targetmap_solidify", {method:"POST", cache:"no-store"})
-  .then(function(r){ return r.json(); })
-  .then(function(j){
-    if (!j.ok){ toast(j.error || "固化失败"); if(btn){btn.disabled=false;
-      btn.textContent = "以当前表为准（固化基表）";} return; }
-    toast("已固化：" + j.count + " 个靶位。此后页面这张表就是映射本体，旧 xls 不再参与");
-    openTmap();
-  })
-  .catch(function(){ toast("固化失败（网络错误）"); if(btn){btn.disabled=false;
-    btn.textContent = "以当前表为准（固化基表）";} });
-}
-function saveTmapTitle(inp){
-  fetch("/api/targetmap_title", {method:"POST", cache:"no-store",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({title: inp.value.trim()})})
-  .then(function(r){ return r.json(); })
-  .then(function(j){
-    toast(j.ok ? "标题已保存" : (j.error || "标题保存失败"));
-  })
-  .catch(function(){ toast("标题保存失败（网络错误）"); });
-}
-function histSheetRO(name){
-  /* 日期命名的表：真实历史日期（早于今天）= 只读；
-     今天/未来/日历上不存在的测试日期（如 2026-09-31）= 可点选绑定，与后端一致 */
-  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(name || "");
-  if (!m) return false;
-  var d = new Date(+m[1], +m[2]-1, +m[3]);
-  if (d.getFullYear() !== +m[1] || d.getMonth() !== +m[2]-1 ||
-      d.getDate() !== +m[3]) return false;      // 09-31 这类测试日期 → 可绑定
-  var t = new Date(); t.setHours(0,0,0,0);
-  return d < t;
-}
-function renderSheet(sheets){
-  var h = "<div style='font-size:11px;color:#888;background:#f6f8fa;border-radius:6px;" +
-          "padding:6px 10px;margin-bottom:8px'>上报目标默认「按打靶日期自动分表」：每天自动写入当天日期命名的表，一天一张、与日志一一对应。历史日期表仅供查看；今天/未来/测试日期（如 2026-09-31）可点选为上报目标（测完记得切回来）。</div>";
-  h += sheetRow("@date", "按打靶日期自动分表", "每天打靶自动写入当天日期命名的表（如 2026-09-15），不存在自动创建");
-  h += sheetRow("", "实时打靶（默认表）", "所有打靶集中写这一张固定表");
-  if (sheets.length){
-    h += "<div style='font-size:11px;color:#999;margin:10px 0 6px'>—— A 机已有表格（点「查看 →」打开）——</div>";
-    sheets.forEach(function(s, i){
-      var ro = histSheetRO(s.name);   // 只有真实历史日期表才只读
-      h += sheetRow(s.name, s.name,
-                    ro ? (s.count + " 条记录 ｜ 历史表，仅供查看")
-                       : (s.count + " 条记录 ｜ " +
-                          (/^\d{4}-/.test(s.name) ? "今天/测试日期表，可绑定"
-                                                   : "可选为上报目标")),
-                    "@dateornull_" + i, s.view_url, ro);
-    });
-  } else {
-    h += "<div style='font-size:11px;color:#999;margin:10px 0 4px'>（A 机表格列表获取失败，仅显示常用选项）</div>";
-  }
-  document.getElementById("sheetList").innerHTML = h;
-}
-function sheetRow(val, title, sub, key, viewUrl, viewonly){
-  viewonly = !!viewonly;
-  var sel = viewonly ? "border:1px dashed #d8dce0;background:#fafbfc" :
-            (CUR_SHEET === val) ? "border:2px solid #2c3e50;background:#f2f7ff" :
-            "border:1px solid #e6e8eb";
-  var view = viewUrl ? " <span onclick='event.stopPropagation();window.open(\"" +
-             viewUrl + "\")' style='color:#2471a3;font-size:11px;cursor:pointer;" +
-             "text-decoration:underline;margin-left:6px'>查看 →</span>" : "";
-  var click = viewonly ? "<div" :
-          "<div onclick='selectSheet(this)' data-v=\"" + val.replace(/"/g,"&quot;") + "\"";
-  return click +
-         " style='" + sel + ";border-radius:8px;padding:9px 12px;margin-bottom:6px;" +
-         (viewonly ? "" : "cursor:pointer") + "'><div style='font-size:13px;" +
-         "font-weight:bold" + (viewonly ? ";color:#999" : "") + "'>" + title + view +
-         (!viewonly && CUR_SHEET === val ?
-          " <span style='color:#2ecc71;font-size:12px'>✓ 当前</span>" : "") +
-         "</div><div style='font-size:11px;color:#888;margin-top:2px'>" + sub + "</div></div>";
-}
-function selectSheet(el){
-  var v = el.getAttribute("data-v");
-  fetch("/api/sheetname", {method:"POST", cache:"no-store",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({sheet_name: v})})
-  .then(function(r){ return r.json(); }).then(function(j){
-    if (!j.ok){ toast(j.error || "保存失败"); return; }
-    CUR_SHEET = j.sheet_name || "";
-    document.getElementById("sheetName").textContent = j.label;
-    toast("上报表格已切换为：" + j.label);
-    openSheet();   // 重新渲染列表高亮
-  }).catch(function(){ toast("保存失败（网络错误）"); });
-}
-function tesc(s){ return String(s==null?"":s).replace(/&/g,"&amp;")
-  .replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
-function openTrash(){
-  document.getElementById("trashMask").style.display = "flex";
-  fetch("/api/trash", {cache:"no-store"}).then(function(r){ return r.json(); })
-  .then(function(j){
-    var b = document.getElementById("trashList");
-    var list = j.trash || [];
-    if (!list.length){
-      b.innerHTML = "<div style='color:#999;padding:24px 0;text-align:center'>" +
-                    "回收站是空的</div>";
-      return;
-    }
-    var h = "<table style='width:100%;border-collapse:collapse;font-size:13px'>";
-    h += "<tr style='text-align:left;color:#888;font-size:12px'>" +
-         "<th style='padding:4px 6px'>发次时间</th><th>No.</th><th>图片</th>" +
-         "<th>能量</th><th>状态</th><th>操作</th></tr>";
-    list.forEach(function(s){
-      h += "<tr style='border-top:1px solid #eee'>" +
-           "<td style='padding:5px 6px;white-space:nowrap'>" + tesc(s.shot_time) + "</td>" +
-           "<td>" + (s.no || "-") + "</td><td>" + (s.file_count || 0) + "</td>" +
-           "<td>" + tesc(eStr(s)) + "</td><td>" + stLabel(s.status) + "</td>" +
-           "<td style='white-space:nowrap'>" +
-           "<span style='color:#2471a3;cursor:pointer;text-decoration:underline' " +
-           "onclick='trashAct(\"" + s.shot_time + "\",\"restore\")'>恢复</span> " +
-           "<span style='color:#c0392b;cursor:pointer;text-decoration:underline' " +
-           "onclick='trashAct(\"" + s.shot_time + "\",\"delete\")'>彻底删除</span>" +
-           "</td></tr>";
-    });
-    b.innerHTML = h + "</table>";
-  }).catch(function(){
-    document.getElementById("trashList").innerHTML =
-      "<div style='color:#c0392b;font-size:13px'>读取回收站失败</div>";
-  });
-}
-function closeTrash(){ document.getElementById("trashMask").style.display = "none"; }
-function trashAct(st, act){
-  if (act === "delete" &&
-      !confirm("彻底删除该发次（" + st + "）？将无法恢复！")) return;
-  fetch("/api/trash", {method:"POST", cache:"no-store",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({act: act, shot_time: st})})
-  .then(function(r){ return r.json(); }).then(function(j){
-    if (!j.ok){ toast(j.error || "操作失败"); return; }
-    toast(act === "restore" ? "已恢复到待确认列表" :
-          act === "clear" ? "回收站已清空" : "已彻底删除");
-    openTrash(); refresh(); LASTJSON = "";
-  }).catch(function(){ toast("操作失败（网络错误）"); });
-}
-function clearTrash(){
-  if (!confirm("清空回收站？里面的发次将永久删除，无法恢复！")) return;
-  trashAct("", "clear");
-}
-function refresh(){
-  fetch("/api/local", {cache:"no-store"}).then(function(r){ return r.json(); }).then(apply)
-  .catch(function(){
-    document.getElementById("dot").className = "dot bad";
-  });
-}
-/* 实时通道：服务器有新发次/状态变化立刻推送 */
-var ES = null;
-function connectSSE(){
-  if (!window.EventSource) return;
-  try { ES = new EventSource("/api/events"); } catch(e){ return; }
-  ES.onmessage = function(ev){
-    try { apply(JSON.parse(ev.data)); } catch(e){}
-  };
-  ES.onerror = function(){ document.getElementById("dot").className = "dot bad"; };
-}
-function ignoreShot(i){
-  var s = SHOTS[i];
-  var msg = s.reported
-    ? ("该发次已在日志系统里（列表移除不影响已有记录）。忽略 " + s.shot_time + " ？")
-    : ("忽略 " + s.shot_time + " ？\n只从本列表移除，不会写入日志系统。");
-  if (!confirm(msg)) return;
-  fetch("/api/ignore", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({shot_time: s.shot_time})})
-    .then(function(r){ return r.json(); })
-    .then(function(j){ toast(j.removed ? "已忽略" : "未找到该发次"); refresh(); LASTJSON = ""; })
-    .catch(function(e){ toast("请求失败: " + e); });
-}
-function clearShots(mode){
-  var msg = mode === "all"
-    ? "清空整个发次列表？\n（正在检测中的发次会保留；日志系统里已有的记录不受影响）"
-    : "清理所有已绑定/发送失败的发次？\n（未确认的发次保留）";
-  if (!confirm(msg)) return;
-  fetch("/api/shots_clear", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({mode: mode})})
-    .then(function(r){ return r.json(); })
-    .then(function(j){ toast("已移除 " + j.removed + " 条，剩 " + j.left + " 条"); refresh(); LASTJSON = ""; })
-    .catch(function(e){ toast("请求失败: " + e); });
-}
-function send(i, create){
-  var s = SHOTS[i];
-  var energies = {}, any = false;
-  document.querySelectorAll("input.e[data-i='" + i + "']").forEach(function(inp){
-    var v = (inp.value || "").trim();
-    if (v){ energies[inp.getAttribute("data-f")] = v; any = true; }
-  });
-  if (!any && s.reported && !create){ toast("先填能量再发送"); return; }
-  var ninp = document.querySelector("input.n[data-i='" + i + "']");
-  var no = parseInt((ninp ? ninp.value : SHOTS[i].no), 10) || 0;
-  fetch("/api/bind", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({shot_time: SHOTS[i].shot_time, energies: energies,
-                          energy: energies[CFG_EFIELDS[0].key] || "",
-                          shot_no: no, create: create})})
-    .then(function(r){ return r.json(); })
-    .then(function(j){
-      if (j.ok && j.confirmed){
-        toast("已确认上报：打靶行已写入日志系统（能量待填）");
-      } else if (j.ok && (j.matched !== undefined)){
-        toast(j.by_no ? ("时间窗未命中，已按 No." + no + " 绑定到 " + j.matched_time)
-                      : ("已绑定到发次 " + j.matched_time + "（差 " + (+j.diff_sec).toFixed(1) + "s）"));
-      } else if (j.ok && j.created){
-        toast("已补录独立记录 #" + j.created);
-      } else if (j.error === "no_match"){
-        var n = j.nearest ? ("最近一条: " + j.nearest.shot_time) : "日志系统暂无记录";
-        toast("无匹配发次（±" + j.window_sec + "s）｜" + n + "，可点\"补录\"");
-      } else {
-        toast("出错: " + (j.message || j.error || "未知错误"));
-      }
-      refresh(); LASTJSON = "";
-    })
-    .catch(function(e){ toast("请求失败: " + e); refresh(); LASTJSON = ""; });
-}
-var WIN_SEC = CFG_WINDOW;   // 当前生效绑定窗口（服务端注入）
-function setWin(inp){
-  var v = parseFloat(inp.value);
-  if (!(v >= 3 && v <= 300)){
-    toast("绑定窗口需在 3~300 秒之间"); inp.value = WIN_SEC; return;
-  }
-  fetch("/api/matchwindow", {method:"POST", cache:"no-store",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({sec: v})})
-  .then(function(r){ return r.json(); })
-  .then(function(j){
-    if (j.ok){ WIN_SEC = j.window; inp.value = j.window;
-               toast("绑定窗口已调整为 ±" + j.window + "s"); }
-    else { toast(j.error || "调整失败"); inp.value = WIN_SEC; }
-  })
-  .catch(function(){ toast("调整失败（网络错误）"); inp.value = WIN_SEC; });
-}
-document.getElementById("machine").textContent = "本机: " + CFG_MACHINE;
-document.getElementById("srv").textContent = CFG_SERVER;
-document.getElementById("dirs").textContent = CFG_DIRS;
-document.getElementById("efields").textContent =
-  CFG_EFIELDS.map(function(f){ return f.label; }).join(" / ");
-refresh(); connectSSE(); setInterval(refresh, 1000);   // SSE 实时推送，1s 轮询仅作兜底
-loadSheetBinding();
-VDATE = todayStr();
-document.getElementById("viewDate").value = VDATE;
-if (location.hash === "#dirs") openDirs();   // URL 直达目录管理面板
-/* 切回标签页/窗口聚焦时立即刷新，不等下一个 4 秒节拍 */
-document.addEventListener("visibilitychange", function(){ if (!document.hidden) refresh(); });
-window.addEventListener("focus", refresh);
-</script>
-</body>
-</html>"""
+def _load_ui_html():
+    """读 UI 模板（mtime 缓存）。绝不在这里抛异常打断 HTTP 通道。"""
+    try:
+        mt = os.path.getmtime(_UI_PATH)
+        if _UI_CACHE["mtime"] != mt or _UI_CACHE["html"] is None:
+            with open(_UI_PATH, encoding="utf-8") as f:
+                _UI_CACHE["html"] = f.read()
+            _UI_CACHE["mtime"] = mt
+        return _UI_CACHE["html"]
+    except OSError as e:
+        return ("<!DOCTYPE html><meta charset=utf-8>"
+                "<h2>UI 模板缺失</h2><p>%s 读不到: %r</p>"
+                "<p>请 git pull 补齐 ui/ 目录。</p>"
+                % (_UI_PATH, e))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2936,7 +2125,7 @@ class Handler(BaseHTTPRequestHandler):
     def _page(self):
         # 模板变量：CFG_SERVER/CFG_WINDOW 必须生成合法 JS 字面量（带引号/数字）
         efs = [dict(f, ph=f.get("ph") or "如 2.35") for f in ENERGY_FIELDS]
-        html = (HELP_PAGE
+        html = (_load_ui_html()
                 .replace("CFG_SERVER", json.dumps(SERVER_URL))
                 .replace("CFG_MACHINE", json.dumps(MACHINE))
                 .replace("CFG_DIRS", json.dumps("；".join(WATCH_DIRS)))
@@ -2945,7 +2134,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, html, "text/html; charset=utf-8")
 
     def _snapshot(self):
-        ttm = effective_target_map(_bound_day())   # 绑定到哪张表就显示哪天的映射
+        # 绑定到哪张表就显示哪天的映射（日报表 target_types/<日期>.json）。
+        # ⚠️ 必须走 get_daily_target_map()：effective_target_map() 是**无参**
+        # 函数，09-30 这里误传了 _bound_day() → 每次快照抛 TypeError →
+        # /api/local 500 且 SSE 连接被打断，页面失去实时推送（表现为"十几秒
+        # 才动一次"，实际是轮询兜底）。任何异常都必须降级成空映射，
+        # **绝不允许把整条页面通道带崩**。
+        try:
+            ttm = get_daily_target_map(_bound_day()).get("map") or {}
+        except Exception as e:
+            log("快照取靶类型映射失败(降级为空): %r" % e)
+            ttm = {}
         with _state_lock:
             shots = []
             for s in STATE["shots"]:
@@ -3463,6 +2662,13 @@ def main():
             n_pending = sum(1 for s in STATE["shots"] if s["status"] != "sent")
         log("已恢复状态: %d 条发次记录（其中 %d 条待绑定能量）"
             % (len(STATE["shots"]), n_pending))
+    # 生产数据写保护：到这里说明是真正跑起来的实例（main() 已执行、
+    # 已尝试从磁盘恢复），授予 save_state() 写盘权限。
+    # 测试/脚本 import 模块不会执行 main()，_STATE_LOADED 恒为 False，
+    # save_state() 对它们是 no-op → 再也不会覆盖生产 state_helper.json。
+    global _STATE_LOADED
+    _STATE_LOADED = True
+    log("已授予状态写盘权限（_STATE_LOADED=True）")
 
     def _thread_exc(args):
         log("线程异常退出: %r" % args.exc_value)
@@ -3475,6 +2681,14 @@ def main():
     log("靶位采集线程已启动（重频靶系统 %s:%s，每 5s 刷新）" %
         (target_client._load_cfg().get("host", "10.0.23.116"),
          target_client._load_cfg().get("port", 5362)))
+    # 补发线程：与扫描解耦，A 机不通时它自己慢慢等，绝不拖慢监测
+    rt = threading.Thread(target=retry_loop,
+                          args=(float(CFG.get("retry_gap_sec", 30)),),
+                          daemon=True)
+    rt.start()
+    log("补发线程已启动（每 %gs 检查一次失败队列，不阻塞扫描）"
+        % float(CFG.get("retry_gap_sec", 30)))
+    log("发次识别: %s / %s" % _shot_filter_desc())
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
         log("汤姆逊能量上报页面: http://127.0.0.1:%d" % port)

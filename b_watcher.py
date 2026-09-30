@@ -414,13 +414,80 @@ NO_PAT = re.compile(r"(?:shot|shor)[-_ ]?(\d+)", re.IGNORECASE)
 
 # 非发次文件（谱仪目录里的记录/日志类文件）：不参与发次分组，防止刷假发次
 # 规则：① 名为"发次记录*"的文件；② 所有 .txt/.log/.ini/.tmp/.csv/.xls/.xlsx/.json
+# ⚠️ 这是「应急回退」用的黑名单。默认走白名单（见下），因为监视目录里还有
+#    大量其他相机的 PNG（高倍靶前-*.PNG、315远场-Snapshot-*.PNG…），
+#    黑名单挡不住它们 → 会被当发次并抢走编号（09-30 之乱）。
 _META_FILE_RE = re.compile(
     r"发次记录[^/\\]*$|\.(txt|log|ini|tmp|csv|xls|xlsx|json)$", re.IGNORECASE)
+
+# 白名单：只有发次命名的文件才可能建条目（与 thomson_helper 同款规则）。
+# config 里可用 shot_file_patterns 覆盖；shot_file_mode="blacklist" 应急回退。
+DEFAULT_SHOT_PATTERNS = [
+    r"^shot[-_ ]?\d+\.(png|tif|tiff|dat|raw|jpg|jpeg|bmp)$",   # B机 shot79.PNG
+    r"^shor[-_ ]?\d+\.(png|tif|tiff|dat|raw|jpg|jpeg|bmp)$",   # C机 shor_79.tif
+]
+_PAT_CACHE = {}
+_IGNORED_SEEN = set()
+_CUR_CFG = {}      # main() 里指向当前生效的 config（热重载时同步更新）
 
 
 def _is_meta_file(path):
     import os as _os
     return bool(_META_FILE_RE.search(_os.path.basename(str(path))))
+
+
+def _shot_filter():
+    """返回 (mode, 白名单正则)；按 config 内容缓存，支持热重载。"""
+    cfg = _CUR_CFG
+    pats = cfg.get("shot_file_patterns") or DEFAULT_SHOT_PATTERNS
+    if not isinstance(pats, (list, tuple)) or not pats:
+        pats = DEFAULT_SHOT_PATTERNS
+    mode = str(cfg.get("shot_file_mode", "whitelist")
+               or "whitelist").strip().lower()
+    if mode not in ("whitelist", "blacklist"):
+        mode = "whitelist"
+    key = (mode, tuple(str(x) for x in pats))
+    rx = _PAT_CACHE.get(key)
+    if rx is None:
+        try:
+            rx = re.compile("|".join(pats), re.IGNORECASE)
+        except re.error as e:
+            log("shot_file_patterns 正则非法(%r)，回退默认白名单" % e)
+            rx = re.compile("|".join(DEFAULT_SHOT_PATTERNS), re.IGNORECASE)
+        _PAT_CACHE[key] = rx
+    return mode, rx
+
+
+def is_shot_file(path):
+    name = os.path.basename(str(path))
+    mode, rx = _shot_filter()
+    if mode == "blacklist":
+        return not _is_meta_file(name)
+    return bool(rx.match(name))
+
+
+def note_ignored(files):
+    """被白名单挡掉的文件：每类命名只提示一次 + 写账本（留证据）。"""
+    if not files:
+        return
+    fresh = []
+    for p, mt in files:
+        name = os.path.basename(str(p))
+        sig = re.sub(r"\d+", "N", name).lower()
+        if sig in _IGNORED_SEEN:
+            continue
+        _IGNORED_SEEN.add(sig)
+        fresh.append((name, sig))
+    if not fresh:
+        return
+    for name, _sig in fresh[:5]:
+        log("已忽略非发次文件: %s（不建条目；如需纳入请改 config 的 "
+            "shot_file_patterns）" % name)
+    if len(fresh) > 5:
+        log("…另有 %d 类非发次文件被忽略" % (len(fresh) - 5))
+    led({"ev": "file_ignored_w", "count": len(files),
+         "kinds": [{"name": n, "pattern": s} for n, s in fresh[:20]],
+         "mode": _shot_filter()[0]})
 
 
 def make_payload(machine_name, group, sheet_name=""):
@@ -512,6 +579,8 @@ def main():
     watch_dirs = cfg["watch_dirs"]
     server_url = cfg["server_url"]
     machine_name = cfg.get("machine_name", socket.gethostname())
+    global _CUR_CFG
+    _CUR_CFG = cfg          # 白名单过滤读它（热重载时同步更新）
     interval = float(cfg.get("scan_interval_sec", 3))
     window = float(cfg.get("group_window_sec", 8))
     # 上报目标表：""=默认"实时打靶"；"@date"=按打靶日期自动分表；其他=固定表名
@@ -604,6 +673,15 @@ def main():
                 cfg_mtime = mt
                 nc = load_json(LOCAL_CONFIG_PATH, None) or load_json(CONFIG_PATH, None)
                 if nc:
+                    # 发次识别白名单热更新（shot_file_patterns / shot_file_mode）
+                    _old_mode, _old_rx = _shot_filter()
+                    _CUR_CFG = nc
+                    _new_mode, _new_rx = _shot_filter()
+                    if (_new_mode, _new_rx.pattern) != (_old_mode, _old_rx.pattern):
+                        _DIR_CACHE.clear()     # 缓存是按旧规则过滤的结果，必须作废
+                        _IGNORED_SEEN.clear()  # 让"已忽略"提示按新规则重报一次
+                        log("配置热重载：发次识别 -> %s / %s"
+                            % (_new_mode, _new_rx.pattern))
                     # 上报目标表热更新
                     ns = str(nc.get("sheet_name", "") or "").strip()
                     if ns != sheet_name:
@@ -668,10 +746,21 @@ def main():
                 first_run = False
                 log("首次运行：登记已有文件 %d 个（不上报）" % len(seen))
             else:
-                new_entries = [(p, mt) for p, mt in entries
-                               if p not in seen and not _is_meta_file(p)]
+                new_entries = []
+                ignored = []
+                for p, mt in entries:
+                    if p in seen:
+                        continue
+                    if is_shot_file(p):        # 白名单：只有发次命名才进分组
+                        new_entries.append((p, mt))
+                    else:
+                        ignored.append((p, mt))
+                        seen[p] = mt           # 只登记，绝不建条目/参与补号
+                if ignored:
+                    note_ignored(ignored)
+                    save_json(STATE_PATH, seen)
                 # pending（上次还没归组的文件）+ 本轮新文件，合并后统一重新分组
-                all_new = [tuple(x) for x in pend if not _is_meta_file(x[0])] \
+                all_new = [tuple(x) for x in pend if is_shot_file(x[0])] \
                     + new_entries
                 if all_new:
                     log("本轮待处理文件 %d 个（含缓冲 %d）"
