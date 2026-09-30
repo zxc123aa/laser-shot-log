@@ -274,6 +274,7 @@ PAGE = r"""<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
+<meta name="ui-ver" content="3-redesign+colpanel">
 <title>实验打靶日志系统</title>
 <style>
   :root{
