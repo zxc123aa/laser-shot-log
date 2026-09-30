@@ -159,6 +159,19 @@ def scan_once(watch_dirs):
     return scan_once_status(watch_dirs)[0]
 
 
+# 只监测的文件后缀（小写带点，如 {".tif", ".png"}）。
+# 由配置 watch_exts 决定；为空 = 监测全部文件（旧行为）。
+# 发次记录只应由图片（谱仪/TPS 落盘）触发，其他文件（日志/临时文件）
+# 不得产生发次。
+_SCAN_EXTS = set()
+
+
+def _match_ext(name):
+    if not _SCAN_EXTS:
+        return True
+    return os.path.splitext(name)[1].lower() in _SCAN_EXTS
+
+
 def _scan_dir(d, out):
     try:
         mt = os.path.getmtime(d)
@@ -180,7 +193,7 @@ def _scan_dir(d, out):
         p = os.path.join(d, n)
         if os.path.isdir(p):
             subs.append(p)
-        else:
+        elif _match_ext(n):       # 后缀过滤：只监测配置的文件类型（默认只看图片）
             try:
                 files.append((p, os.path.getmtime(p)))
             except OSError:
@@ -298,6 +311,9 @@ def main():
     # "confirm"=只送到本机 8767 上报系统待确认，人工点「确认上报」才写 A 机
     report_mode = str(cfg.get("report_mode", "direct") or "direct").strip().lower()
     helper_url = str(cfg.get("helper_url", "") or "http://127.0.0.1:8767").strip()
+    # 只监测的文件后缀（如 [".tif", ".png"]）；为空 = 全部文件（旧行为）
+    exts = cfg.get("watch_exts") or []
+    _SCAN_EXTS.update(str(e).strip().lower() for e in exts if str(e).strip())
 
     seen = load_json(STATE_PATH, {})      # {路径: mtime}
     pend = load_json(PENDING_PATH, [])    # 已见但尚未归组上报的 [[路径, mtime], ...]
@@ -306,6 +322,8 @@ def main():
         log("发现 %d 条未上报记录，将自动补发" % len(pending))
 
     log("监视目录: %s" % watch_dirs)
+    log("监测文件类型: %s"
+        % (", ".join(sorted(_SCAN_EXTS)) if _SCAN_EXTS else "全部文件"))
     log("上报地址: %s  (本机名: %s)" % (server_url, machine_name))
 
     first_run = not os.path.exists(STATE_PATH)
@@ -382,6 +400,17 @@ def main():
                     nhu = str(nc.get("helper_url", "") or "").strip()
                     if nhu and nhu != helper_url:
                         helper_url = nhu
+                    # 监测文件类型热更新
+                    n_exts = {str(e).strip().lower()
+                              for e in (nc.get("watch_exts") or [])
+                              if str(e).strip()}
+                    if n_exts != _SCAN_EXTS:
+                        _SCAN_EXTS.clear()
+                        _SCAN_EXTS.update(n_exts)
+                        _DIR_CACHE.clear()  # 缓存里是按旧后缀过滤的结果，必须作废
+                        log("配置热重载：监测文件类型 -> %s"
+                            % (", ".join(sorted(_SCAN_EXTS))
+                               if _SCAN_EXTS else "全部文件"))
                 if nc and nc.get("watch_dirs") and nc["watch_dirs"] != watch_dirs:
                     nd = [os.path.normpath(d) for d in nc["watch_dirs"] if d]
                     added = [d for d in nd if d not in watch_dirs]
