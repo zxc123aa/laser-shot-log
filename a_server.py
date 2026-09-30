@@ -37,6 +37,8 @@ PORT = int(os.environ.get("PORT") or 8765)  # 8765 被占用时可用 PORT=8766 
 DB_PATH = os.path.join(BASE, "shots.db")
 COLS_PATH = os.path.join(BASE, "shotlist_cols.json")
 LIVE_SHEET = "实时打靶"          # B 机上报默认写入的表
+SHOT_MERGE_SEC = 15             # 同发次合并窗口：不同机器上报时间差在此内的视为同一发次，
+                                # 并入已有行（不新建），能量按"时间最近"才能命中正确行
 SORTABLE_SQL = {"shot_time", "machine", "file_count", "first_file", "id"}
 
 DEFAULT_COLS = [{"key": "target_type", "name": "靶类型", "width": 110},
@@ -245,6 +247,14 @@ def norm_shot_time(s):
         except ValueError:
             continue
     raise ValueError("时间格式应为 YYYY-MM-DD HH:MM:SS（收到: %s）" % s)
+
+
+def _diff_key(t0):
+    """行时间与 t0 的绝对秒差（min 的 key 函数）"""
+    def _f(r):
+        d = datetime.strptime(r["shot_time"], "%Y-%m-%d %H:%M:%S") - t0
+        return abs(d.total_seconds())
+    return _f
 
 
 def to_number(v):
@@ -1289,6 +1299,32 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT id, fields FROM shots WHERE machine IS ? AND shot_time=? "
                 "AND first_file IS ? AND sheet_id=?",
                 (machine, shot_time, first_name, sh["id"])).fetchone()
+            # 跨机器同发次合并：窗口内已有其他机器的行 = 同一发次（如 B机 shot84.PNG
+            # 18:13:59 与 C机 shor_84.tif 18:14:02），并入已有行，不再各建一行，
+            # 否则能量按"时间最近"绑定会命中本机重复行而不是 No.84 那条。
+            near = None
+            if not dup:
+                near = conn.execute(
+                    "SELECT id, fields, sheet_id, shot_time FROM shots WHERE "
+                    "ABS(julianday(shot_time) - julianday(?)) * 86400 <= ? "
+                    "ORDER BY (sheet_id=? ) DESC, "
+                    "ABS(julianday(shot_time) - julianday(?)) LIMIT 1",
+                    (shot_time, SHOT_MERGE_SEC, sh["id"], shot_time)).fetchone()
+            if not dup and near:
+                try:
+                    flds = json.loads(near["fields"] or "{}")
+                except Exception:
+                    flds = {}
+                merged = {k: v for k, v in (p.get("fields") or {}).items()
+                          if v not in ("", None) and not flds.get(k)}
+                if merged:
+                    flds.update(merged)
+                conn.execute(
+                    "UPDATE shots SET fields=?, file_count=file_count+?, "
+                    "rev=COALESCE(rev,1)+1 WHERE id=?",
+                    (json.dumps(flds, ensure_ascii=False), len(files), near["id"]))
+                self._ok(merged_into=near["id"], sheet_id=near["sheet_id"])
+                return
             if not dup:
                 conn.execute("""
                     INSERT INTO shots
@@ -1320,11 +1356,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_energy(self):
         """汤姆逊谱仪能量上报绑定。
-        按 shot_time 在匹配窗口内找时间最近的一条发次记录，把能量写入
-        指定列（默认 fiber_p_energy「闪烁光纤质子能量」）。
-        - 找到：更新该行并返回 matched（含行 id / 匹配时间 / 时间差）。
-        - 窗口内没有发次：返回 ok:false + error:no_match + nearest（全库最近一条），
-          调用方可带 create:true 强制补录一条独立记录（写入"实时打靶"表）。
+        匹配优先级（绝不覆盖已有发次号——序号只能来自 B 机文件名解析）：
+        1. 带 shot_no 时：精确匹配当天 fields.no == shot_no 的行（最可信）；
+        2. 时间窗内最近的一条发次（只在目标行没有 No. 时补写，绝不改写），
+           目标行 No. 与 shot_no 不一致时在返回中带 no_mismatch 提示；
+        3. 都没中：返回 no_match（可 create:true 补录独立记录）。
         能量可重复发送（覆盖更新），便于解谱修正后重报。"""
         p = self._json_body()
         st = norm_shot_time(p.get("shot_time"))
@@ -1344,59 +1380,54 @@ class Handler(BaseHTTPRequestHandler):
             window = 15.0
         t0 = datetime.strptime(st, "%Y-%m-%d %H:%M:%S")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        day = st[:10]
         with _db_lock, db() as conn:
+            def _bind(best, by_no=False):
+                flds = json.loads(best["fields"] or "{}")
+                flds[field] = energy
+                if shot_no and not str(flds.get("no") or "").strip():
+                    flds["no"] = shot_no       # 仅补空，绝不覆盖已有序号
+                conn.execute(
+                    "UPDATE shots SET fields=?, rev=COALESCE(rev,1)+1 WHERE id=?",
+                    (json.dumps(flds, ensure_ascii=False), best["id"]))
+                d = datetime.strptime(
+                    best["shot_time"], "%Y-%m-%d %H:%M:%S") - t0
+                extra = {}
+                if not by_no and shot_no and str(flds.get("no") or "") \
+                        not in ("", str(shot_no)):
+                    extra["no_mismatch"] = {
+                        "row_no": flds.get("no"), "sent_no": shot_no,
+                        "message": "时间最近行 No.%s 与上报 No.%d 不一致，"
+                                   "已按行写入能量、未改动行号"
+                                   % (flds.get("no"), shot_no)}
+                return self._ok(matched=best["id"],
+                                matched_time=best["shot_time"],
+                                diff_sec=abs(d.total_seconds()),
+                                sheet_id=best["sheet_id"],
+                                field=field, energy=energy, **extra)
+
+            # 1) 精确 No. 匹配（当天内；可能有多条历史重复，取时间最近的）
+            if shot_no:
+                rows = conn.execute(
+                    "SELECT * FROM shots WHERE shot_time LIKE ? ORDER BY shot_time",
+                    (day + "%",)).fetchall()
+                exact = [r for r in rows
+                         if str(json.loads(r["fields"] or "{}")
+                                .get("no") or "") == str(shot_no)]
+                if exact:
+                    return _bind(min(exact, key=_diff_key(t0)), by_no=True)
+
+            # 2) 时间窗内最近行
             lo = (t0 - timedelta(seconds=window)).strftime("%Y-%m-%d %H:%M:%S")
             hi = (t0 + timedelta(seconds=window)).strftime("%Y-%m-%d %H:%M:%S")
             cands = conn.execute(
                 "SELECT * FROM shots WHERE shot_time BETWEEN ? AND ?",
                 (lo, hi)).fetchall()
             if cands:
-                def _diff(r):
-                    d = datetime.strptime(
-                        r["shot_time"], "%Y-%m-%d %H:%M:%S") - t0
-                    return abs(d.total_seconds())
-                best = min(cands, key=_diff)
-                flds = json.loads(best["fields"] or "{}")
-                flds[field] = energy
-                if shot_no:
-                    flds["no"] = shot_no
-                conn.execute(
-                    "UPDATE shots SET fields=?, rev=COALESCE(rev,1)+1 WHERE id=?",
-                    (json.dumps(flds, ensure_ascii=False), best["id"]))
-                return self._ok(matched=best["id"], matched_time=best["shot_time"],
-                                diff_sec=_diff(best), sheet_id=best["sheet_id"],
-                                field=field, energy=energy)
-            if shot_no:
-                # 发次号兜底：时间窗没匹配到，但带了 No. → 绑定当天第 No. 条记录
-                day = st[:10]
-                rows = conn.execute(
-                    "SELECT * FROM shots WHERE shot_time LIKE ? ORDER BY shot_time",
-                    (day + "%",)).fetchall()
-                if 0 < shot_no <= len(rows):
-                    best = rows[shot_no - 1]
-                    flds = json.loads(best["fields"] or "{}")
-                    flds[field] = energy
-                    flds["no"] = shot_no
-                    conn.execute(
-                        "UPDATE shots SET fields=?, rev=COALESCE(rev,1)+1 WHERE id=?",
-                        (json.dumps(flds, ensure_ascii=False), best["id"]))
-                    d = datetime.strptime(
-                        best["shot_time"], "%Y-%m-%d %H:%M:%S") - t0
-                    return self._ok(matched=best["id"], matched_time=best["shot_time"],
-                                    diff_sec=abs(d.total_seconds()),
-                                    sheet_id=best["sheet_id"], field=field,
-                                    energy=energy, by_no=True)
-            if p.get("create"):
-                sh = get_sheet(conn, LIVE_SHEET)
-                cur = conn.execute("""
-                    INSERT INTO shots(shot_time, machine, file_count, first_file,
-                                      folder, fields, reported_at, created_at, sheet_id)
-                    VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (st, str(p.get("machine") or "thomson"), 0, "", "",
-                     json.dumps({field: energy}, ensure_ascii=False),
-                     "thomson_helper", now, sh["id"]))
-                return self._ok(created=cur.lastrowid, sheet_id=sh["id"],
-                                shot_time=st)
+                return _bind(min(cands, key=_diff_key(t0)))
+
+            # 3) 窗口内没有发次：不猜"第 N 条"（合并/缺行时必然绑错），
+            #    直接返回 no_match 交给调用方重试或补录
             near = conn.execute(
                 "SELECT id, shot_time, machine FROM shots "
                 "ORDER BY ABS(julianday(shot_time) - julianday(?)) LIMIT 1",

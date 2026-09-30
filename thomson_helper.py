@@ -38,7 +38,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -298,14 +298,11 @@ def _save_ttm_overrides(o):
         return False
 
 
-def effective_target_map(day=None):
-    """按日期绑定的当天靶类型表（页面编辑直接写入 target_types/<日期>.json）"""
-    try:
-        return dict(get_daily_target_map(day).get("map") or {})
-    except Exception:
-        m = dict(get_target_type_map())
-        m.update(_ttm_overrides())
-        return m
+def effective_target_map():
+    """自动(xls)映射 + 手动覆盖 合并后的生效映射"""
+    m = dict(get_target_type_map())
+    m.update(_ttm_overrides())
+    return m
 
 
 def get_target_type_layout():
@@ -587,6 +584,7 @@ def energy_cell(s):
             parts.append("%s:%s" % (f["label"].replace("能量", ""), v))
     return "  ".join(parts)
 AUTO_REPORT = True
+REPORT_SHOTS = True   # false=C机模式：只发能量，永不向 A 机建行
 BW_MACHINE = ""   # b_watcher 的机名（读 config_b.local.json）：确认上报时与
                   # b_watcher 旧直报记录对齐，A 机去重才不会产生重复行
 # 展示/绑定状态：pending 待确认 | sent 已绑定 | no_match 无匹配 | error 发送失败
@@ -989,22 +987,25 @@ def api_targetmap_solidify():
     新架构下每次编辑都已直接写当天表，此按钮用于把旧系统(xls+覆盖)内容一次性抓进来。"""
     day = _bound_day()
     with TTM_STATE["lock"]:
-        dm = dict(get_daily_target_map(day))
-        merged = dict(dm.get("map") or {})
-        if not merged:                   # 当天表为空 → 抓旧系统内容兜底
-            merged = dict(get_target_type_map())
-            merged.update(_ttm_overrides())
-        dm["map"] = merged
-        if not dm.get("title"):
-            dm["title"] = _ttm_title()
+        merged = dict(get_target_type_map())
+        merged.update(_ttm_overrides())
+        data = {"solidified_at": time.time(),
+                "solidified_str": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "title": _ttm_title(),
+                "map": merged}
         try:
-            ok = _save_daily_map(day, dm)
+            json.dump(data, open(TTM_BASE_MANUAL_PATH, "w", encoding="utf-8"),
+                      ensure_ascii=False, indent=1)
         except Exception as e:
-            log("日报表固化失败: %r" % e)
+            log("固化基表写入失败: %r" % e)
             return {"ok": False, "error": str(e)}
+        _TTM_BASE_MANUAL["mtime"] = None    # 强制下次重载
+        TTM_STATE["map"] = merged           # 立即生效（不等 60s 节流）
+        TTM_STATE["next_check"] = 0
     bump_ver()
-    log("靶类型已固化为 %s 日报表：%d 个靶位" % (day, len(merged)))
-    return {"ok": ok, "count": len(merged), "date": day}
+    log("靶类型映射已固化为基表：%d 个靶位（来源=页面当前表，xls 不再参与）"
+        % len(merged))
+    return {"ok": True, "count": len(merged)}
 
 
 def api_trash_act(p):
@@ -2768,8 +2769,11 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(energies, dict):
             energies = {}
         legacy = str(p.get("energy", "")).strip()      # 兼容旧客户端单 energy
+        # 外部程序（PyTPS 等）可用 field 指定能量列（tps_h/tps_c6…），
+        # 不带 field 时按旧约定落第一列（fiber_p_energy）
+        fld_in = str(p.get("field") or "").strip()
         if legacy and not str(energies.get(ekey0()) or "").strip():
-            energies[ekey0()] = legacy
+            energies[fld_in if fld_in in efield_keys() else ekey0()] = legacy
         energies = {str(k): str(v).strip() for k, v in energies.items()
                     if str(v).strip() and k in efield_keys()}
         with _state_lock:
@@ -2796,25 +2800,37 @@ class Handler(BaseHTTPRequestHandler):
 
         # 第 1 步：确认上报——打靶行写入 A 机（带靶位/离焦/No.，含能量如有）
         if not shot.get("reported"):
-            try:
-                report_shot(shot)
-            except Exception as e:
-                shot["status"], shot["info"] = "error", "上报日志系统失败"
+            if not REPORT_SHOTS:
+                # C机模式：行由 B 机上报，本机只发能量（第 2 步继续）
+                shot["reported"] = True
+                shot["info"] = "C机模式：不建行，仅能量绑定"
                 save_state()
-                log("确认上报失败: %s %r" % (st, e))
-                return self._send(200, json.dumps(
-                    {"ok": False, "error": "connect_failed", "message": repr(e)},
-                    ensure_ascii=False))
-            shot["reported"] = True
-            shot["info"] = ("打靶行已上报（含能量）" if energies
-                            else "打靶行已上报，能量待填")
-            save_state()
-            log("确认上报: %s%s" % (st, ("（" + energy_cell(shot) + "）")
-                                     if energies else ""))
-            if not energies:
-                bump_ver()
-                return self._send(200, json.dumps(
-                    {"ok": True, "confirmed": True}, ensure_ascii=False))
+                log("C机模式：跳过建行 %s（行由 B 机上报）" % st)
+                if not energies:
+                    return self._send(200, json.dumps(
+                        {"ok": True, "c_mode": True,
+                         "message": "C机不建行（B机负责）；填入能量后即按时间最近绑定"},
+                        ensure_ascii=False))
+            else:
+                try:
+                    report_shot(shot)
+                except Exception as e:
+                    shot["status"], shot["info"] = "error", "上报日志系统失败"
+                    save_state()
+                    log("确认上报失败: %s %r" % (st, e))
+                    return self._send(200, json.dumps(
+                        {"ok": False, "error": "connect_failed", "message": repr(e)},
+                        ensure_ascii=False))
+                shot["reported"] = True
+                shot["info"] = ("打靶行已上报（含能量）" if energies
+                                else "打靶行已上报，能量待填")
+                save_state()
+                log("确认上报: %s%s" % (st, ("（" + energy_cell(shot) + "）")
+                                         if energies else ""))
+                if not energies:
+                    bump_ver()
+                    return self._send(200, json.dumps(
+                        {"ok": True, "confirmed": True}, ensure_ascii=False))
 
         # 第 2 步：能量绑定（每个能量列独立调 /api/energy，窗口内命中，
         # 重发可覆盖修正；带 create 时第一列会补录独立记录，后续列
@@ -2909,6 +2925,7 @@ class Handler(BaseHTTPRequestHandler):
                  "message": "helper 未找到含 %s 的发次（可能未监视该目录或发次尚未检测到）" % fn},
                 ensure_ascii=False))
         p = {"shot_time": shot["shot_time"], "energy": energy,
+             "field": str(p.get("field") or "").strip() or "tps_h",
              "create": False}
         log("远程能量上报: %s = %s（发次 %s）"
             % (fn, energy, shot.get("no") if shot.get("no") is not None
@@ -2920,7 +2937,7 @@ CFG = {}
 
 
 def main():
-    global SERVER_URL, MACHINE, WATCH_DIRS, ENERGY_FIELDS, MATCH_WINDOW, AUTO_REPORT, BW_MACHINE, CFG
+    global SERVER_URL, MACHINE, WATCH_DIRS, ENERGY_FIELDS, MATCH_WINDOW, AUTO_REPORT, BW_MACHINE, CFG, REPORT_SHOTS
     CFG = load_json(CONFIG_PATH, None)
     if CFG is None:
         save_json(CONFIG_PATH, {
@@ -2962,6 +2979,9 @@ def main():
             ENERGY_FIELDS = fl
     ENERGY_FIELD = ekey0()   # 兼容旧展示
     AUTO_REPORT = bool(CFG.get("auto_report", True))
+    # C机模式：report_shots=false → 本机永不向 A 机建行（行由 B 机上报），
+    # 只做能量绑定（/api/energy 按时间最近匹配已有行）
+    REPORT_SHOTS = bool(CFG.get("report_shots", True))
     port = int(CFG.get("helper_port", 8767))
     # b_watcher 机名：确认上报的行用它做 machine，与 b_watcher 去重键对齐
     try:
