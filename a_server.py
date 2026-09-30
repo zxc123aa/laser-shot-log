@@ -1505,9 +1505,10 @@ class Handler(BaseHTTPRequestHandler):
     def api_energy(self):
         """汤姆逊谱仪能量上报绑定。
         匹配优先级（绝不覆盖已有发次号——序号只能来自 B 机文件名解析）：
-        1. 带 shot_no 时：精确匹配当天 fields.no == shot_no 的行（最可信）；
-        2. 时间窗内最近的一条发次（只在目标行没有 No. 时补写，绝不改写），
-           目标行 No. 与 shot_no 不一致时在返回中带 no_mismatch 提示；
+        1. 时间窗内最近的一条发次（TPS 的 No 可能断号错位，时间才最可靠；
+           只在目标行没有 No. 时补写，绝不改写；行 No 与 shot_no 不一致时
+           在返回中带 no_mismatch 提示）；
+        2. 窗口未中且带 shot_no：精确匹配当天 fields.no == shot_no 的行兜底；
         3. 都没中：返回 no_match（可 create:true 补录独立记录）。
         能量可重复发送（覆盖更新），便于解谱修正后重报。"""
         p = self._json_body()
@@ -1554,7 +1555,16 @@ class Handler(BaseHTTPRequestHandler):
                                 sheet_id=best["sheet_id"],
                                 field=field, energy=energy, **extra)
 
-            # 1) 精确 No. 匹配（当天内；可能有多条历史重复，取时间最近的）
+            # 1) 时间窗内最近行（TPS No 可能断号错位，时间是最可靠锚点）
+            lo = (t0 - timedelta(seconds=window)).strftime("%Y-%m-%d %H:%M:%S")
+            hi = (t0 + timedelta(seconds=window)).strftime("%Y-%m-%d %H:%M:%S")
+            cands = conn.execute(
+                "SELECT * FROM shots WHERE shot_time BETWEEN ? AND ?",
+                (lo, hi)).fetchall()
+            if cands:
+                return _bind(min(cands, key=_diff_key(t0)))
+
+            # 2) 窗口未中 + 带 shot_no：当天精确 No. 匹配兜底（行可能迟到落库）
             if shot_no:
                 rows = conn.execute(
                     "SELECT * FROM shots WHERE shot_time LIKE ? ORDER BY shot_time",
@@ -1565,16 +1575,7 @@ class Handler(BaseHTTPRequestHandler):
                 if exact:
                     return _bind(min(exact, key=_diff_key(t0)), by_no=True)
 
-            # 2) 时间窗内最近行
-            lo = (t0 - timedelta(seconds=window)).strftime("%Y-%m-%d %H:%M:%S")
-            hi = (t0 + timedelta(seconds=window)).strftime("%Y-%m-%d %H:%M:%S")
-            cands = conn.execute(
-                "SELECT * FROM shots WHERE shot_time BETWEEN ? AND ?",
-                (lo, hi)).fetchall()
-            if cands:
-                return _bind(min(cands, key=_diff_key(t0)))
-
-            # 3) 窗口内没有发次：不猜"第 N 条"（合并/缺行时必然绑错），
+            # 3) 都没中：不猜"第 N 条"（合并/缺行时必然绑错），
             #    直接返回 no_match 交给调用方重试或补录
             near = conn.execute(
                 "SELECT id, shot_time, machine FROM shots "
