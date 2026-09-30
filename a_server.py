@@ -1444,17 +1444,20 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT id, fields FROM shots WHERE machine IS ? AND shot_time=? "
                 "AND first_file IS ? AND sheet_id=?",
                 (machine, shot_time, first_name, sh["id"])).fetchone()
-            # 跨机器同发次合并：窗口内已有其他机器的行 = 同一发次（如 B机 shot84.PNG
-            # 18:13:59 与 C机 shor_84.tif 18:14:02），并入已有行，不再各建一行，
-            # 否则能量按"时间最近"绑定会命中本机重复行而不是 No.84 那条。
+            # 跨机器同发次合并：C机发次号与B机无对应关系（编号不可参考），
+            # 只按时间窗口匹配 shot_xx.PNG 的打靶时间。仅"不同机器"才允许合并
+            # （C机 shor_x.tif 并入 B机 shot_x.PNG 的行）；同一台机器的连续发次
+            # （快速连打 shot79/shot80 差 15s）绝不并入——一个 shot 文件 = 一条记录。
             near = None
             if not dup:
-                near = conn.execute(
-                    "SELECT id, fields, sheet_id, shot_time FROM shots WHERE "
+                cand = conn.execute(
+                    "SELECT id, fields, sheet_id, shot_time, machine FROM shots WHERE "
                     "ABS(julianday(shot_time) - julianday(?)) * 86400 <= ? "
                     "ORDER BY (sheet_id=? ) DESC, "
                     "ABS(julianday(shot_time) - julianday(?)) LIMIT 1",
                     (shot_time, SHOT_MERGE_SEC, sh["id"], shot_time)).fetchone()
+                if cand and (cand["machine"] or "") != (machine or ""):
+                    near = cand
             if not dup and near:
                 try:
                     flds = json.loads(near["fields"] or "{}")
