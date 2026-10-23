@@ -276,10 +276,17 @@ def _recon_sheet_id(server_url, day):
     return None
 
 
+def _is_blank_or_garbage(v):
+    """空串或 nan/none/null/0/na 这类无意义值（视为上报方未填真值）。"""
+    v = str(v or "").strip().lower()
+    return v == "" or v in ("nan", "none", "null", "0", "na")
+
+
 def reconcile_target_map(server_url, helper_url):
-    """对账一轮（覆盖模式）：A 机当天日志行的 target_type 与映射表不一致的
-    → 一律改成映射值（含补空、纠正之前映射错误的行）。
-    映射表里没有该靶位时：只清 'nan' 等垃圾值，不动真实类型。
+    """对账一轮（上报方优先·映射表仅填空缺/垃圾）：A 机当天日志行的
+    target_type 若已由上报方填了非空真值 → 一律不动；
+    仅当该行 target_type 为空/垃圾值(nan/none/null/0/空)时才用映射表回填。
+    若行带 target_type_lock=true 则整行跳过。
     返回补写行数；helper/A 机不可达返回 -1。"""
     try:
         j = _recon_get_json(helper_url.rstrip("/") + "/api/targetmap")
@@ -307,10 +314,15 @@ def reconcile_target_map(server_url, helper_url):
                 if not pos:
                     continue
                 t = mapping.get(pos)
+                # 上报方显式锁定该行 → 不染指
+                if str(f.get("target_type_lock") or "").strip().lower() \
+                        in ("1", "true", "yes", "y"):
+                    continue
                 if t is not None:
-                    if cur != t:         # 覆盖：不一致就改成映射值
+                    if _is_blank_or_garbage(cur):
+                        # 上报方没填/填了垃圾 → 用映射值回填
                         todo.append((r, t))
-                elif cur.lower() in ("nan", "none", "null"):
+                elif _is_blank_or_garbage(cur):
                     todo.append((r, ""))  # 映射也没有 → 只清垃圾值
             if not todo:
                 return 0

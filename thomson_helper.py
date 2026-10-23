@@ -1267,10 +1267,16 @@ def _a_sheet_id(day, server):
     return None
 
 
+def _is_blank_or_garbage(v):
+    """空串或 nan/none/null/0/na 这类无意义值（视为上报方未填真值）。"""
+    v = str(v or "").strip().lower()
+    return v == "" or v in ("nan", "none", "null", "0", "na")
+
+
 def _sync_types_to_a(day, changed):
     """后台线程：把 {靶位: 新类型} 同步到 A 机当天日志行。
-    新类型非空 → 覆盖该靶位所有日志行的 target_type；
-    新类型为空 → 只清 'nan' 类垃圾值，不动人工填过的类型。"""
+    上报方优先：仅当日志行 target_type 为空/垃圾值时才用新类型回填；
+    若行带 target_type_lock=true 则跳过该行。"""
     if not changed:
         return
     server = SERVER_URL or "http://10.0.23.155:8765"
@@ -1292,10 +1298,14 @@ def _sync_types_to_a(day, changed):
                     continue
                 new_t = changed[pos]
                 cur_t = str(f.get("target_type") or "").strip()
+                # 上报方显式锁定该行 → 跳过
+                if str(f.get("target_type_lock") or "").strip().lower() \
+                        in ("1", "true", "yes", "y"):
+                    continue
                 if new_t:
-                    if cur_t != new_t:          # 覆盖为映射值
+                    if _is_blank_or_garbage(cur_t):   # 上报方没填/填了垃圾 → 补映射值
                         pending.append((r, new_t))
-                elif cur_t.lower() in ("nan", "none", "null"):
+                elif _is_blank_or_garbage(cur_t):
                     pending.append((r, ""))     # 只清垃圾值
             if not pending:
                 return
