@@ -297,6 +297,17 @@ def check_invariants():
        "_snapshot 不再误调 effective_target_map(参数)（P0 已修）",
        "_snapshot 又出现 effective_target_map(_bound_day()) —— SSE 会断链！")
 
+    # 3.9 表绑定过期保护（2026-10-23 事故：09-30 测试绑定忘切回，挂 23 天）
+    ck("def _binding_expired_check" in h,
+       "helper 有绑定过期自动保护（_binding_expired_check）",
+       "helper 缺 _binding_expired_check —— 测试绑定忘切回会一直挂旧表！")
+    ck("_binding_expired_check" in _func_calls(h, "monitor_loop"),
+       "monitor_loop 每轮调用绑定过期检查",
+       "monitor_loop 没调 _binding_expired_check —— 过期保护失效！")
+    ck('"expired": _binding_is_expired' in h,
+       "helper /api/sheetname 与 /api/targetmap 返回 expired 标志",
+       "helper API 响应缺 expired 标志 —— 前端无法显示过期警告！")
+
     # 3.8 UI 与代码分离（根治 git merge 覆盖：改 UI 只碰 ui/*.html，不碰 .py）
     ck("def _load_ui_html" in h and "_UI_PATH" in h,
        "helper UI 已抽离到 ui/helper.html（_load_ui_html 加载）",

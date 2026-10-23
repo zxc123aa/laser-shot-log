@@ -451,7 +451,13 @@ function loadSheetBinding(){
   .then(function(j){
     if (!j.ok) return;
     CUR_SHEET = j.sheet_name || "";
-    document.getElementById("sheetName").textContent = j.label || sheetLabel(CUR_SHEET);
+    var el = document.getElementById("sheetName");
+    el.textContent = j.label || sheetLabel(CUR_SHEET);
+    /* 绑定过期（历史日期残留）→ 顶部标红提醒，防测试表挂多天 */
+    if (j.expired){
+      el.style.color = "#e74c3c"; el.style.fontWeight = "bold";
+      el.title = "绑定已过期：历史日期禁止绑定，请切回「按日期自动分表」";
+    } else { el.style.color = ""; el.style.fontWeight = ""; el.title = ""; }
   }).catch(function(){});
 }
 function openSheet(){
@@ -548,6 +554,10 @@ function renderTmap(j){
   var TTLOVR = j.title || "";
 
   var h = "<div style='font-size:11px;color:#888;margin-bottom:6px'>" +
+          (j.expired ? "<div style='background:#fdecea;color:#c0392b;" +
+            "border:1px solid #e74c3c;padding:4px 8px;margin-bottom:6px'>" +
+            "⚠ 绑定的 " + tesc(j.date || "") + " 已是历史日期（上一轮测试残留）！" +
+            "发次会上报进旧表。请去「上报表格」切回「按日期自动分表」。</div>" : "") +
           "本表绑定日期：<b style='color:#2c3e50'>" + tesc(j.date || "今天") +
           "</b>（与当天日志表一致；点「保存全部修改」一次存入 target_types\\" +
           tesc(j.date || "") + ".json）<br>" +

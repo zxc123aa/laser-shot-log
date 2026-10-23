@@ -1870,6 +1870,7 @@ def get_sheet_binding():
     except Exception:
         pass  # A 机暂不可达：下拉框只显示特殊选项，不影响改绑定
     return {"ok": True, "sheet_name": cur, "label": sheet_label(cur),
+            "expired": _binding_is_expired(cur),
             "sheets": sheets}
 
 
@@ -1896,6 +1897,33 @@ def set_sheet_binding(name):
     return {"ok": True, "sheet_name": sn, "label": sheet_label(sn)}
 
 
+def _binding_is_expired(sn):
+    """绑定是否已过期：真实日期且 < 今天——正是 set_sheet_binding 现在
+    会拒绝的那类「历史日期表」。日历不存在的测试日期（如 09-31）不算过期。"""
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", str(sn or "")):
+        return False
+    try:
+        return datetime.strptime(sn, "%Y-%m-%d").date() < datetime.now().date()
+    except ValueError:
+        return False
+
+
+def _binding_expired_check():
+    """绑定过期自动保护（2026-10-23 事故：09-30 测试时绑定了当天日期表，
+    测完忘切回 @date，一挂 23 天——靶类型表/上报目标全是旧表，用户才发现）。
+    「昨天合法、今天就是禁绑的历史日期」只可能是这种残留，按既有的
+    「真实历史日期禁止绑定」规则自动切回 @date；测试日期不自动切。
+    monitor_loop 每轮开头调用（零开销字符串比较，锁外）。"""
+    sn = str((CFG or {}).get("sheet_name", "") or "").strip()
+    if not _binding_is_expired(sn):
+        return
+    was = sn
+    set_sheet_binding("@date")
+    log("⚠ 表绑定 %s 已过期（真实历史日期禁止绑定），已自动切回「按日期自动分表」"
+        % was)
+    led({"ev": "bind_expired", "was": was, "now": "@date"})
+
+
 def monitor_loop(interval, window):
     """监视循环：每轮取 WATCH_DIRS 快照，页面改目录后下一轮立即生效"""
     seen_first = not os.path.exists(STATE_PATH)
@@ -1913,6 +1941,7 @@ def monitor_loop(interval, window):
     missing_seen = {}      # {目录: 上次告警时间}，60 秒节流
     while True:
         try:
+            _binding_expired_check()   # 绑定过期自动切回 @date（防测试残留挂多天）
             # ⚠️ retry_queue() 不在这里同步调了——它每条 http_post_json
             # timeout=6s，A 机 IP 不通时队列有 N 条就阻塞 N×6s，主循环这期间
             # 完全不扫描（"说好百 ms、实际十几秒"的真凶之一）。已移到独立
@@ -2194,6 +2223,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(
                 {"ok": True, "date": day,
                  "map": dm.get("map") or {},
+                 "expired": _binding_is_expired(day),
                  "overrides": {},               # 日报表即最终值，无覆盖层
                  "title": dm.get("title") or "",
                  "seeded_from": dm.get("seeded_from", ""),
