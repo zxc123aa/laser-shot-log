@@ -308,6 +308,14 @@ def check_invariants():
        "helper /api/sheetname 与 /api/targetmap 返回 expired 标志",
        "helper API 响应缺 expired 标志 —— 前端无法显示过期警告！")
 
+    # 3.10 monitor_loop 的 done 必须每轮无条件初始化
+    # （2026-10-23 事故：done 只在 if all_new: 块内赋值，空轮 UnboundLocalError
+    #   每轮抛出，SSE 推送/能量补绑全被跳过，页面静止 31 分钟）
+    mloop_src = _func_body(h, "monitor_loop")
+    ck("done = []" in mloop_src,
+       "monitor_loop 的 done 有无条件初始化（空轮不炸）",
+       "monitor_loop 的 done 缺无条件初始化 —— 空轮 UnboundLocalError 会让页面静止！")
+
     # 3.8 UI 与代码分离（根治 git merge 覆盖：改 UI 只碰 ui/*.html，不碰 .py）
     ck("def _load_ui_html" in h and "_UI_PATH" in h,
        "helper UI 已抽离到 ui/helper.html（_load_ui_html 加载）",

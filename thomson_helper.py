@@ -1984,6 +1984,11 @@ def monitor_loop(interval, window):
             all_new = [tuple(x) for x in STATE["pend"]] + new_entries
             # 即时行：有未到齐的文件（含刚落盘还没过安静期的）立刻上表显示
             forming = None
+            # ⚠️ done 必须每轮无条件初始化：下面的 `if done:`（补绑暂存能量）
+            # 在 all_new 为空的轮次也执行——2026-10-23 教训：done 只在
+            # if all_new: 块内赋值，空轮 UnboundLocalError 每轮抛出，
+            # 循环后半段（SSE 推送/能量补绑）全被跳过，页面彻底静止 31 分钟。
+            done = []
             if all_new:
                 done, hold = group_into_shots(all_new, window)
                 if hold:
