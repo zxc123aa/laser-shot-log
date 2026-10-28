@@ -27,6 +27,34 @@
 - PyTPS 截止能量 → `8767 /api/energy_remote`（按文件名匹配）→ A 机时间最近绑定；
   能量落 `tps_h` 列。对接代码镜像在本仓库 `pytps/`（真源仓库 zxc123aa/Pytps）
 
+## 温馨提示：target_type 污染与 C 机数据防线（2026-10-28 排查复盘）
+
+**C 机"永不建行"的三重防线**（改动任一处前先想清楚）
+
+1. `config_helper.json` → `report_shots: false`：helper 建行分支硬性跳过，直接标记
+   reported 转入能量绑定
+2. 补发队列（state_helper.json 的 `queue`）必须为空——若 C 机曾跑过 direct 模式，
+   队列里残留的旧报文被 retry 重发时会绕过开关直接建行。检查命令：
+   `python -c "import json;print(len(json.load(open('state_helper.json'))['queue']))"`
+3. A 机 `/api/energy` 无 create 入口（只有"绑定已有行 / no_match"两种结局）；
+   建行唯一路径是 `/api/shot`，C 机代码不存在调用它的活分支
+
+**target_types/ 日报表的三个特性（踩过坑的）**
+
+- **播种只在文件缺失时发生**：改坏/想重置某天的表 → 直接删掉那个 json，
+  下次访问自动重播（xls 比最近日报表新 → xls 接管；否则沿用最近一天；全无 → legacy 基表+当前 overrides）
+- **冻结表会向后传染**：播种回看"最近一天"，一个 15 天没更新的 stale 表会一路
+  传给之后每一天。发现 `seeded_from: legacy` 且多天字节相同 → 就是它
+- **清理前必须备份**：2026-10-28 清理的 18 个污染表在 `backup/target_types_stale_20261028/`，
+  可对照/回滚
+
+**排障速查**
+
+- 核对 helper 是否旧进程：`curl --noproxy "*" http://127.0.0.1:8767/api/ver`
+- 触发当日表重播：`curl --noproxy "*" http://127.0.0.1:8767/api/targetmap`
+- 遗留事项：A 机行上被旧覆盖逻辑写坏的 target_type，需 A 机 agent 用 map 修复
+  历史（git 7108884 / 50449fb 那批）+ 回收站核对回填
+
 ## 常用地址（固定，内网任何电脑浏览器直接打开）
 
 | 系统 | 地址 | 用途 |
