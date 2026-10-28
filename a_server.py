@@ -680,12 +680,16 @@ class Handler(BaseHTTPRequestHandler):
     def api_field(self):
         """单元格级编辑（带乐观锁）：shot_time 或 shotlist_cols.json 白名单字段。
         请求可带 rev（该行当前版本号）；服务端版本不一致 → 返回 conflict + 最新值，
-        避免多人编辑互相覆盖。"""
+        避免多人编辑互相覆盖。
+        每次成功写入都记 A 机账本 a_field 事件（含 client_ip）——
+        2026-10-28 排查"神秘写入方"（90 秒节拍往 A 机行回填旧 legacy 靶类型）
+        时加的审计：api_field 是唯一不记来源的写入口。"""
         p = self._json_body()
         sid = int(p["id"])
         field = p["field"]
         val = str(p.get("value", "")).strip()
         rev = p.get("rev")
+        ip = self.client_address[0] or "?"
         with _db_lock, db() as conn:
             row = conn.execute(
                 "SELECT fields, rev FROM shots WHERE id=?", (sid,)).fetchone()
@@ -706,16 +710,24 @@ class Handler(BaseHTTPRequestHandler):
                               else f.get(field, "")},
                     ensure_ascii=False), "application/json")
             new_rev = cur_rev + 1
+            wrote = None          # (field, old, new) → 事务外记审计
             if field == "shot_time":
                 conn.execute("UPDATE shots SET shot_time=?, rev=? WHERE id=?",
                              (norm_shot_time(val), new_rev, sid))
+                wrote = (field, "", val)
             elif field in COL_KEYS:
                 flds = json.loads(row["fields"] or "{}")
+                old = str(flds.get(field, "") or "")
                 flds[field] = val
                 conn.execute("UPDATE shots SET fields=?, rev=? WHERE id=?",
                              (json.dumps(flds, ensure_ascii=False), new_rev, sid))
+                wrote = (field, old, val)
             else:
                 return self._err("非法字段: %s" % field)
+        if wrote:
+            aled({"ev": "a_field", "id": sid, "field": wrote[0],
+                  "old": wrote[1], "new": wrote[2], "rev": new_rev,
+                  "client_ip": ip})
         self._ok(rev=new_rev)
 
     def api_shot(self):
