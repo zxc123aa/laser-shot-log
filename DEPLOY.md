@@ -1,5 +1,32 @@
 # 部署与一键启动指南
 
+## 机器分工与防旧进程规范（2026-10-28 定稿，红线必读）
+
+**机器分工（谁干什么）**
+
+| 机器 | 跑什么 | 职责 |
+|---|---|---|
+| **A 机 10.0.23.155** | `start_a_server.bat` | 日志总表服务(8765)，唯一建行入口（api_shot）；能量按**时间最近**绑定，绝不改写行 No. |
+| **B 机 DESKTOP-6RGKBS8** | `start_real.bat` | `b_watcher` 监视谱仪 PNG **建行上报**（confirm 制）+ sheet_backup + 8767 上报确认页 |
+| **C 机 10.0.23.117** | 桌面`C机-一键启动.bat` | **只跑 helper(8767) + sheet_backup，不跑 b_watcher**。行全由 B 机建；C 机只做 PyTPS 截止能量上报 |
+
+**防旧进程三条纪律（target_type 覆盖事故的教训，10-23 旧 helper 跑了 5 天旧代码）**
+
+1. **改代码/配置 = 必须重启对应进程**。helper/b_watcher/a_server 都是常驻进程，
+   `git pull` 不重启等于没更新，旧逻辑会一直跑到天荒地老。
+2. **启动脚本先杀旧实例**：一键启动 bat 一律"先杀后启"（按端口/窗口标题 taskkill），
+   保证跑起来的永远是刚 pull 的代码。不要用"已在运行就跳过"的旧逻辑。
+3. **版本可核对**：helper 暴露 `GET /api/ver` 返回 `code_ver`（如 `2026-10-28.d9c185b`），
+   改 helper 代码时必须同步更新 `CODE_VER` 常量；健康检查用它与 git HEAD 比对，
+   不一致 = 旧进程，立即重启。
+
+**C 机额外红线**
+
+- C 机不建行：`config_helper.json` 保持 `report_shots: false`、`report_mode` 无关紧要
+  （b_watcher 已从 C 机退役，勿再启动）
+- PyTPS 截止能量 → `8767 /api/energy_remote`（按文件名匹配）→ A 机时间最近绑定；
+  能量落 `tps_h` 列。对接代码镜像在本仓库 `pytps/`（真源仓库 zxc123aa/Pytps）
+
 ## 常用地址（固定，内网任何电脑浏览器直接打开）
 
 | 系统 | 地址 | 用途 |

@@ -67,6 +67,14 @@ def led(ev, day=None):
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config_helper.json")
 
+# ── 防旧进程规范 ──────────────────────────────────────────────
+# helper 是常驻进程：改了代码不重启 = 旧逻辑继续跑（2026-10-28 靶类型
+# 覆盖事故即 10-23 启动的旧 helper 跑了 5 天旧代码所致）。
+# 纪律：①改动本文件/配置后必须重启 helper；②启动脚本先杀 8767 旧实例；
+# ③健康检查用 /api/ver 核对 CODE_VER 与 git 最新提交一致。
+CODE_VER = "2026-10-28.d9c185b"
+STARTED_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def _bypass_proxy_for_lan():
     """实验室内网地址不走系统代理。
@@ -2215,6 +2223,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if urlparse(self.path).path == "/":
             self._page()
+        elif urlparse(self.path).path == "/api/ver":
+            # 代码版本标记：健康检查用它识别"进程跑的是不是旧代码"。
+            # 改动 helper 代码时必须同步更新这个字符串。
+            self._send(200, json.dumps(
+                {"ok": True, "code_ver": CODE_VER,
+                 "started_at": STARTED_AT}, ensure_ascii=False))
         elif urlparse(self.path).path == "/api/local":
             self._send(200, self._snapshot())
         elif urlparse(self.path).path == "/api/ledger_stats":
