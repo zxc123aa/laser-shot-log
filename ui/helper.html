@@ -567,10 +567,9 @@ function renderTmap(j){
           "<span style='float:right'>" +
           "<button id='tmapSaveBtn' onclick='saveTmapAll(this)' " +
           "style='font-size:11px;padding:2px 10px;cursor:pointer;margin-right:6px;" +
-          "background:#eee;color:#333;border:1px solid #ccc'>保存全部修改</button>" +
-          "<button onclick='solidifyTmap(this)' " +
-          "style='font-size:11px;padding:2px 8px;cursor:pointer'>" +
-          "以当前表为准（存为今天）</button></span></div>" +
+          "background:#eee;color:#333;border:1px solid #ccc'>保存全部修改</button></span></div>" +
+          // 固化按钮(solidifyTmap)已下线 2026-10-28：旧体系迁移按钮被误点会把
+          // xls+overrides 旧快照存成固化基表；后端 /api/targetmap_solidify 保留备用。
           "<table style='border-collapse:collapse;font-size:12px;table-layout:fixed'>";
   if (L.ncols > 1){
     h += "<colgroup><col style='width:34px'>";
