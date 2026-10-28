@@ -2559,25 +2559,35 @@ class Handler(BaseHTTPRequestHandler):
                          "message": "C机不建行（B机负责）；填入能量后即按时间最近绑定"},
                         ensure_ascii=False))
             else:
-                try:
-                    report_shot(shot)
-                except Exception as e:
-                    shot["status"], shot["info"] = "error", "上报日志系统失败"
+                if not shot.get("target"):
+                    # 裸行防护（2026-10-28 shot100 事故）：本机缺靶位信息时建行
+                    # 会以"仅含 no"的裸行占住 A 机去重键，堵死 b_watcher 带
+                    # 完整数据的正式上报 → 行被修复工具删除后发次整行缺失。
+                    # 缺靶位一律不建行；能量照常走第 2 步按时间窗绑定。
+                    shot["info"] = ("缺靶位：未建行（watcher 将带完整数据上报）；"
+                                    "能量按时间窗绑定")
                     save_state()
-                    log("确认上报失败: %s %r" % (st, e))
-                    return self._send(200, json.dumps(
-                        {"ok": False, "error": "connect_failed", "message": repr(e)},
-                        ensure_ascii=False))
-                shot["reported"] = True
-                shot["info"] = ("打靶行已上报（含能量）" if energies
-                                else "打靶行已上报，能量待填")
-                save_state()
-                log("确认上报: %s%s" % (st, ("（" + energy_cell(shot) + "）")
-                                         if energies else ""))
-                if not energies:
-                    bump_ver()
-                    return self._send(200, json.dumps(
-                        {"ok": True, "confirmed": True}, ensure_ascii=False))
+                    log("确认上报跳过建行 %s：无靶位信息（裸行防护）" % st)
+                else:
+                    try:
+                        report_shot(shot)
+                    except Exception as e:
+                        shot["status"], shot["info"] = "error", "上报日志系统失败"
+                        save_state()
+                        log("确认上报失败: %s %r" % (st, e))
+                        return self._send(200, json.dumps(
+                            {"ok": False, "error": "connect_failed", "message": repr(e)},
+                            ensure_ascii=False))
+                    shot["reported"] = True
+                    shot["info"] = ("打靶行已上报（含能量）" if energies
+                                    else "打靶行已上报，能量待填")
+                    save_state()
+                    log("确认上报: %s%s" % (st, ("（" + energy_cell(shot) + "）")
+                                            if energies else ""))
+                    if not energies:
+                        bump_ver()
+                        return self._send(200, json.dumps(
+                            {"ok": True, "confirmed": True}, ensure_ascii=False))
 
         # 第 2 步：能量绑定（每个能量列独立调 /api/energy，窗口内命中，
         # 重发可覆盖修正；带 create 时第一列会补录独立记录，后续列

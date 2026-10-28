@@ -761,6 +761,22 @@ class Handler(BaseHTTPRequestHandler):
                     "文件名不符合发次命名规则，拒绝建行: %s"
                     "（如确需纳入，改 config_a.json 的 shot_file_patterns，"
                     "或把 enforce_shot_file 设为 false）" % bad[:3])
+        # ---- 裸行防护（2026-10-28 shot100 事故）----：helper 手动确认链
+        # （machine 以 -Thomson 结尾）在拿不到靶位时建"仅含 no"的裸行，
+        # 占住去重键后堵死 b_watcher 带完整数据的正式上报，行被修复工具
+        # 删除后发次整行缺失。缺靶位的 -Thomson 建行一律拒绝：
+        # b_watcher 会带着靶位/类型/离焦完整上报，宁缺不裸。
+        if str(machine).strip().endswith("-Thomson") \
+                and not str((p.get("fields") or {})
+                            .get("target_pos") or "").strip():
+            aled({"ev": "a_shot_reject", "reason": "thomson_bare_row",
+                  "machine": machine, "shot_time": shot_time,
+                  "fields": p.get("fields", {}),
+                  "client_ip": self.client_address[0]},
+                 day=str(shot_time)[:10] or None)
+            return self._err(
+                "缺靶位：拒绝建裸行（b_watcher 将带完整靶位/类型上报；"
+                "能量可照常按时间窗绑定）")
         new_id, drev = None, None   # 建行/去重两条路径共用，供末尾统一返回
         with _db_lock, db() as conn:
             if p.get("sheet_id"):
