@@ -328,6 +328,22 @@ def check_invariants():
        "_seed_daily_map 回看异常有日志（不静默吞）",
        "_seed_daily_map 回看异常被静默吞掉 —— 播种选路错误无法察觉！")
 
+    # 3.12 靶类型机理防线（2026-10-28 神秘写入方事故闭环，用户要求"从机理上修复"）
+    # a) 上报带溯源：A 机每行能查到类型值出自哪张表哪一代（继承链污染可定位）
+    ck("def _tt_provenance" in h and '"tt_src"' in h,
+       "helper 上报带 tt_src 溯源（seeded_from+updated）",
+       "helper 缺 tt_src 溯源 —— 错值无法定位到播种代际！")
+    # b) 对账版本门：helper 无 /api/ver 版本标记（=旧代码）→ 拒绝对账写入
+    recon_src = _func_body(w, "reconcile_target_map")
+    ck('"/api/ver"' in recon_src,
+       "b_watcher 对账前校验 helper /api/ver（旧代码拒绝写入，fail-safe）",
+       "b_watcher 对账缺 /api/ver 版本门 —— 旧 helper 的不可信映射会被写进 A 机！")
+    # c) 违规写入审计 watchdog：脚本式批量写靶类型自动报警
+    ck("def audit_target_type_writes" in w and '"tt_audit"' in w
+       and "maybe_audit" in _func_calls(w, "main"),
+       "b_watcher 有靶类型违规审计 watchdog 且主循环在调（tt_audit）",
+       "b_watcher 缺 tt_audit watchdog 或主循环没调 —— 批量覆盖无人报警！")
+
     # 3.8 UI 与代码分离（根治 git merge 覆盖：改 UI 只碰 ui/*.html，不碰 .py）
     ck("def _load_ui_html" in h and "_UI_PATH" in h,
        "helper UI 已抽离到 ui/helper.html（_load_ui_html 加载）",

@@ -72,7 +72,7 @@ CONFIG_PATH = os.path.join(BASE, "config_helper.json")
 # 覆盖事故即 10-23 启动的旧 helper 跑了 5 天旧代码所致）。
 # 纪律：①改动本文件/配置后必须重启 helper；②启动脚本先杀 8767 旧实例；
 # ③健康检查用 /api/ver 核对 CODE_VER 与 git 最新提交一致。
-CODE_VER = "2026-10-28.d9c185b"
+CODE_VER = "2026-10-28.mechfix"
 STARTED_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -1603,6 +1603,19 @@ def _report_day(shot_time):
     return str(shot_time)[:10]
 
 
+def _tt_provenance(day=None):
+    """靶类型溯源串：当前生效的当天表是哪次播种、何时最后更新。
+    机理防线（2026-10-28 神秘写入方事故闭环）：错值（继承链带来的旧值 /
+    legacy 污染 / 旧进程覆盖）必须能一眼定位到"哪张表哪一代"，
+    否则每次都要人肉排查整条播种链。"""
+    try:
+        dm = get_daily_target_map(day) or {}
+        return "seed:%s|upd:%s" % (dm.get("seeded_from") or "?",
+                                   str(dm.get("updated") or "?")[:16])
+    except Exception:
+        return ""
+
+
 def report_shot(shot):
     """把发次上报给 A 机（人工点「确认上报」后才会走到这里）。
     machine 用 b_watcher 的机名：A 机按 machine+时间+首文件去重，
@@ -1625,10 +1638,15 @@ def report_shot(shot):
     fields = {"no": shot["no"]} if shot.get("no") is not None else {}
     if shot.get("target"):
         fields["target_pos"] = shot["target"]       # A 机表已有"靶位"列
-        tt = lookup_target_type(shot["target"],     # 读行所写表对应日期的映射
-                                _report_day(shot["shot_time"]))
+        _rday = _report_day(shot["shot_time"])
+        tt = lookup_target_type(shot["target"], _rday)
         if tt:
             fields["target_type"] = tt              # A 机表已有"靶类型"列
+        # 机理防线：上报值带溯源（哪张表哪次播种+更新时间）——
+        # A 机行事后可查"这个类型值是谁给的"，继承链污染一眼定位。
+        _tsrc = _tt_provenance(_rday)
+        if _tsrc:
+            fields["tt_src"] = _tsrc
     if shot.get("defocus") != "":
         fields["target_defocus"] = str(shot["defocus"])  # A 机表"靶离焦"列
     e = norm_energies(shot)
@@ -2069,6 +2087,7 @@ def monitor_loop(interval, window):
                          "no": shot.get("no"),
                          "target_pos": shot.get("target", ""),
                          "target_type": _tt,
+                         "tt_src": _tt_provenance(day) if shot.get("target") else "",
                          "target_defocus": shot.get("defocus", ""),
                          "sheet_name": day,
                          "file_count": shot.get("file_count"),

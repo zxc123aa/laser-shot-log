@@ -288,6 +288,20 @@ def reconcile_target_map(server_url, helper_url):
     仅当该行 target_type 为空/垃圾值(nan/none/null/0/空)时才用映射表回填。
     若行带 target_type_lock=true 则整行跳过。
     返回补写行数；helper/A 机不可达返回 -1。"""
+    # ── 机理防线（2026-10-28 神秘写入方事故）：helper 必须带版本标记。
+    # 10-23 启动的旧 helper 跑了 5 天旧代码，其 /api/targetmap 一直在吐
+    # legacy 合并映射，被对账方拿去回填 A 机行。没有 /api/ver = 旧代码
+    # → 宁可不对账，也绝不把不可信映射写进 A 机（fail-safe 拒绝）。
+    try:
+        vj = _recon_get_json(helper_url.rstrip("/") + "/api/ver", timeout=4)
+        if not str((vj or {}).get("code_ver") or "").strip():
+            raise ValueError("code_ver 为空")
+    except Exception:
+        if time.time() - _recon_state.get("ver_warn", 0) >= 600:
+            _recon_state["ver_warn"] = time.time()
+            log("⚠ 靶类型对账拒绝执行：helper 无 /api/ver 版本标记（旧代码？）"
+                "——升级并重启 helper 后自动恢复；期间不回填、不写错值")
+        return -1
     try:
         j = _recon_get_json(helper_url.rstrip("/") + "/api/targetmap")
     except Exception:
@@ -357,6 +371,70 @@ def maybe_reconcile(server_url, helper_url, interval_sec):
     elif n == -1 and now - _recon_state["err_logged"] >= 600:
         _recon_state["err_logged"] = now   # 10 分钟最多提示一次不可达
         log("靶类型对账：helper/A 机暂不可达，下轮重试")
+
+
+# ---------------- 靶类型写入审计 watchdog（2026-10-28 事故闭环） ----------------
+# 神秘写入方（10.0.23.117 旧对账，90s 节拍批量覆盖）靠 A 机 a_field 审计
+# 才抓到——但当时只能靠人翻账本。这道防线把"盯审计"自动化：
+# 同一 IP 批量写多行靶类型 + 覆盖非空值 = 脚本式写入特征（人工逐格编辑
+# 一次只有一两格，永远命中不了）→ 大声报警 + B 机账本记 tt_audit 事件。
+_audit_state = {"last_ts": 0.0, "last_run": 0.0}
+
+
+def audit_target_type_writes(server_url):
+    """拉 A 机 a_field 增量，识别靶类型违规写入。返回违规嫌疑组数；不可达 -1。"""
+    day = datetime.now().strftime("%Y-%m-%d")
+    try:
+        j = _recon_get_json(server_url.rstrip("/")
+                            + "/api/ledger?day=%s&ev=a_field&limit=300" % day,
+                            timeout=8)
+        lines = j.get("lines") or []
+    except Exception:
+        return -1
+    if not lines:
+        return 0
+    cut = max(e.get("ts") or 0 for e in lines)
+    if not _audit_state["last_ts"]:
+        _audit_state["last_ts"] = cut       # 首轮只建立基线，不回溯报警
+        return 0
+    new = [e for e in lines
+           if (e.get("ts") or 0) > _audit_state["last_ts"]
+           and e.get("field") == "target_type"]
+    _audit_state["last_ts"] = max(_audit_state["last_ts"], cut)
+    by_ip = {}
+    for e in new:
+        by_ip.setdefault(str(e.get("client_ip") or "?"), []).append(e)
+    viol = []
+    for ip, evs in by_ip.items():
+        rows = {e.get("id") for e in evs}
+        over = [e for e in evs
+                if str(e.get("old") or "").strip() and e.get("old") != e.get("new")]
+        if len(rows) >= 5 and over:
+            viol.append({"ip": ip, "writes": len(evs), "rows": len(rows),
+                         "overwrite_nonempty": len(over),
+                         "sample": [{"id": e.get("id"), "old": e.get("old"),
+                                     "new": e.get("new"), "iso": e.get("iso")}
+                                    for e in over[:5]]})
+    if viol:
+        try:
+            log("⚠⚠ 靶类型违规写入嫌疑 %d 组: %s"
+                % (len(viol), json.dumps(viol, ensure_ascii=False)[:400]))
+        except Exception:
+            log("⚠⚠ 靶类型违规写入嫌疑 %d 组（详情见账本 tt_audit）" % len(viol))
+        led({"ev": "tt_audit", "violations": viol}, day=day)
+    return len(viol)
+
+
+def maybe_audit(server_url, interval_sec):
+    """主循环里调用：与对账同节拍（默认 90s），异常静默。"""
+    now = time.time()
+    if now - _audit_state["last_run"] < interval_sec:
+        return
+    _audit_state["last_run"] = now
+    try:
+        audit_target_type_writes(server_url)
+    except Exception:
+        pass
 
 
 def scan_once(watch_dirs):
@@ -747,6 +825,9 @@ def main():
             #      不一致的自动覆盖/补齐（纠正历史错误映射 + 补空）
             if recon_sec > 0:
                 maybe_reconcile(server_url, helper_url, recon_sec)
+                # 1.9b) 靶类型写入审计 watchdog：同节拍盯 A 机 a_field 增量，
+                #       脚本式批量写靶类型（神秘写入方特征）→ 报警+账本留痕
+                maybe_audit(server_url, recon_sec)
 
             # 2) 扫描
             entries = scan_once(watch_dirs)
