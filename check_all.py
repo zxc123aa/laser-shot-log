@@ -316,6 +316,18 @@ def check_invariants():
        "monitor_loop 的 done 有无条件初始化（空轮不炸）",
        "monitor_loop 的 done 缺无条件初始化 —— 空轮 UnboundLocalError 会让页面静止！")
 
+    # 3.11 日报表播种回看不得静默失败
+    # （2026-10-28 事故：_seed_daily_map 用了未导入的 timedelta，NameError 被
+    #   except:pass 吞掉 → 回看永远失败 → 每天午夜新表误走 legacy（09-30 旧
+    #   overrides 灌入），10-24~10-28 五张表全被污染）
+    ck("from datetime import datetime, timedelta" in h,
+       "helper 导入了 timedelta（播种回看依赖它）",
+       "helper 缺 timedelta 导入 —— 播种回看会 NameError，每天误走 legacy！")
+    seed_src = _func_body(h, "_seed_daily_map")
+    ck("timedelta(days=" in seed_src and "except Exception as e" in seed_src,
+       "_seed_daily_map 回看异常有日志（不静默吞）",
+       "_seed_daily_map 回看异常被静默吞掉 —— 播种选路错误无法察觉！")
+
     # 3.8 UI 与代码分离（根治 git merge 覆盖：改 UI 只碰 ui/*.html，不碰 .py）
     ck("def _load_ui_html" in h and "_UI_PATH" in h,
        "helper UI 已抽离到 ui/helper.html（_load_ui_html 加载）",

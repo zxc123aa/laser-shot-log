@@ -42,7 +42,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -389,8 +389,10 @@ def _seed_daily_map(day):
                 prev = json.load(open(p, encoding="utf-8"))
                 prev_day, prev_mt = pd, os.path.getmtime(p)
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        # ⚠ 禁止静默：此处曾因 timedelta 未导入每天午夜 NameError 被吞，
+        # 导致新一天的表全部误走 legacy（旧 overrides 灌入），2026-10-28 修复
+        log("日报表播种回看异常(%s) → 将退 legacy 播种: %r" % (day, e))
     if prev and prev.get("map"):
         xls = _ttm_pick_xls(_ttm_cfg()[0])
         xls_mt = 0.0
