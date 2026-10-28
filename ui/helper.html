@@ -565,6 +565,9 @@ function renderTmap(j){
           "：蓝格＝靶类型（合并大格＝同一靶块，改一处整块生效），" +
           "白格＝靶位编号/待填；大标题（含日期）可直接点击修改" +
           "<span style='float:right'>" +
+          "<button id='tmapSyncBtn' onclick='syncTmapToLog(this)' " +
+          "style='font-size:11px;padding:2px 10px;cursor:pointer;margin-right:6px;" +
+          "background:#4472C4;color:#fff;border:1px solid #385a9e'>同步日志表</button>" +
           "<button id='tmapSaveBtn' onclick='saveTmapAll(this)' " +
           "style='font-size:11px;padding:2px 10px;cursor:pointer;margin-right:6px;" +
           "background:#eee;color:#333;border:1px solid #ccc'>保存全部修改</button></span></div>" +
@@ -737,6 +740,63 @@ function renderTmapFlat(j){
 /* ---- 靶类型批量保存（在线表格式：改完点「保存全部修改」一次落盘） ---- */
 var TMAP_DIRTY = {};          // data-positions -> input 元素
 var TMAP_DATE = "";           // 对话框当前编辑的日期（跟随上报表格绑定）
+/* ---- 一键同步：以当前表为准，把 A 机日志行 target_type 推平 ----
+   先 dry 预览差异，确认后才真写；锁定行后端自动跳过（2026-10-28） */
+function syncTmapToLog(btn){
+  if (!confirm("将以「当前靶类型表」为准，全量对齐 A 机日志表的靶类型。\n" +
+      "（先预览差异，锁定行不会动）继续？")) return;
+  var old = btn.textContent;
+  btn.disabled = true; btn.textContent = "对比中…";
+  fetch("/api/reconcile_force", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({dry: true})})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if (!j || !j.ok){
+        btn.disabled = false; btn.textContent = old;
+        toast("对比失败：" + ((j && j.error) || "未知错误")); return;
+      }
+      if (!j.written){
+        btn.disabled = false; btn.textContent = old;
+        toast("日志表已与当前表一致（相同 " + j.same + " 行，锁定 " +
+              j.locked + " 行），无需同步");
+        return;
+      }
+      var d = j.detail || [];
+      var lines = d.slice(0, 10).map(function(x){
+        return "  发次" + x.no + "  " + x.pos + "：[" +
+               (x.old || "空") + "] → [" + (x.new || "空") + "]"; });
+      var more = d.length > 10 ? "\n  …等共 " + d.length + " 行" : "";
+      if (!confirm("将更新 A 机日志 " + j.written + " 行：\n" +
+            lines.join("\n") + more +
+            "\n\n（锁定 " + j.locked + " 行不动；相同 " + j.same +
+            " 行）\n确定执行？")) {
+        btn.disabled = false; btn.textContent = old; return;
+      }
+      btn.textContent = "同步中…";
+      fetch("/api/reconcile_force", {method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({})})
+        .then(function(r){ return r.json(); })
+        .then(function(j2){
+          btn.disabled = false; btn.textContent = old;
+          if (j2 && j2.ok && !((j2.errors || []).length)){
+            toast("✅ 已按当前表更新 A 机日志 " + j2.written + " 行");
+          } else {
+            toast("同步完成 " + (j2 ? j2.written : "?") + " 行，失败 " +
+                  ((j2 && j2.errors || []).length) + " 行（可重试）");
+          }
+        })
+        .catch(function(e){
+          btn.disabled = false; btn.textContent = old;
+          toast("同步请求失败: " + e);
+        });
+    })
+    .catch(function(e){
+      btn.disabled = false; btn.textContent = old;
+      toast("对比请求失败: " + e);
+    });
+}
 function tmCount(){ return Object.keys(TMAP_DIRTY).length; }
 function tmRefreshBtn(){
   var b = document.getElementById("tmapSaveBtn");

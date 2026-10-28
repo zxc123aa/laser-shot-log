@@ -72,7 +72,7 @@ CONFIG_PATH = os.path.join(BASE, "config_helper.json")
 # 覆盖事故即 10-23 启动的旧 helper 跑了 5 天旧代码所致）。
 # 纪律：①改动本文件/配置后必须重启 helper；②启动脚本先杀 8767 旧实例；
 # ③健康检查用 /api/ver 核对 CODE_VER 与 git 最新提交一致。
-CODE_VER = "2026-10-28.mechfix"
+CODE_VER = "2026-10-28.syncbtn"
 STARTED_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -1339,6 +1339,118 @@ def _sync_types_to_a(day, changed):
         log("靶类型同步 A 机异常: %r" % e)
 
 
+def api_reconcile_force(clear=False, dry=False):
+    """一键同步（人工显式操作）：以当前绑定的当天表为准，把 A 机日志行
+    target_type 全量对齐。与 90s 周期对账（上报方优先、只补空、永不覆盖）
+    互补：表里改了已有值、或历史错值残留时，用它一键推平。
+    - 表非空 → 回填/覆盖日志行；表为空且 clear=True → 清日志行值（严格表为准）
+    - 带 target_type_lock 的行一律跳过；靶位不在当天表里的行不动
+    - dry=True 只算计划不写（前端先预览再确认）；每次执行落账本 reconcile_force
+    返回 {ok, written, same, locked, detail, errors}"""
+    clear = bool(clear)
+    day = _bound_day()
+    server = SERVER_URL or "http://10.0.23.155:8765"
+    try:
+        with TTM_STATE["lock"]:
+            dm = dict(get_daily_target_map(day))
+        tmap = {str(k).strip(): _clean_type_val(v)
+                for k, v in (dm.get("map") or {}).items()}
+    except Exception as e:
+        return {"ok": False, "error": "读取当天表失败: %r" % e}
+    try:
+        sid = _a_sheet_id(day, server)
+        if not sid:
+            return {"ok": False, "error": "A 机没有 %s 表" % day}
+        url_rows = (server.rstrip("/")
+                    + "/api/rows?sheet_id=%s&page=1&page_size=2000" % sid)
+        rows = json.loads(urllib.request.urlopen(url_rows, timeout=8)
+                          .read().decode("utf-8")).get("rows") or []
+    except Exception as e:
+        return {"ok": False, "error": "拉取 A 机行失败: %r" % e}
+
+    def _plan(rs):
+        pend, n_lock, n_same, n_nomap = [], 0, 0, 0
+        for r in rs:
+            f = r.get("fields") or {}
+            pos = str(f.get("target_pos") or "").strip()
+            if not pos:
+                continue
+            if str(f.get("target_type_lock") or "").strip().lower() \
+                    in ("1", "true", "yes", "y"):
+                n_lock += 1
+                continue
+            if pos not in tmap:
+                n_nomap += 1
+                continue                       # 表里没有的靶位，不动
+            tv = tmap[pos]
+            cur = str(f.get("target_type") or "").strip()
+            if _is_blank_or_garbage(cur):
+                cur = ""
+            if cur == tv:
+                n_same += 1
+                continue
+            if tv or (clear and cur):          # 表有值→覆盖/回填；表空→仅 clear 模式清
+                pend.append({"id": r["id"], "no": f.get("no"), "pos": pos,
+                             "old": cur, "new": tv, "rev": r.get("rev")})
+            else:
+                n_same += 1                    # 表空+非clear：维持上报方原值
+        return pend, n_lock, n_same, n_nomap
+
+    pend, n_lock, n_same, n_nomap = _plan(rows)
+    base = {"ok": True, "written": 0, "same": n_same,
+            "locked": n_lock, "no_map": n_nomap,
+            "detail": [{k: p[k] for k in ("id", "no", "pos", "old", "new")}
+                       for p in pend[:200]]}
+    if dry or not pend:
+        base["msg"] = ("已全部一致，无需同步" if not pend
+                       else "预览完成，待确认执行")
+        return base
+
+    # 两轮执行：首轮写，rev 冲突的行重取后再试一轮
+    written, errs = [], []
+    todo = pend
+    for attempt in (0, 1):
+        still = []
+        for p in todo:
+            try:
+                j = http_post_json(server.rstrip("/") + "/api/field",
+                                   {"id": p["id"], "field": "target_type",
+                                    "value": p["new"], "rev": p["rev"]},
+                                   timeout=6)
+                if j.get("ok"):
+                    written.append(p)
+                else:
+                    still.append(p)
+            except Exception:
+                still.append(p)
+        if not still:
+            break
+        if attempt == 0:                       # 重取 rev 再试一轮
+            try:
+                rows = json.loads(urllib.request.urlopen(url_rows, timeout=8)
+                                  .read().decode("utf-8")).get("rows") or []
+                revs = {r["id"]: r.get("rev") for r in rows}
+                for p in still:
+                    p["rev"] = revs.get(p["id"], p["rev"])
+            except Exception:
+                pass
+        todo = still
+    errs = [{"id": p["id"], "pos": p["pos"], "old": p["old"], "new": p["new"]}
+            for p in still]
+    led({"ev": "reconcile_force", "day": day, "clear": clear,
+         "written": [{k: w[k] for k in ("id", "no", "pos", "old", "new")}
+                     for w in written],
+         "errors": errs})
+    if written:
+        log("一键同步：A 机日志 %s 表 %d 行已按当天表更新（clear=%s）"
+            % (day, len(written), clear))
+    return {"ok": not errs, "written": len(written), "same": n_same,
+            "locked": n_lock, "no_map": n_nomap,
+            "detail": [{k: w[k] for k in ("id", "no", "pos", "old", "new")}
+                       for w in written[:200]],
+            "errors": errs}
+
+
 def api_targetmap_set(pos, ttype, positions=None, day=None):
     """编辑靶类型 → 直接写入按日期绑定的当天表（target_types/<日期>.json）。
     positions 为合并块内的全部靶位（一次保存整块）；type 为空 → 从当天表删除该格。
@@ -2373,6 +2485,12 @@ class Handler(BaseHTTPRequestHandler):
                 ok = _save_daily_map(day, dm)
             self._send(200, json.dumps(
                 {"ok": ok, "title": t, "date": day},
+                ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/reconcile_force":
+            p = self._json_body()
+            self._send(200, json.dumps(
+                api_reconcile_force(clear=bool(p.get("clear")),
+                                    dry=bool(p.get("dry"))),
                 ensure_ascii=False))
         elif urlparse(self.path).path == "/api/matchwindow":
             p = self._json_body()
