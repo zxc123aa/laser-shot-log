@@ -219,6 +219,7 @@
 </div>
 <script>
 var SHOTS = [], LASTJSON = "", T = null;
+var AHIST = {}, AHIST_REQ = {};       /* 查看日期→日志系统(A机)只读回显缓存/在途标记 */
 var CFG_EFIELDS = CFG_EFIELDS_JSON;   /* 能量列清单（服务端注入，只替换一次） */
 function toast(s){
   var t = document.getElementById("toast");
@@ -265,10 +266,72 @@ function viewIdx(){   // 当前查看日期对应的 SHOTS 下标（本地留痕
               .filter(function(i){ return (SHOTS[i].shot_time || "")
                                             .slice(0, 10) === VDATE; });
 }
+/* ---- 历史回看：本地留痕可能已被重启/换天清空，此时从日志系统(A机)拉当天表只读回显 ---- */
+function escH(s){
+  return String(s == null ? "" : s).replace(/&/g,"&amp;")
+         .replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/'/g,"&#39;");
+}
+function loadHist(day){
+  if (AHIST_REQ[day]) return;
+  AHIST_REQ[day] = true;
+  fetch("/api/a_rows?day=" + encodeURIComponent(day), {cache:"no-store"})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      AHIST[day] = (j && j.rows) || [];
+      delete AHIST_REQ[day];
+      render();
+    })
+    .catch(function(){ delete AHIST_REQ[day]; });
+}
+function renderHistInto(tb, rows){
+  var h = "";
+  rows.forEach(function(s){
+    h += "<tr class='hist'>";
+    h += "<td>" + escH(s.no) + "</td>";
+    h += "<td class='t'>" + escH(s.shot_time) + "</td>";
+    h += "<td>" + escH(s.file_count) + "</td>";
+    h += "<td class='files' title='" + escH(s.file) + "'>" +
+         (s.file ? escH(s.file) : "-") +
+         (s.file_count > 1 ? " 等" + escH(s.file_count) + "个" : "") + "</td>";
+    var tgt = s.target || "-";
+    if (s.defocus !== "" && s.defocus != null) tgt += " <span style='color:#888'>离焦 " + escH(s.defocus) + "</span>";
+    h += "<td style='white-space:nowrap'>" + tgt + "</td>";
+    h += "<td style='white-space:nowrap;color:#1a6fb5'>" + (s.ttype ? escH(s.ttype) : "-") + "</td>";
+    var es = s.energies || {};
+    h += "<td>";
+    CFG_EFIELDS.forEach(function(ef){
+      h += "<div style='display:flex;align-items:center;gap:5px;margin:2px 0'>" +
+           "<span style='font-size:11px;color:#888;min-width:70px;white-space:nowrap'>" +
+           escH(ef.label) + "</span>" +
+           "<span style='font-size:12px;color:#333'>" +
+           (es[ef.key] !== "" && es[ef.key] != null ? escH(es[ef.key]) : "-") +
+           "</span></div>";
+    });
+    h += "</td>";
+    h += "<td><span class='st sent'>日志系统已上报</span></td>";
+    h += "<td style='color:#999;font-size:11px'>A机日志只读回显</td>";
+    h += "</tr>";
+  });
+  tb.innerHTML = h;
+}
 function render(){
   var tb = document.getElementById("tb");
   var view = viewIdx();
   if (!view.length){
+    if (VDATE && VDATE !== todayStr()){
+      /* 历史日期本地无留痕 → 日志系统(A机)只读回显（数据躺在A机表里） */
+      var hr = AHIST[VDATE];
+      if (hr && hr.length){ renderHistInto(tb, hr); return; }
+      if (hr && !hr.length){
+        tb.innerHTML = "<tr><td colspan=9 class='empty'>" +
+          escH(VDATE) + " 在日志系统(A机)里也没有发次记录</td></tr>";
+        return;
+      }
+      tb.innerHTML = "<tr><td colspan=9 class='empty'>本地无留痕，正在从日志系统(A机)拉取 " +
+          escH(VDATE) + " 表…</td></tr>";
+      loadHist(VDATE);
+      return;
+    }
     tb.innerHTML = "<tr><td colspan=9 class='empty'>" +
       (VDATE && VDATE !== todayStr()
         ? VDATE + " 当天没有发次记录"

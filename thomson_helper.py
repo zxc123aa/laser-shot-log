@@ -72,7 +72,7 @@ CONFIG_PATH = os.path.join(BASE, "config_helper.json")
 # 覆盖事故即 10-23 启动的旧 helper 跑了 5 天旧代码所致）。
 # 纪律：①改动本文件/配置后必须重启 helper；②启动脚本先杀 8767 旧实例；
 # ③健康检查用 /api/ver 核对 CODE_VER 与 git 最新提交一致。
-CODE_VER = "2026-10-28.syncbtn"
+CODE_VER = "2026-10-30.histview"
 STARTED_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -1255,6 +1255,7 @@ def _ttm_pan_expand(pos):
 
 
 _A_SYNC_SHEET = {"day": None, "id": None}     # A 机日期表 id 缓存
+_A_ROWS_CACHE = {"day": None, "ts": 0.0, "data": None}   # 查看日期回显缓存(20s)
 
 
 def _a_sheet_id(day, server):
@@ -2372,6 +2373,8 @@ class Handler(BaseHTTPRequestHandler):
                                        for d in WATCH_DIRS]}, ensure_ascii=False))
         elif urlparse(self.path).path == "/api/pickdir":
             self._send(200, json.dumps(pick_dir_status(), ensure_ascii=False))
+        elif urlparse(self.path).path == "/api/a_rows":
+            self.api_a_rows()
         elif urlparse(self.path).path == "/api/sheetname":
             self._send(200, json.dumps(get_sheet_binding(), ensure_ascii=False))
         elif urlparse(self.path).path == "/api/trash":
@@ -2782,6 +2785,55 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps(
             {"ok": True, "n": n, "day": day, "total": total,
              "bound_now": bound}, ensure_ascii=False))
+
+    def api_a_rows(self):
+        """GET /api/a_rows?day=YYYY-MM-DD —— 历史回看：从日志系统(A机)拉
+        该日期表的行做只读回显。背景：页面「查看日期」原本只过滤 B 机本地
+        留痕(SHOTS)，helper 重启/换天后本地留痕没了就显示"当天没有发次记录"，
+        其实数据都好好躺在 A 机日志表里。这里做代理拉取（20s 缓存），
+        绝不写任何东西。"""
+        q = parse_qs(urlparse(self.path).query)
+        day = str((q.get("day") or [""])[0]).strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+            return self._err("day 必须是 YYYY-MM-DD")
+        now = time.time()
+        if (_A_ROWS_CACHE["day"] == day and _A_ROWS_CACHE["data"]
+                and now - _A_ROWS_CACHE["ts"] < 20):
+            return self._send(200, json.dumps(_A_ROWS_CACHE["data"],
+                                              ensure_ascii=False))
+        server = SERVER_URL or "http://10.0.23.155:8765"
+        try:
+            sid = _a_sheet_id(day, server)
+            if not sid:
+                data = {"ok": True, "day": day, "rows": [],
+                        "note": "日志系统没有 %s 表（该日未打靶或表未建）" % day}
+            else:
+                j = json.loads(urllib.request.urlopen(
+                    server.rstrip("/")
+                    + "/api/rows?sheet_id=%s&page=1&page_size=5000" % sid,
+                    timeout=10).read().decode("utf-8"))
+                rows = j.get("rows") or []
+                ekeys = [f.get("key") for f in ENERGY_FIELDS]
+                out = []
+                for r in rows:
+                    f = r.get("fields") or {}
+                    out.append({
+                        "no": f.get("no"),
+                        "shot_time": r.get("shot_time") or f.get("shot_time") or "",
+                        "file_count": r.get("file_count") or 0,
+                        "file": r.get("first_file") or "",
+                        "target": f.get("target_pos") or "",
+                        "defocus": f.get("target_defocus") or "",
+                        "ttype": f.get("target_type") or "",
+                        "energies": {k: f.get(k) for k in ekeys if k},
+                    })
+                out.sort(key=lambda x: str(x.get("shot_time") or ""))
+                data = {"ok": True, "day": day, "sheet_id": sid, "rows": out}
+            _A_ROWS_CACHE.update(day=day, ts=now, data=data)
+            self._send(200, json.dumps(data, ensure_ascii=False))
+        except Exception as e:
+            log("历史回看 %s：拉取 A 机失败 %r" % (day, e))
+            self._err("日志系统(A机)不可达: %r" % e)
 
     def api_ledger_stats(self):
         """GET /api/ledger_stats?day=YYYY-MM-DD —— 体检本机账本（只读）。"""

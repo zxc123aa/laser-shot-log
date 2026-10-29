@@ -245,6 +245,7 @@ def check_invariants():
     a = _read("a_server.py")
     h = _read("thomson_helper.py")
     w = _read("b_watcher.py")
+    ui_h = _read("ui/helper.html")
 
     # 3.1 能量永不建行：api_energy 体内不得出现 INSERT
     body = _func_body(a, "api_energy")
@@ -343,6 +344,13 @@ def check_invariants():
        and "maybe_audit" in _func_calls(w, "main"),
        "b_watcher 有靶类型违规审计 watchdog 且主循环在调（tt_audit）",
        "b_watcher 缺 tt_audit watchdog 或主循环没调 —— 批量覆盖无人报警！")
+
+    # 3.13 历史回看走日志系统（2026-10-30 用户报"10-28 内容全没了"实为
+    #      页面查看日期只过滤本地留痕；本地留痕会被重启/换天清空）
+    ck('"/api/a_rows"' in h and "def api_a_rows" in h
+       and "renderHistInto" in ui_h and "loadHist" in ui_h,
+       "helper 有 /api/a_rows 历史回看代理 + 页面 loadHist/renderHistInto（本地无留痕自动从A机回显）",
+       "helper 缺历史回看链路 —— 换天后查历史日期会误显示\"当天没有发次记录\"！")
 
     # 3.8 UI 与代码分离（根治 git merge 覆盖：改 UI 只碰 ui/*.html，不碰 .py）
     ck("def _load_ui_html" in h and "_UI_PATH" in h,
