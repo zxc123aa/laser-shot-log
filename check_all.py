@@ -372,6 +372,19 @@ def check_invariants():
        "b_watcher 审计覆盖批量填空模式（≥20 行填空也报警）",
        "b_watcher 审计只查覆盖非空 —— 批量填空钻空子无人报警！")
 
+    # 3.16 洪泛熔断（2026-10-29 相机自由连拍 1Hz×3h 灌 3686 张纯白空帧事故：
+    #      b_watcher 逐条如实上报 → A 机 1003 行垃圾。熔断=最多脏阈值行）
+    ck("flood_max_per_min" in w and "_FLOOD_TIMES" in w
+       and "def flood_gate" in w,
+       "b_watcher 洪泛熔断（flood_gate：60s 窗口超阈值暂停上报）",
+       "b_watcher 缺洪泛熔断 —— 相机再抽风就 1 秒灌 1 行垃圾！")
+    ck('"flood_pause"' in w and '"flood_resume"' in w,
+       "b_watcher 熔断账本留证（flood_pause 触发 / flood_resume 恢复含丢弃数）",
+       "b_watcher 熔断无账本事件 —— 触发/恢复不留痕，灾后查不清！")
+    ck("flood_gate(all_new" in w and "seen[p] = mt" in w,
+       "b_watcher 熔断接入主循环分组前（丢弃文件登记 seen 永不复活）",
+       "b_watcher 熔断没接进主循环 —— 形同虚设！")
+
     # 3.8 UI 与代码分离（根治 git merge 覆盖：改 UI 只碰 ui/*.html，不碰 .py）
     ck("def _load_ui_html" in h and "_UI_PATH" in h,
        "helper UI 已抽离到 ui/helper.html（_load_ui_html 加载）",

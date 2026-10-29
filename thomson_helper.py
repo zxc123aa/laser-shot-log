@@ -72,7 +72,7 @@ CONFIG_PATH = os.path.join(BASE, "config_helper.json")
 # 覆盖事故即 10-23 启动的旧 helper 跑了 5 天旧代码所致）。
 # 纪律：①改动本文件/配置后必须重启 helper；②启动脚本先杀 8767 旧实例；
 # ③健康检查用 /api/ver 核对 CODE_VER 与 git 最新提交一致。
-CODE_VER = "2026-10-30.histview"
+CODE_VER = "2026-10-30.floodguard"
 STARTED_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 

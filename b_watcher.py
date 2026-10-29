@@ -23,7 +23,7 @@ import re
 import socket
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 import urllib.request
 from datetime import datetime
 
@@ -190,6 +190,56 @@ def send_alert(server_url, machine_name, level, message, timeout=5):
         urllib.request.urlopen(req, timeout=timeout).read()
     except Exception:
         pass  # 告警通道失败不阻塞扫描
+
+
+# ---- 洪泛熔断（2026-10-29 事故：相机采集软件没关干净，自由连拍 1Hz×3 小时
+#      往 20261028 目录写了 3686 张 6628B 纯白空帧，b_watcher 如实逐条上报，
+#      正好撞上 117 映射表枪口，在 A 机灌出 1003 行垃圾）----
+# 规则：滚动 60 秒窗口内新发次文件数 > flood_max_per_min（默认 10，0=关闭）
+#       → 熔断：窗口内文件只登记已见、绝不进分组上报；账本 flood_pause 留证
+#       + A 机告警；窗口回落后自动恢复，记 flood_resume（含累计丢弃数）。
+_FLOOD_TIMES = deque()                 # 最近 60s 检出的发次文件时刻
+_FLOOD_STATE = {"active": False, "dropped": 0, "last_log": 0.0}
+
+
+def flood_gate(all_new, flood_max, server_url, machine_name):
+    """每轮主循环都必须调用（含空轮，恢复判定靠它）。
+    返回 (放行列表, 丢弃列表)；丢弃的文件由调用方登记 seen 后永不再报。"""
+    if flood_max <= 0:
+        return list(all_new), []
+    now = time.time()
+    st = _FLOOD_STATE
+    while _FLOOD_TIMES and now - _FLOOD_TIMES[0] > 60.0:
+        _FLOOD_TIMES.popleft()
+    # 恢复判定：熔断中且窗口已空（洪泛停了）
+    if st["active"] and not _FLOOD_TIMES:
+        st["active"] = False
+        log("FLOOD GUARD: 洪泛结束，恢复上报（共丢弃 %d 个垃圾文件）"
+            % st["dropped"])
+        led({"ev": "flood_resume", "dropped_total": st["dropped"]})
+        st["dropped"] = 0
+    if not all_new:
+        return list(all_new), []
+    _FLOOD_TIMES.extend([now] * len(all_new))
+    if len(_FLOOD_TIMES) <= flood_max:
+        return list(all_new), []
+    # 触发/持续熔断：本轮文件全部丢弃
+    if not st["active"]:
+        st["active"] = True
+        st["dropped"] = 0
+        msg = ("发次洪泛熔断: 60秒内新增发次文件 %d 个(阈值 %d)，已自动暂停上报"
+               "（超速文件只登记不建条目）。请检查相机采集软件是否处于"
+               "连拍/自由触发/回放模式！" % (len(_FLOOD_TIMES), flood_max))
+        log("ERROR: " + msg)
+        send_alert(server_url, machine_name, "error", msg)
+        led({"ev": "flood_pause", "window_count": len(_FLOOD_TIMES),
+             "threshold": flood_max})
+    st["dropped"] += len(all_new)
+    if now - st["last_log"] >= 30.0:
+        st["last_log"] = now
+        log("FLOOD GUARD: 熔断中，本轮再丢弃 %d 个（累计 %d）"
+            % (len(all_new), st["dropped"]))
+    return [], list(all_new)
 
 
 def send_tif_timeline(b_helper_url, machine_name, payload, timeout=4):
@@ -698,6 +748,8 @@ def main():
     tif_push_url = str(cfg.get("push_tif_timeline_to", "") or "").strip()
     # 靶类型映射 → A 机日志 自动对账周期（秒），0 = 关闭
     recon_sec = float(cfg.get("map_reconcile_sec", 90) or 0)
+    # 洪泛熔断阈值：60 秒内新发次文件超过该数即暂停上报，0 = 关闭
+    flood_max = int(cfg.get("flood_max_per_min", 10) or 0)
     # 只监测的文件后缀（如 [".tif", ".png"]）；为空 = 全部文件（旧行为）
     exts = cfg.get("watch_exts") or []
     _SCAN_EXTS.update(str(e).strip().lower() for e in exts if str(e).strip())
@@ -801,6 +853,12 @@ def main():
                     nhu = str(nc.get("helper_url", "") or "").strip()
                     if nhu and nhu != helper_url:
                         helper_url = nhu
+                    # 洪泛熔断阈值热更新
+                    nf = int(nc.get("flood_max_per_min", 10) or 0)
+                    if nf != flood_max:
+                        flood_max = nf
+                        log("配置热重载：洪泛熔断阈值 -> %d/分钟%s"
+                            % (nf, "" if nf > 0 else "（已关闭）"))
                     # C机 tif 时间表推送目标热更新（置空 = 关闭推送）
                     ntp = str(nc.get("push_tif_timeline_to", "") or "").strip()
                     if ntp != tif_push_url:
@@ -868,6 +926,14 @@ def main():
                 # pending（上次还没归组的文件）+ 本轮新文件，合并后统一重新分组
                 all_new = [tuple(x) for x in pend if is_shot_file(x[0])] \
                     + new_entries
+                # 洪泛熔断（每轮必查，含恢复判定）：超速文件只登记不上报
+                allowed, dropped = flood_gate(all_new, flood_max,
+                                              server_url, machine_name)
+                if dropped:
+                    for p, mt in dropped:
+                        seen[p] = mt          # 登记已见，重启也不复活
+                    save_json(STATE_PATH, seen)
+                all_new = allowed
                 if all_new:
                     log("本轮待处理文件 %d 个（含缓冲 %d）"
                         % (len(all_new), len(pend)))
