@@ -47,6 +47,30 @@ def led(ev, day=None):
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
+# ── C机禁启守卫（2026-10-30）─────────────────────────────────────────
+# 背景：C机(10.0.23.117)只跑 helper 做能量上报，行全由 B 机建（DEPLOY.md 红线）。
+# 但多次出现"被各种启动入口复活"（旧 bat/别的 agent 会话照旧文档启动），
+# 每次复活都是一次潜在的建行/覆盖事故源。故在进程入口硬性自检：
+# 本机配置机名带"C机" → 拒绝启动。B 机/其他机器不受影响。
+def _c_machine_guard():
+    try:
+        cfg = json.load(open(os.path.join(BASE, "config_b.local.json"),
+                             encoding="utf-8"))
+        if "C机" in str(cfg.get("machine_name", "")):
+            print("[b_watcher] 拒绝启动：本机是 C 机（machine_name=%s），"
+                  "按三机分工 C 机只跑 thomson_helper，行由 B 机建。" %
+                  cfg.get("machine_name"))
+            print("[b_watcher] 如确需在本机跑 b_watcher，请先修改 "
+                  "config_b.local.json 的 machine_name（并确认分工）。")
+            raise SystemExit(2)
+    except SystemExit:
+        raise
+    except Exception:
+        pass  # 配置读不到不拦（B 机老部署可能没有 local 配置）
+
+_c_machine_guard()
+
+
 def _bypass_proxy_for_lan():
     """实验室内网地址不走系统代理（http_proxy 是会话级动态端口，会把
     10.0.23.x 内网请求拖死）。把 A 机/靶系统主机名加入 NO_PROXY。"""
