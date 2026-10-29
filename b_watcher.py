@@ -23,6 +23,7 @@ import re
 import socket
 import sys
 import time
+from collections import Counter
 import urllib.request
 from datetime import datetime
 
@@ -409,12 +410,24 @@ def audit_target_type_writes(server_url):
         rows = {e.get("id") for e in evs}
         over = [e for e in evs
                 if str(e.get("old") or "").strip() and e.get("old") != e.get("new")]
+        fills = [e for e in evs
+                 if not str(e.get("old") or "").strip() and str(e.get("new") or "").strip()]
+        # 两类嫌疑：①覆盖非空 ≥5 行 ②批量填空 ≥20 行（2026-10-29 C机-DAQ
+        # 一天 1000 次往空行灌 ch50nm 10°，钻了"只查覆盖"的空子——
+        # 空=空发是合法状态，谁批量填空谁就可疑）
         if len(rows) >= 5 and over:
             viol.append({"ip": ip, "writes": len(evs), "rows": len(rows),
                          "overwrite_nonempty": len(over),
                          "sample": [{"id": e.get("id"), "old": e.get("old"),
                                      "new": e.get("new"), "iso": e.get("iso")}
                                     for e in over[:5]]})
+        elif len(fills) >= 20:
+            viol.append({"ip": ip, "writes": len(evs), "rows": len(rows),
+                         "fill_empty": len(fills),
+                         "values": dict(Counter(str(e.get("new")) for e in fills)
+                                        .most_common(3)),
+                         "sample": [{"id": e.get("id"), "new": e.get("new"),
+                                     "iso": e.get("iso")} for e in fills[:5]]})
     if viol:
         try:
             log("⚠⚠ 靶类型违规写入嫌疑 %d 组: %s"

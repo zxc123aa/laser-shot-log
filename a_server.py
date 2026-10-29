@@ -103,6 +103,13 @@ COL_KEYS = {c["key"] for c in COLS}
 # 空 = 不限制；非空 = 只允许列表里的 IP/网段前缀
 ALLOW_IPS = [str(x) for x in _CFG_A.get("allow_ips", [])]
 
+# 靶类型写入白名单（2026-10-29 事故：C机-DAQ@10.0.23.117 一天 1000 次往
+# 空行灌 ch50nm 10° 旧映射值——空发=空 是合法状态，轮不到谱仪机填类型）。
+# /api/field 写 target_type 只允许这些来源（127.0.0.1 恒放行，供本机修复工具）。
+# C机=汤姆逊谱仪，只许走 /api/energy 写能量（能量永不建行、永不碰靶类型）。
+# 支持精确 IP 或前缀（如 "10.0.23."）。
+TT_WRITERS = [str(x) for x in _CFG_A.get("target_type_writers", ["10.0.23.157"])]
+
 _db_lock = threading.Lock()
 
 # 数据版本号：任意 POST（增删改行/表/回收站/告警等）成功后 +1，
@@ -690,6 +697,15 @@ class Handler(BaseHTTPRequestHandler):
         val = str(p.get("value", "")).strip()
         rev = p.get("rev")
         ip = self.client_address[0] or "?"
+        # ---- 靶类型写入白名单（2026-10-29 C机-DAQ 灌值事故）----
+        # 谱仪机（C机）只允许写能量（/api/energy），不允许碰 target_type。
+        # 违规尝试写账本 a_field_reject 留证。
+        if field == "target_type" and ip != "127.0.0.1" \
+                and not any(ip == w or ip.startswith(w) for w in TT_WRITERS):
+            aled({"ev": "a_field_reject", "reason": "target_type_writer_not_allowed",
+                  "client_ip": ip, "id": sid, "rejected_value": val[:60]})
+            return self._err("target_type 只允许日志系统(B机)写入；"
+                             "能量请走 /api/energy（能量永不建行）")
         with _db_lock, db() as conn:
             row = conn.execute(
                 "SELECT fields, rev FROM shots WHERE id=?", (sid,)).fetchone()
@@ -761,15 +777,16 @@ class Handler(BaseHTTPRequestHandler):
                     "文件名不符合发次命名规则，拒绝建行: %s"
                     "（如确需纳入，改 config_a.json 的 shot_file_patterns，"
                     "或把 enforce_shot_file 设为 false）" % bad[:3])
-        # ---- 裸行防护（2026-10-28 shot100 事故）----：helper 手动确认链
-        # （machine 以 -Thomson 结尾）在拿不到靶位时建"仅含 no"的裸行，
-        # 占住去重键后堵死 b_watcher 带完整数据的正式上报，行被修复工具
-        # 删除后发次整行缺失。缺靶位的 -Thomson 建行一律拒绝：
-        # b_watcher 会带着靶位/类型/离焦完整上报，宁缺不裸。
-        if str(machine).strip().endswith("-Thomson") \
-                and not str((p.get("fields") or {})
-                            .get("target_pos") or "").strip():
-            aled({"ev": "a_shot_reject", "reason": "thomson_bare_row",
+        # ---- 裸行防护（2026-10-28 shot100 事故，2026-10-30 泛化）----
+        # helper 手动确认链曾在拿不到靶位时建"仅含 no"的裸行，占住去重键
+        # 后堵死 b_watcher 带完整数据的正式上报，行被修复工具删除后发次
+        # 整行缺失。现在 helper 侧已改为缺靶位不建行；A 机侧把守卫泛化为
+        # **机名无关**：任何来源缺靶位建行一律拒绝（b_watcher 的行永远带
+        # 靶位——靶位来自打靶页面当前靶位，空发也有；宁缺不裸）。
+        # （B机 machine_name 已去掉误导性的 -Thomson 后缀，故不能按机名判断）
+        if not str((p.get("fields") or {})
+                   .get("target_pos") or "").strip():
+            aled({"ev": "a_shot_reject", "reason": "bare_row_no_target_pos",
                   "machine": machine, "shot_time": shot_time,
                   "fields": p.get("fields", {}),
                   "client_ip": self.client_address[0]},

@@ -359,6 +359,19 @@ def check_invariants():
        "ui/helper.html 有查看日期日历选择器（showCal+calFetchDates，记录日期标色）",
        "ui/helper.html 缺日历选择器 —— 查看日期回退为纯手输！")
 
+    # 3.15 靶类型写入白名单 + 裸行防护泛化（2026-10-29 C机-DAQ@117 一天
+    #      1000 次往空行灌 ch50nm 10° 事故闭环：C机=汤姆逊谱仪，只许写能量）
+    ck("TT_WRITERS" in a and "a_field_reject" in a
+       and "target_type_writer_not_allowed" in a,
+       "A机 api_field 靶类型写入白名单（TT_WRITERS，违规 a_field_reject 留证）",
+       "A机 缺靶类型写入白名单 —— 谱仪机可继续灌错值！")
+    ck('"bare_row_no_target_pos"' in a and 'endswith("-Thomson")' not in a,
+       "A机 裸行防护已泛化为机名无关（缺靶位一律拒绝建行）",
+       "A机 裸行防护仍按 -Thomson 机名判断 —— 改名后防护失效！")
+    ck('"fill_empty"' in w,
+       "b_watcher 审计覆盖批量填空模式（≥20 行填空也报警）",
+       "b_watcher 审计只查覆盖非空 —— 批量填空钻空子无人报警！")
+
     # 3.8 UI 与代码分离（根治 git merge 覆盖：改 UI 只碰 ui/*.html，不碰 .py）
     ck("def _load_ui_html" in h and "_UI_PATH" in h,
        "helper UI 已抽离到 ui/helper.html（_load_ui_html 加载）",
