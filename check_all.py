@@ -352,6 +352,13 @@ def check_invariants():
        "helper 有 /api/a_rows 历史回看代理 + 页面 loadHist/renderHistInto（本地无留痕自动从A机回显）",
        "helper 缺历史回看链路 —— 换天后查历史日期会误显示\"当天没有发次记录\"！")
 
+    # 3.14 查看日期日历选择器（2026-10-30 用户便捷性需求：点日期弹日历，
+    #      日志系统有记录的日期标色；数据源=/api/sheetname 的 sheets 计数）
+    ck('"calPop"' in ui_h and "function showCal" in ui_h
+       and "calFetchDates" in ui_h and "/api/sheetname" in ui_h,
+       "ui/helper.html 有查看日期日历选择器（showCal+calFetchDates，记录日期标色）",
+       "ui/helper.html 缺日历选择器 —— 查看日期回退为纯手输！")
+
     # 3.8 UI 与代码分离（根治 git merge 覆盖：改 UI 只碰 ui/*.html，不碰 .py）
     ck("def _load_ui_html" in h and "_UI_PATH" in h,
        "helper UI 已抽离到 ui/helper.html（_load_ui_html 加载）",
