@@ -264,11 +264,16 @@ function setVDate(v){
   document.getElementById("viewDate").value = VDATE;
   render(); LASTJSON = "";
 }
-function viewIdx(){   // 当前查看日期对应的 SHOTS 下标（本地留痕，按发次时间过滤）
-  if (!VDATE) return SHOTS.map(function(_, i){ return i; });
-  return SHOTS.map(function(_, i){ return i; })
-              .filter(function(i){ return (SHOTS[i].shot_time || "")
+function viewIdx(){   // 当前查看日期对应的 SHOTS 下标（本地留痕，按发次时间过滤+排序）
+  var idx = SHOTS.map(function(_, i){ return i; });
+  if (VDATE) idx = idx.filter(function(i){ return (SHOTS[i].shot_time || "")
                                             .slice(0, 10) === VDATE; });
+  // 按发次时间倒序（最新在上）——回放/补录的条目不再打乱时间顺序
+  idx.sort(function(a, b){
+    return (SHOTS[b].shot_time || "") < (SHOTS[a].shot_time || "") ? -1 :
+           (SHOTS[b].shot_time || "") > (SHOTS[a].shot_time || "") ? 1 : 0;
+  });
+  return idx;
 }
 /* ---- 历史回看：本地留痕可能已被重启/换天清空，此时从日志系统(A机)拉当天表只读回显 ---- */
 function escH(s){
