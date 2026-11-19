@@ -195,9 +195,10 @@ def send_alert(server_url, machine_name, level, message, timeout=5):
 # ---- 洪泛熔断（2026-10-29 事故：相机采集软件没关干净，自由连拍 1Hz×3 小时
 #      往 20261028 目录写了 3686 张 6628B 纯白空帧，b_watcher 如实逐条上报，
 #      正好撞上 117 映射表枪口，在 A 机灌出 1003 行垃圾）----
-# 规则：滚动 60 秒窗口内新发次文件数 > flood_max_per_min（默认 10，0=关闭）
-#       → 熔断：窗口内文件只登记已见、绝不进分组上报；账本 flood_pause 留证
-#       + A 机告警；窗口回落后自动恢复，记 flood_resume（含累计丢弃数）。
+# 规则：滚动 60 秒窗口内**新发现**的发次文件数 > flood_max_per_min
+#       （默认 30，0=关闭）→ 熔断：窗口内文件只登记已见、绝不进分组上报；
+#       账本 flood_pause 留证 + A 机告警；窗口回落后自动恢复，记
+#       flood_resume（含累计丢弃数）。注意：只数新文件，pend 缓冲不重复计数。
 _FLOOD_TIMES = deque()                 # 最近 60s 检出的发次文件时刻
 _FLOOD_STATE = {"active": False, "dropped": 0, "last_log": 0.0}
 
@@ -749,7 +750,8 @@ def main():
     # 靶类型映射 → A 机日志 自动对账周期（秒），0 = 关闭
     recon_sec = float(cfg.get("map_reconcile_sec", 90) or 0)
     # 洪泛熔断阈值：60 秒内新发次文件超过该数即暂停上报，0 = 关闭
-    flood_max = int(cfg.get("flood_max_per_min", 10) or 0)
+    # （默认 30：真实打靶 2-3 发/分，2026-11-19 用户拍板 30，留 10 倍余量）
+    flood_max = int(cfg.get("flood_max_per_min", 30) or 0)
     # 只监测的文件后缀（如 [".tif", ".png"]）；为空 = 全部文件（旧行为）
     exts = cfg.get("watch_exts") or []
     _SCAN_EXTS.update(str(e).strip().lower() for e in exts if str(e).strip())
@@ -854,7 +856,7 @@ def main():
                     if nhu and nhu != helper_url:
                         helper_url = nhu
                     # 洪泛熔断阈值热更新
-                    nf = int(nc.get("flood_max_per_min", 10) or 0)
+                    nf = int(nc.get("flood_max_per_min", 30) or 0)
                     if nf != flood_max:
                         flood_max = nf
                         log("配置热重载：洪泛熔断阈值 -> %d/分钟%s"
@@ -913,7 +915,14 @@ def main():
                 new_entries = []
                 ignored = []
                 for p, mt in entries:
-                    if p in seen:
+                    # mtime 感知去重（2026-11-19 事故根因）：旧逻辑只认路径
+                    # （p in seen 即跳过），相机重开 会话从 1 重编号 时同名文件
+                    # 覆盖写同一路径 → 新发次被旧会话登记挡死，永不上报
+                    # （新 5/6/7 因此消失）。现在：路径已见但 mtime 变新 =
+                    # 文件被覆盖重写 = 新发次，放行；mtime 未变/变旧 = 旧文件
+                    # （含从备份恢复的历史文件），跳过。
+                    old_mt = seen.get(p)
+                    if old_mt is not None and mt <= old_mt:
                         continue
                     if is_shot_file(p):        # 白名单：只有发次命名才进分组
                         new_entries.append((p, mt))
@@ -923,24 +932,32 @@ def main():
                 if ignored:
                     note_ignored(ignored)
                     save_json(STATE_PATH, seen)
-                # pending（上次还没归组的文件）+ 本轮新文件，合并后统一重新分组
-                all_new = [tuple(x) for x in pend if is_shot_file(x[0])] \
-                    + new_entries
-                # 洪泛熔断（每轮必查，含恢复判定）：超速文件只登记不上报
-                allowed, dropped = flood_gate(all_new, flood_max,
-                                              server_url, machine_name)
-                if dropped:
-                    for p, mt in dropped:
+                # ---- 洪泛熔断（每轮必查，含恢复判定）----
+                # ⚠ 只统计"本轮新发现"的文件！2026-11-19 事故根因：熔断曾在
+                # pend 合并后调用，pend 缓冲里同一个等待归组的文件每 0.2s 轮
+                # 被重复计入 60s 窗口一次（5 次/秒），单发等待 3 秒就攒 15 个
+                # 计数 → 9 发真实打靶节奏(2-3发/分)被误判成洪泛，且丢弃的
+                # pend 文件不出去 → 窗口永不落空 → 永不恢复(自锁)。
+                # 修复：熔断只看 new_entries；被丢弃的文件登记 seen 后不再
+                # 进 pend，窗口随真实文件老化自然回落。
+                allowed_new, dropped_new = flood_gate(new_entries, flood_max,
+                                                      server_url, machine_name)
+                if dropped_new:
+                    for p, mt in dropped_new:
                         seen[p] = mt          # 登记已见，重启也不复活
                     save_json(STATE_PATH, seen)
-                all_new = allowed
+                # pending（上次还没归组的文件，已通过熔断）+ 本轮放行的新文件
+                all_new = [tuple(x) for x in pend if is_shot_file(x[0])] \
+                    + allowed_new
                 if all_new:
                     log("本轮待处理文件 %d 个（含缓冲 %d）"
                         % (len(all_new), len(pend)))
                     done_groups, hold = group_into_shots(all_new, window)
                     # 全部登记为已见（防止重启后重复上报；A 机另有 UNIQUE 去重兜底）
+                    # ⚠ 必须用赋值不能 setdefault：覆盖写场景（重编号会话）下
+                    #   旧登记的 mtime 已过时，不更新会导致同一路径每轮重报。
                     for p, mt in all_new:
-                        seen.setdefault(p, mt)
+                        seen[p] = mt
                     pend = [list(x) for x in hold]
                     save_json(STATE_PATH, seen)
                     save_json(PENDING_PATH, pend)

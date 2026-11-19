@@ -372,8 +372,10 @@ def check_invariants():
        "b_watcher 审计覆盖批量填空模式（≥20 行填空也报警）",
        "b_watcher 审计只查覆盖非空 —— 批量填空钻空子无人报警！")
 
-    # 3.16 洪泛熔断（2026-10-29 相机自由连拍 1Hz×3h 灌 3686 张纯白空帧事故：
-    #      b_watcher 逐条如实上报 → A 机 1003 行垃圾。熔断=最多脏阈值行）
+    # 3.16 洪泛熔断（2026-10-29 相机自由连拍 1Hz×3h 灌 3686 张纯白空帧事故；
+    #      2026-11-19 补丁：熔断只数"本轮新发现"文件——曾在 pend 合并后调用，
+    #      同一个等待归组文件每 0.2s 被重复计数 → 真实打靶节奏被误判洪泛且
+    #      自锁不恢复，shot5/6/7 差点丢）
     ck("flood_max_per_min" in w and "_FLOOD_TIMES" in w
        and "def flood_gate" in w,
        "b_watcher 洪泛熔断（flood_gate：60s 窗口超阈值暂停上报）",
@@ -381,9 +383,23 @@ def check_invariants():
     ck('"flood_pause"' in w and '"flood_resume"' in w,
        "b_watcher 熔断账本留证（flood_pause 触发 / flood_resume 恢复含丢弃数）",
        "b_watcher 熔断无账本事件 —— 触发/恢复不留痕，灾后查不清！")
-    ck("flood_gate(all_new" in w and "seen[p] = mt" in w,
-       "b_watcher 熔断接入主循环分组前（丢弃文件登记 seen 永不复活）",
-       "b_watcher 熔断没接进主循环 —— 形同虚设！")
+    ck("flood_gate(new_entries" in w and "seen[p] = mt" in w
+       and w.index("flood_gate(new_entries") < w.index("all_new = [tuple(x) for x in pend"),
+       "b_watcher 熔断只数本轮新文件、且在 pend 合并之前调用（防重复计数+自锁）",
+       "b_watcher 熔断又挪回 pend 合并后了 —— 同一文件每轮重复计数会假触发！")
+
+    # 3.17 mtime 感知去重（2026-11-19 事故：相机重开会话从 1 重编号，同名文件
+    #      覆盖写同一路径，旧逻辑 p in seen 只认路径 → 新 5/6/7 被旧会话登记
+    #      挡死永不上报。修：mtime 变新=覆盖重写=新发次放行；且分组登记必须
+    #      用赋值不能用 setdefault（否则旧 mtime 残留 → 同路径每轮重报））
+    ck("old_mt = seen.get(p)" in w and "mt <= old_mt" in w
+       and "if p in seen:\n                        continue" not in w,
+       "b_watcher 扫描去重带 mtime 感知（同路径覆盖写=新发次）",
+       "b_watcher 去重退回只认路径 —— 相机重编号会话的新发次会被挡死！")
+    ck("for p, mt in all_new:\n                        seen[p] = mt" in w
+       and "seen.setdefault(p, mt)\n                    pend" not in w,
+       "b_watcher 分组登记 seen 用赋值（防 setdefault 残留旧 mtime 无限重报）",
+       "b_watcher 分组登记退回 setdefault —— 覆盖写路径会每轮重复上报！")
 
     # 3.8 UI 与代码分离（根治 git merge 覆盖：改 UI 只碰 ui/*.html，不碰 .py）
     ck("def _load_ui_html" in h and "_UI_PATH" in h,
