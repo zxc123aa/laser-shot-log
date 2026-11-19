@@ -610,6 +610,8 @@ class Handler(BaseHTTPRequestHandler):
         if not ids:
             return self._err("未指定记录")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ip = self.client_address[0] or "?"
+        deleted_info = []
         with _db_lock, db() as conn:
             for rid in ids:
                 row = conn.execute(
@@ -627,7 +629,16 @@ class Handler(BaseHTTPRequestHandler):
                          row["folder"], row["fields"], row["reported_at"],
                          row["created_at"], now))
                     conn.execute("DELETE FROM shots WHERE id=?", (rid,))
-        self._ok(deleted=len(ids))
+                    deleted_info.append({"id": rid,
+                                         "shot_time": row["shot_time"],
+                                         "sheet": row["sname"]})
+        # 删行审计（2026-11-19 事故：3 行被批量删进回收站，账本无留痕查不到谁删的）
+        if deleted_info:
+            aled({"ev": "a_row_delete", "client_ip": ip,
+                  "count": len(deleted_info), "rows": deleted_info})
+        # ⚠ 只报真实删除数：删不存在的 id 不得虚报（2026-11-19 教训：
+        #   恢复接口以新 id 重插，按旧 id 撤销时 deleted=3 是虚报，差点漏删）
+        self._ok(deleted=len(deleted_info))
 
     # ---------- 回收站 ----------
     def api_trash(self):
@@ -643,6 +654,8 @@ class Handler(BaseHTTPRequestHandler):
         if not ids:
             return self._err("未指定记录")
         restored = 0
+        restored_info = []
+        ip = self.client_address[0] or "?"
         with _db_lock, db() as conn:
             for tid in ids:
                 row = conn.execute("SELECT * FROM trash WHERE id=?", (tid,)).fetchone()
@@ -662,7 +675,17 @@ class Handler(BaseHTTPRequestHandler):
                         sheet_id = cur.lastrowid
                     else:
                         sheet_id = sh["id"]
-                conn.execute("""
+                # 防重复恢复守卫：同表同时刻同文件（同机）的行已存在 → 跳过，
+                # 回收站记录保留。恢复以新 id 重插，重复调用会造重复行
+                # （2026-11-19 事故：一次恢复就多出 3 行要再删一遍）。
+                dup = conn.execute(
+                    "SELECT 1 FROM shots WHERE sheet_id=? AND shot_time=? "
+                    "AND first_file IS ? AND machine IS ?",
+                    (sheet_id, row["shot_time"], row["first_file"],
+                     row["machine"])).fetchone()
+                if dup:
+                    continue
+                cur = conn.execute("""
                     INSERT INTO shots(shot_time, machine, file_count, first_file,
                                       folder, fields, reported_at, created_at, sheet_id)
                     VALUES (?,?,?,?,?,?,?,?,?)""",
@@ -671,6 +694,12 @@ class Handler(BaseHTTPRequestHandler):
                      row["reported_at"], row["created_at"], sheet_id))
                 conn.execute("DELETE FROM trash WHERE id=?", (tid,))
                 restored += 1
+                restored_info.append({"trash_id": tid, "new_id": cur.lastrowid,
+                                      "shot_time": row["shot_time"],
+                                      "sheet_id": sheet_id})
+        if restored_info:
+            aled({"ev": "a_row_restore", "client_ip": ip,
+                  "count": len(restored_info), "rows": restored_info})
         self._ok(restored=restored)
 
     def api_trash_delete(self):
