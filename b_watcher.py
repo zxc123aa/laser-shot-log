@@ -224,7 +224,7 @@ def send_alert(server_url, machine_name, level, message, timeout=5):
 #       账本 flood_pause 留证 + A 机告警；窗口回落后自动恢复，记
 #       flood_resume（含累计丢弃数）。注意：只数新文件，pend 缓冲不重复计数。
 _FLOOD_TIMES = deque()                 # 最近 60s 检出的发次文件时刻
-_FLOOD_STATE = {"active": False, "dropped": 0, "last_log": 0.0}
+_FLOOD_STATE = {"active": False, "dropped": 0, "last_log": 0.0, "files": []}
 
 
 def flood_gate(all_new, flood_max, server_url, machine_name):
@@ -241,29 +241,45 @@ def flood_gate(all_new, flood_max, server_url, machine_name):
         st["active"] = False
         log("FLOOD GUARD: 洪泛结束，恢复上报（共丢弃 %d 个垃圾文件）"
             % st["dropped"])
-        led({"ev": "flood_resume", "dropped_total": st["dropped"]})
+        # 丢弃明细随 resume 落账本：2026-11-19 教训——421 个文件被丢却没留
+        # 文件名单，里面混着的真实发次无从找回（只能靠磁盘 mtime 手工回放）
+        led({"ev": "flood_resume", "dropped_total": st["dropped"],
+             "dropped_files": st.get("files", [])})
         st["dropped"] = 0
+        st["files"] = []
     if not all_new:
         return list(all_new), []
     _FLOOD_TIMES.extend([now] * len(all_new))
     if len(_FLOOD_TIMES) <= flood_max:
         return list(all_new), []
     # 触发/持续熔断：本轮文件全部丢弃
+    trigger = False
     if not st["active"]:
         st["active"] = True
         st["dropped"] = 0
+        st["files"] = []
+        trigger = True
         msg = ("发次洪泛熔断: 60秒内新增发次文件 %d 个(阈值 %d)，已自动暂停上报"
                "（超速文件只登记不建条目）。请检查相机采集软件是否处于"
                "连拍/自由触发/回放模式！" % (len(_FLOOD_TIMES), flood_max))
         log("ERROR: " + msg)
         send_alert(server_url, machine_name, "error", msg)
-        led({"ev": "flood_pause", "window_count": len(_FLOOD_TIMES),
-             "threshold": flood_max})
     st["dropped"] += len(all_new)
+    # 丢弃明细（截取前 60 条）：文件名+mtime 随 pause/resume 入账本，
+    # 被丢的真实发次才有据可查（按 mtime 用 /api/detect 回放补报）
+    st["files"].extend({"name": os.path.basename(p), "mtime": mt}
+                       for p, mt in all_new)
+    del st["files"][60:]
+    if trigger:
+        led({"ev": "flood_pause", "window_count": len(_FLOOD_TIMES),
+             "threshold": flood_max, "dropped_this_round": len(all_new),
+             "samples": st["files"][:20]})
     if now - st["last_log"] >= 30.0:
         st["last_log"] = now
-        log("FLOOD GUARD: 熔断中，本轮再丢弃 %d 个（累计 %d）"
-            % (len(all_new), st["dropped"]))
+        names = ", ".join(f["name"] for f in st["files"][:5])
+        log("FLOOD GUARD: 熔断中，本轮再丢弃 %d 个（累计 %d）%s"
+            % (len(all_new), st["dropped"],
+               ("本轮首: " + names) if names else ""))
     return [], list(all_new)
 
 
